@@ -268,7 +268,17 @@ function listTmuxSessions(): TmuxSession[] {
 function buildRows(): Row[] {
   const entries = readSessions();
   const tmuxSessions = listTmuxSessions();
-  const tmuxByToken = new Map(tmuxSessions.filter((t) => t.token).map((t) => [t.token, t]));
+  // A token is only an identity if it is unique. Two sessions carrying the same
+  // one cannot be told apart, and Map construction silently keeps the last
+  // writer — which pairs a session with the wrong tmux session and displays it
+  // under another session's name and directory. Showing the wrong identity is
+  // worse than showing none, so ambiguous tokens are dropped from the index and
+  // those sessions fall through to name matching.
+  const tokenCounts = new Map<string, number>();
+  for (const t of tmuxSessions) if (t.token) tokenCounts.set(t.token, (tokenCounts.get(t.token) ?? 0) + 1);
+  const tmuxByToken = new Map(
+    tmuxSessions.filter((t) => t.token && tokenCounts.get(t.token) === 1).map((t) => [t.token, t]),
+  );
   const tmuxByName = new Map(tmuxSessions.map((t) => [t.name, t]));
   const matchedTmuxNames = new Set<string>();
   const sessionRows: SessionRow[] = entries.map((entry) => {
@@ -301,7 +311,11 @@ function tmuxError(result: ReturnType<typeof spawnSync>): string {
 // for a real working session). `-e` on `new-session` sets the env for that
 // specific new session's process, independent of server-inherited env —
 // confirmed empirically, not assumed.
-const NORMAL_AGENT_DIR = `${process.env.HOME ?? ""}/.pi/agent`;
+/** The agent directory a newly created session should use: the one in force
+ * here, not a fixed path. Hardcoding it meant a session created from the
+ * dashboard silently ignored the user's PI_CODING_AGENT_DIR and started against
+ * a configuration they had not chosen. */
+const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.env.HOME ?? ""}/.pi/agent`;
 
 function createTmuxSession(name: string, dir: string): { ok: boolean; message: string } {
   // Identity token: stamped on the tmux session as a user option AND handed to
@@ -505,7 +519,7 @@ function clockLine(): string {
  * without reading it), and the top three models get descending emphasis so
  * rank is legible at a glance. Renders nothing when no calls were logged
  * today — "0 calls" would falsely imply measured inactivity. */
-function tickerParts(th: Theme, stats: UsageStats | undefined, loaded: boolean): string | undefined {
+function tickerParts(th: Theme, stats: UsageStats | undefined, loaded: boolean, budget = Infinity): string | undefined {
   if (!loaded) return th.fg("dim", "\u2026");
   if (!stats) return undefined;
   const rate = stats.calls > 0 ? (stats.errors / stats.calls) * 100 : 0;
@@ -527,7 +541,13 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, loaded: boolean):
     segs.push(th.fg(modelColors[i] ?? "dim", m.model) + th.fg("dim", ` ${m.pct}%`));
   });
   if (stats.partial) segs.push(th.fg("warning", "(partial)"));
-  return segs.join(th.fg("dim", "  \u2502  "));
+  // The band shares its row with a right-flushed clock. If the segments overrun
+  // the space left for it, the clock is pushed past the terminal edge and
+  // silently truncated, so shed the least important segments (trailing models
+  // first) until what remains fits.
+  const joiner = th.fg("dim", "  │  ");
+  while (segs.length > 1 && visibleWidth(segs.join(joiner)) > budget) segs.pop();
+  return segs.join(joiner);
 }
 
 class Composer {
@@ -760,17 +780,11 @@ class DashboardView implements Component {
     const W = width;
     const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - visibleWidth(s)));
     /** Left content, right content, flush to the full terminal width. */
-    // Typographic measure. Beyond a certain width the eye loses the thread
-    // between a row's label and its right-flushed value, so the content block
-    // does not simply stretch to whatever width the terminal has. But a fixed
-    // cap is wrong in the other direction: on a wide terminal it left-aligns
-    // everything into a narrow strip and wastes most of the screen. Scale with
-    // the terminal and stop at a width where a label and its value are still
-    // visually paired. Override with PI_KING_WIDTH if your eyes disagree.
-    const override = Number(process.env.PI_KING_WIDTH);
-    const MEASURE = Number.isFinite(override) && override > 40
-      ? Math.min(W, override)
-      : Math.min(W, Math.max(132, Math.floor(W * 0.82)), 200);
+    // Full terminal width. Earlier versions capped this on the theory that a
+    // label and its right-flushed value stop reading as a pair once the gap
+    // grows, but in practice the cap just left most of a wide screen empty,
+    // which is the more obvious defect.
+    const MEASURE = W;
     const split = (left: string, right: string): string =>
       left + " ".repeat(Math.max(1, MEASURE - visibleWidth(left) - visibleWidth(right))) + right;
 
@@ -795,10 +809,13 @@ class DashboardView implements Component {
     lines.push("");
 
     // ---- ticker + quote -------------------------------------------------
-    const ticker = tickerParts(th, stats, loaded);
+    // Budget: the row is "  " + ticker ... clock + "  ", so the ticker may use
+    // everything except the clock, the two-space margins and a separating gap.
+    const clockText = clockLine();
+    const ticker = tickerParts(th, stats, loaded, Math.max(20, MEASURE - visibleWidth(clockText) - 8));
     const rule = th.fg("dim", "\u2500".repeat(Math.max(0, MEASURE - 4)));
     lines.push("  " + rule);
-    lines.push(split("  " + (ticker ?? th.fg("dim", "no router activity today")), th.fg("dim", clockLine()) + "  "));
+    lines.push(split("  " + (ticker ?? th.fg("dim", "no router activity today")), th.fg("dim", clockText) + "  "));
     lines.push("  " + rule);
     lines.push("  " + th.fg("dim", `\u201c${this.quote}\u201d`));
     lines.push("");
@@ -1228,6 +1245,13 @@ function installSessionTracker(pi: ExtensionAPI) {
       "-e", `PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent")}`,
       // Same reasoning for PATH: the server may not have ours.
       "-e", `PATH=${process.env.PATH ?? ""}`,
+      // And for the status directory. Without this the resumed session writes
+      // its status file to the default location while the supervisor that
+      // handed it off reads an overridden one, so a successfully backgrounded
+      // session never appears on the dashboard that backgrounded it.
+      ...(process.env.PI_KING_STATUS_DIR?.trim()
+        ? ["-e", `PI_KING_STATUS_DIR=${process.env.PI_KING_STATUS_DIR.trim()}`]
+        : []),
       "-c", ctx.cwd, "--", "pi", "--session", sessionId, "--name", name,
     ], { encoding: "utf8", timeout: 8000 });
     if (created.status !== 0) {

@@ -18,13 +18,13 @@ Set TypingSpeed 40ms
 Set PlaybackSpeed 0.75
 
 Hide
-Type "clear; tmux kill-server 2>/dev/null; source ~/king-demo/env.sh; clear"
+Type "clear; source ~/king-demo/env.sh; clear"
 Enter
 Sleep 3s
 Show
 
 # --- session 1: api-server ---
-Type "cd $P/api-server && pi --no-skills --model demo/auto/best-fast"
+Type "cd $P/api-server && pi --no-skills --model demo/auto/chat"
 Enter
 Sleep 9s
 Type "Reply with exactly THE-CROWN-JEWEL-42 and nothing else."
@@ -35,7 +35,7 @@ Enter
 Sleep 8s
 
 # --- session 2: web-client ---
-Type "cd $P/web-client && pi --no-skills --model demo/auto/best-fast"
+Type "cd $P/web-client && pi --no-skills --model demo/auto/chat"
 Enter
 Sleep 9s
 Type "Reply with exactly SILVER-COMPASS-7 and nothing else."
@@ -46,7 +46,7 @@ Enter
 Sleep 8s
 
 # --- session 3: data-pipeline ---
-Type "cd $P/data-pipeline && pi --no-skills --model demo/auto/best-fast"
+Type "cd $P/data-pipeline && pi --no-skills --model demo/auto/chat"
 Enter
 Sleep 9s
 Type "Reply with exactly NORTH-LANTERN-9 and nothing else."
@@ -80,6 +80,6 @@ Sleep 13s
 # --- detach: back to the dashboard, all three still listed ---
 Ctrl+B
 Type "d"
-Sleep 10s
+Sleep 14s
 Escape
 Sleep 2s

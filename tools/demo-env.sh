@@ -16,6 +16,31 @@ ROOT="${PI_KING_DEMO_ROOT:-$HOME/king-demo}"
 AGENT="$ROOT/agent"
 rm -rf "$ROOT"
 mkdir -p "$AGENT"/{skills,prompts,extensions,lib} "$ROOT"/projects/{api-server,web-client,data-pipeline}
+# A fresh status directory per take. Reaping leftover processes from earlier
+# takes proved unreliable — a survivor's heartbeat recreates its status file in
+# whatever directory the path points at, so a later recording showed six
+# sessions instead of three. A unique directory removes the dependency on
+# killing anything: an old process keeps writing to a directory this take never
+# reads.
+STATUS="$ROOT/status-$(date +%s)"
+mkdir -p "$ROOT/tmux" "$STATUS"
+
+# An empty skills tree at the demo HOME. Pi scans <home>/.agents/skills and
+# prints a validation warning for every malformed skill it finds; with HOME
+# pointed here that scan lands on this empty directory instead of the author's.
+mkdir -p "$ROOT/.agents/skills"
+
+# tmux reads <home>/.tmux.conf. Without one, the demo server runs with defaults
+# and Pi warns that extended keys are off — a warning about the recording rig,
+# not about pi-king, that has no business being in the recording.
+cat > "$ROOT/.tmux.conf" <<'CONF'
+set -s extended-keys on
+set -s extended-keys-format csi-u
+set -g default-terminal "tmux-256color"
+set -sg escape-time 10
+set -g status off
+CONF
+chmod 700 "$ROOT/tmux"
 
 # --- placeholder skills -----------------------------------------------------
 for s in run-tests write-docs review-diff; do
@@ -47,7 +72,7 @@ printf '{\n  "quietStartup": true\n}\n' > "$AGENT/settings.json"
 # model id discloses both the provider and, by inference, how it is being paid
 # for. Point PI_KING_DEMO_BASEURL at any OpenAI-compatible endpoint.
 DEMO_BASEURL="${PI_KING_DEMO_BASEURL:-http://127.0.0.1:20128/v1}"
-DEMO_MODEL="${PI_KING_DEMO_MODEL:-auto/best-fast}"
+DEMO_MODEL="${PI_KING_DEMO_MODEL:-auto/chat}"
 cat > "$AGENT/extensions/demo-provider.ts" <<EOF
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -106,5 +131,20 @@ export PI_CODING_AGENT_DIR="$AGENT"
 export PI_KING_CALL_LOGS="$LOGS"
 export PI_KING_CLIS="git,jq,rg,tmux"
 export P="$ROOT/projects"
+# Isolate the recording from the real environment. TMUX_TMPDIR selects a
+# different socket directory, so the demo gets its own tmux server and cannot
+# see, list, or destroy the sessions you actually have running; PI_KING_STATUS_DIR
+# does the same for the dashboard's view. An earlier version instead ran
+# tmux kill-server for a clean slate and destroyed every live session on the
+# machine, which is the precise failure this project exists to prevent.
+export TMUX_TMPDIR="$ROOT/tmux"
+export PI_KING_STATUS_DIR="$STATUS"
+# Pi scans \$HOME/.agents/skills unconditionally and prints a validation warning
+# for every skill there that fails its name rules, which lands in the recording.
+# Pointing HOME at the demo root makes that scan find nothing. The previous
+# approach moved the real directory aside and restored it on exit, which left
+# the author's skills displaced whenever a run was killed hard enough to skip
+# the trap. Nothing outside this directory is touched now.
+export HOME="$ROOT"
 EOF
 cat "$ROOT/env.sh"
