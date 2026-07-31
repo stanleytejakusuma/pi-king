@@ -14,7 +14,18 @@ set -uo pipefail
 # session" prefills where you actually are rather than where the hub lives.
 export PI_KING_CWD="${PI_KING_CWD:-$PWD}"
 
-HUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hub"
+# Resolve symlinks so the hub directory is found via the real script location,
+# not via whatever alias invoked it. `readlink -f` is not portable to older
+# macOS, hence the loop.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$(dirname "$SELF")/$LINK" ;;
+  esac
+done
+HUB_DIR="$(cd "$(dirname "$SELF")/.." && pwd)/hub"
 ACTION_FILE="$(mktemp -t pi-king-action)"
 export PI_KING_ACTION_FILE="$ACTION_FILE"
 
