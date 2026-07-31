@@ -379,7 +379,7 @@ function killTmuxSession(name: string): { ok: boolean; message: string } {
  * when tmux detaches, the wrapper relaunches the hub.
  */
 function requestWrapperAction(action: HubAction): boolean {
-  const target = process.env.PI_AGENTS_ACTION_FILE;
+  const target = process.env.PI_KING_ACTION_FILE ?? process.env.PI_AGENTS_ACTION_FILE;
   if (!target) return false;
   try {
     writeFileSync(target, JSON.stringify(action));
@@ -612,7 +612,7 @@ class DashboardView implements Component {
       return;
     }
     if (step.kind === "new-name") {
-      this.startComposer({ kind: "new-dir", name: value }, this.invocationCwd);
+      this.startComposer({ kind: "new-dir", name: value }, process.env.PI_KING_CWD?.trim() || this.invocationCwd);
       return;
     }
     if (step.kind === "new-dir") {
@@ -981,6 +981,11 @@ function installSessionTracker(pi: ExtensionAPI) {
    * process just wrote, and the session vanishes from the dashboard despite
    * running perfectly — observed exactly that. */
   let handedOff = false;
+  /** Timers we own. Pi replaces the whole ExtensionRunner on /reload and does
+   * not unwind side effects made outside its registries, so anything started
+   * here must be cleared in session_shutdown or it survives as a zombie
+   * alongside the freshly loaded instance. */
+  const timers = new Set<ReturnType<typeof setInterval>>();
   const subagents = new Map<string, SubagentStatus>();
   let ctxRef: ExtensionContext | undefined;
 
@@ -1038,10 +1043,11 @@ function installSessionTracker(pi: ExtensionAPI) {
     const settle = setInterval(() => {
       attempts++;
       try {
-        if (isInteractive(ctx)) { persist(ctx); clearInterval(settle); }
+        if (isInteractive(ctx)) { persist(ctx); clearInterval(settle); timers.delete(settle); }
       } catch { /* keep trying */ }
-      if (attempts >= 10) clearInterval(settle);
+      if (attempts >= 10) { clearInterval(settle); timers.delete(settle); }
     }, 1000);
+    timers.add(settle);
 
     // Optional: subagent rollup, only if a subagent extension is present.
     // Absent on a stock install, and its absence is not an error.
@@ -1089,6 +1095,12 @@ function installSessionTracker(pi: ExtensionAPI) {
     if (bgQueued) { bgQueued = false; void runBackgroundHandoff(ctx); }
   });
   pi.on("session_shutdown", (_e, ctx) => {
+    // Fires for reason "reload" as well as a real exit — which is precisely
+    // when orphaned timers would otherwise accumulate, since Pi builds a new
+    // ExtensionRunner and never unwinds side effects made outside its own
+    // registries. Clear unconditionally, before any early return.
+    for (const t of timers) clearInterval(t);
+    timers.clear();
     if (!isInteractive(ctx)) return;
     // Do not remove the file if a handoff transferred this id to another
     // process; that file is now theirs, not ours.

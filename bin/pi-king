@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# pi-king — open the cross-project session dashboard.
+#
+# Deliberately does NOT set PI_CODING_AGENT_DIR. An earlier version pointed the
+# hub at a private agent directory to get a quiet startup; because that variable
+# is per-process, the hub and the sessions it spawned then computed different
+# paths for their shared state and could not see each other. The dashboard was
+# silently empty. Quiet startup now comes from a PROJECT settings file in the
+# hub directory, which Pi resolves from cwd independently of the agent dir, so
+# your own Pi configuration is left completely untouched.
+set -uo pipefail
+
+# The directory you invoked from, preserved across the cd below so that "new
+# session" prefills where you actually are rather than where the hub lives.
+export PI_KING_CWD="${PI_KING_CWD:-$PWD}"
+
+HUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hub"
+ACTION_FILE="$(mktemp -t pi-king-action)"
+export PI_KING_ACTION_FILE="$ACTION_FILE"
+
+cleanup() {
+  rm -f "$ACTION_FILE"
+  # Pi prints startup lines to the main buffer before its TUI takes over, so
+  # they linger after exit; clear them so quitting returns a clean prompt.
+  [ -t 1 ] && printf '\033[H\033[2J\033[3J'
+  return 0
+}
+trap cleanup EXIT
+
+cd "$HUB_DIR" || exit 1
+
+while true; do
+  : > "$ACTION_FILE"
+
+  pi --no-session --no-tools --no-context-files --no-skills --agents-hub "$@"
+
+  # No action written => the user quit the dashboard. Done.
+  [ -s "$ACTION_FILE" ] || break
+
+  target="$(sed -n 's/.*"tmuxName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ACTION_FILE" | head -1)"
+  [ -n "$target" ] || break
+
+  # tmux owns the terminal exclusively here; blocks until the user detaches.
+  tmux attach-session -t "$target"
+done

@@ -2,15 +2,36 @@
   "name": "pi-king",
   "version": "0.1.0",
   "description": "Background a Pi session and come back to it later. A local control plane for long-running Pi sessions.",
-  "keywords": ["pi-package", "pi", "pi-extension", "tmux", "session", "dashboard", "persistence"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "tmux",
+    "session",
+    "dashboard",
+    "persistence"
+  ],
   "license": "MIT",
   "type": "module",
-  "files": ["src", "docs", "tools", "README.md", "LICENSE"],
+  "files": [
+    "src",
+    "bin",
+    "hub",
+    "docs",
+    "tools",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.0",
     "@earendil-works/pi-tui": ">=0.80.0"
+  },
+  "bin": {
+    "pi-king": "./bin/pi-king"
   }
 }

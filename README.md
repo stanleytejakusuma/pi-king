@@ -71,6 +71,9 @@ Requires [tmux](https://github.com/tmux/tmux) for persistence. Without it,
 pi-king still runs and lists sessions — it just cannot background them, and
 says so.
 
+pi-king does not modify your Pi configuration. It never sets
+`PI_CODING_AGENT_DIR`, and sessions it spawns inherit your normal setup.
+
 ### Recommended tmux settings
 
 Pi negotiates the kitty keyboard protocol. Without these, modified keys
@@ -84,7 +87,7 @@ set -s extended-keys-format csi-u
 ## Use
 
 ```bash
-pi-king          # open the dashboard
+pi-king          # open the dashboard (installed as a bin by the package)
 ```
 
 | Key | Action |
@@ -111,33 +114,18 @@ Detach from an attached session with tmux's own `Ctrl+B d`.
 
 ## Design notes
 
-**Explicit opt-in.** A session appears only if it was spawned by pi-king or
-surfaced with `/bg`. Being alive is not enough — most sessions have no business
-on a supervisory view.
+Longer reasoning in **[docs/SPEC.md](docs/SPEC.md)**. The short version:
 
-**No fabricated numbers.** There are no progress bars, because Pi exposes no
-completion percentage for a session or a subagent. Elapsed time and subagent
-counts carry the same signal honestly. Missing data renders as nothing, never
-as a zero that implies a measurement.
-
-**Liveness is identity, not existence.** A pid alone proves only that *some*
-process holds it. Sessions killed abruptly leave their status file behind, and
-the OS later recycles that pid — often onto another live Pi. pi-king compares
-process start times, so a dead entry cannot masquerade as a healthy one.
-
-**Standalone.** Depends on stock Pi and the Node standard library. Subagent
-rollup is feature-detected: with a subagent extension installed you get the
-counts, without one the column is simply absent.
-
-## Interoperating
-
-pi-king publishes the format sessions use to advertise themselves:
-**[docs/FORMAT.md](docs/FORMAT.md)** — versioned, with writer and reader
-requirements. Anything may read or write it.
-
-It exists because Pi has no lifecycle hook for "session started / state
-changed / stopped", so every extension that needs live session state invents
-its own private representation. This is an attempt at a documented one.
+- **Explicit opt-in.** A session appears only if pi-king spawned it or you ran
+  `/bg`. Being alive is not enough.
+- **No fabricated numbers.** No progress bars — Pi exposes no completion
+  percentage, so a bar would be invented. Missing data renders as nothing,
+  never as a zero implying a measurement.
+- **Liveness is identity, not existence.** A pid alone proves only that *some*
+  process holds it; abruptly-killed sessions leave files behind and the OS
+  recycles pids onto other live Pi sessions. Process start times are compared.
+- **Standalone.** Stock Pi and the Node standard library only. Subagent rollup
+  is feature-detected.
 
 ## Platform support
 
@@ -159,6 +147,19 @@ and degrades to a message pointing at `/bg`. Everything else is portable.
 
 The wordmark is generated, not a magic constant:
 `python3 tools/braille-art.py 11`.
+
+## Updating
+
+`/reload` inside a running session re-imports extensions from disk (it clears
+Pi's module cache), so a backgrounded session picks up newly installed or
+updated extensions without losing its history. No restart needed.
+
+## AI disclosure
+
+Substantially written with AI assistance, then reviewed, tested, and
+debugged by hand. Several designs here exist because a naive version failed in
+practice: `docs/SPEC.md` records what broke and why the current shape was
+chosen. Issues and corrections welcome.
 
 ## License
 
