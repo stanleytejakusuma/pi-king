@@ -57,9 +57,13 @@ ffmpeg -y -loglevel error -i media/demo.mp4 -i /tmp/pi-king-pal.png \
 rm -f /tmp/pi-king-pal.png
 echo "wrote media/demo.mp4 and media/demo.gif"
 
-# Stills for the README. Pulled from the same recording so they cannot drift
-# from what the demo actually shows.
-ffmpeg -y -loglevel error -ss 41 -i media/demo.mp4 -frames:v 1 media/dashboard.png
+# Stills for the README.
+#
+# These timestamps are tied to the tape's pacing and DO NOT survive edits to it.
+# A previous version shipped a still captioned "the dashboard" that was actually
+# a terminal scroll, because the tape changed and the offsets did not. After any
+# change to demo.tape, open each PNG and confirm it shows what its caption says.
+ffmpeg -y -loglevel error -ss 44 -i media/demo.mp4 -frames:v 1 media/dashboard.png
 ffmpeg -y -loglevel error -ss 57 -i media/demo.mp4 -frames:v 1 media/reattach.png
 ffmpeg -y -loglevel error -ss 17 -i media/demo.mp4 -vf "crop=iw:520:0:0" -frames:v 1 media/backgrounding.png
 echo "wrote media/dashboard.png, media/reattach.png, media/backgrounding.png"
