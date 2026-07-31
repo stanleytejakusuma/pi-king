@@ -28,13 +28,14 @@
       "./src/index.ts"
     ],
     "video": "./media/demo.mp4",
-    "image": "./media/dashboard.png"
+    "image": "./media/demo.gif"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.0",
     "@earendil-works/pi-tui": ">=0.80.0"
   },
   "bin": {
-    "pi-king": "./bin/pi-king"
+    "pi-king": "./bin/pi-king",
+    "pi-agents": "./bin/pi-king"
   }
 }

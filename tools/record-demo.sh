@@ -44,3 +44,15 @@ tmux kill-server 2>/dev/null
 rm -f "$HOME/.pi/king/session-status/"*.json
 
 cd "$REPO" && vhs media/demo.tape
+
+# GitHub renders an inline player only for its own user-attachments URLs, which
+# require a manual upload through the web UI. A committed GIF renders from a
+# relative path instead, so the README works in a fresh clone, on npm, and in
+# any mirror, with nothing to re-upload. Two-pass palette: default GIF
+# quantization mangles terminal text at this size.
+ffmpeg -y -loglevel error -i media/demo.mp4 \
+  -vf "fps=10,scale=1000:-1:flags=lanczos,palettegen=stats_mode=diff" /tmp/pi-king-pal.png
+ffmpeg -y -loglevel error -i media/demo.mp4 -i /tmp/pi-king-pal.png \
+  -lavfi "fps=10,scale=1000:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3" media/demo.gif
+rm -f /tmp/pi-king-pal.png
+echo "wrote media/demo.mp4 and media/demo.gif"

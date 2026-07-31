@@ -24,7 +24,7 @@ A local control plane for long-running [Pi](https://pi.dev) sessions.
 
 ## Demo
 
-https://github.com/user-attachments/assets/REPLACE-AFTER-UPLOAD
+![pi-king demo](media/demo.gif)
 
 Three sessions in three projects are backgrounded with `/bg`, listed together
 in the dashboard, and one is reattached with its history intact — the same
@@ -35,8 +35,6 @@ skills and prompts, synthetic call logs, and a provider under a neutral name.
 A recording holds every panel on screen for its full length, so without that
 it would document the author's machine rather than this tool. Reproduce with
 `tools/record-demo.sh`.
-
-![dashboard](media/dashboard.png)
 
 ## The problem
 
@@ -94,6 +92,8 @@ the launcher for that:
 npm i -g pi-king   # provides the `pi-king` command
 pi-king            # opens the dashboard, owns the attach loop
 ```
+
+`pi-agents` is installed as an alias for the same launcher.
 
 Requires [tmux](https://github.com/tmux/tmux) for persistence. Without it,
 pi-king still runs and lists sessions — it just cannot background them, and
