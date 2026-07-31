@@ -22,6 +22,15 @@ A local control plane for long-running [Pi](https://pi.dev) sessions.
 
 ---
 
+## Demo
+
+https://github.com/user-attachments/assets/REPLACE-AFTER-UPLOAD
+
+A session is backgrounded with `/bg`, listed in the dashboard, then reattached
+with its history intact — the same process, not a replay of its transcript.
+
+![dashboard](media/dashboard.png)
+
 ## The problem
 
 You cannot currently background a Pi session and reattach to the running

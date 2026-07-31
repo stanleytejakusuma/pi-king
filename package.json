@@ -14,18 +14,21 @@
   "license": "MIT",
   "type": "module",
   "files": [
-    "src",
-    "bin",
-    "hub",
-    "docs",
-    "tools",
+    "LICENSE",
     "README.md",
-    "LICENSE"
+    "bin",
+    "docs",
+    "hub",
+    "media",
+    "src",
+    "tools"
   ],
   "pi": {
     "extensions": [
       "./src/index.ts"
-    ]
+    ],
+    "video": "./media/demo.mp4",
+    "image": "./media/dashboard.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.0",
