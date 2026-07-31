@@ -116,7 +116,18 @@ import {
 const REFRESH_MS = 1000;
 const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, trust: 0, working: 1, idle: 2 };
 const MESSAGE_LINGER_MS = 4000;
-const TMUX = "/opt/homebrew/bin/tmux";
+/** Resolved once at load rather than hardcoded. tmux lives in different places
+ * depending on how it was installed: /opt/homebrew/bin on Apple Silicon,
+ * /usr/local/bin on Intel macOS, /usr/bin on most Linux distributions, and
+ * elsewhere again under MacPorts or Nix. A fixed path meant every tmux query
+ * returned nothing on any machine that differed, so the dashboard listed no
+ * sessions and looked broken rather than misconfigured. Falls back to a bare
+ * name so PATH lookup still gets a chance. */
+const TMUX = ((): string => {
+  const which = spawnSync("/usr/bin/env", ["which", "tmux"], { encoding: "utf8", timeout: 3000 });
+  const found = which.status === 0 ? (which.stdout || "").trim().split("\n")[0].trim() : "";
+  return found || "tmux";
+})();
 
 type DashboardEntry = {
   sessionId: string;
@@ -949,15 +960,36 @@ async function showDashboardOnce(ctx: ExtensionContext): Promise<HubAction | und
   );
 }
 
-/** Creates the session if needed, then defers the terminal-owning attach to
- * the wrapper. Returns false when there's no wrapper to defer to. */
+/** Moves the caller to a session, by whichever route is available.
+ *
+ * Inside tmux there is no terminal-ownership problem at all: `switch-client`
+ * relocates tmux's own client, so no second process ever contends for the tty,
+ * and the calling session keeps running in its own tmux session rather than
+ * being exited. That makes it strictly better than the wrapper handoff, and it
+ * is the only route that works for someone who installed the extension through
+ * `pi install` and therefore has no wrapper on PATH.
+ *
+ * Outside tmux the wrapper is still required, because a process cannot hand its
+ * controlling terminal to a child without both fighting over stdin. */
+function goToSession(action: HubAction): boolean {
+  if (action.type === "attach" && process.env.TMUX) {
+    const r = spawnSync(TMUX, ["switch-client", "-t", action.tmuxName], { encoding: "utf8", timeout: 3000 });
+    if (r.status === 0) return true;
+    // Fall through: switch-client fails if the target died between listing and
+    // selection, and the wrapper path reports that more usefully.
+  }
+  return requestWrapperAction(action);
+}
+
+/** Creates the session if needed, then moves the caller into it. Returns false
+ * when neither route is available, so the caller can tell the user what to run. */
 function dispatchHubAction(action: HubAction): { deferred: boolean; message?: string } {
   if (action.type === "create") {
     const created = createTmuxSession(action.name, action.dir);
     if (!created.ok) return { deferred: false, message: created.message };
-    return { deferred: requestWrapperAction({ type: "attach", tmuxName: action.name }), message: created.message };
+    return { deferred: goToSession({ type: "attach", tmuxName: action.name }), message: created.message };
   }
-  return { deferred: requestWrapperAction(action) };
+  return { deferred: goToSession(action) };
 }
 
 /* ------------------------------------------------- self-tracking ---------- */
@@ -1133,8 +1165,10 @@ function installSessionTracker(pi: ExtensionAPI) {
       ctx.ui.notify("Already under tmux \u2014 now visible on the pi-king dashboard.", "info");
       return;
     }
-    const which = spawnSync("/usr/bin/env", ["which", "tmux"], { encoding: "utf8", timeout: 3000 });
-    const tmux = which.status === 0 ? (which.stdout || "").trim() : "";
+    // TMUX is resolved at module load; probe it rather than re-resolving, so
+    // this agrees with what every other tmux call in the file will use.
+    const probe = spawnSync(TMUX, ["-V"], { encoding: "utf8", timeout: 3000 });
+    const tmux = probe.status === 0 ? TMUX : "";
     if (!tmux) {
       visible = true; persist(ctx);
       ctx.ui.notify("tmux not found on PATH \u2014 surfaced on the dashboard, but this session still ends with its terminal.", "warning");

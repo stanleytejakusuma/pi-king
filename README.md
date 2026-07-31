@@ -80,7 +80,19 @@ every project on the machine, and can put you back inside one.
 ## Install
 
 ```bash
-pi install npm:pi-king
+pi install git:github.com/stanleytejakusuma/pi-king
+```
+
+That gives you `/bg`, session tracking, and the `/pi-dashboard` command. Inside
+tmux, selecting a session in the dashboard switches to it directly.
+
+Outside tmux, attaching needs a process that can take over the terminal after
+Pi exits, which an extension cannot do from inside a running session. Install
+the launcher for that:
+
+```bash
+npm i -g pi-king   # provides the `pi-king` command
+pi-king            # opens the dashboard, owns the attach loop
 ```
 
 Requires [tmux](https://github.com/tmux/tmux) for persistence. Without it,
