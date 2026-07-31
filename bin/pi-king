@@ -38,6 +38,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# tmux is a hard requirement for the part people install this for. The
+# dashboard itself works without it — it just has nothing to list and cannot
+# background anything — so this warns rather than exits, and the attach path
+# below fails with an explanation instead of "command not found".
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "pi-king: tmux is not installed." >&2
+  echo "  Sessions cannot be backgrounded or reattached without it." >&2
+  echo "  macOS: brew install tmux     Debian/Ubuntu: apt install tmux" >&2
+  echo >&2
+fi
+
 cd "$HUB_DIR" || exit 1
 
 while true; do
@@ -52,5 +63,9 @@ while true; do
   [ -n "$target" ] || break
 
   # tmux owns the terminal exclusively here; blocks until the user detaches.
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "pi-king: cannot attach to '$target' — tmux is not installed." >&2
+    break
+  fi
   tmux attach-session -t "$target"
 done

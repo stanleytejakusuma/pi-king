@@ -182,7 +182,7 @@ function livePiPids(): Map<number, number> | undefined {
     // matching on cli.js rejected every live session. Trailing space is
     // significant: process.title pads the original argv buffer.
     const cmd = m[3].trim();
-    if (cmd === "pi" || cmd.startsWith("pi-") || /pi-coding-agent|\bcli\.js\b/.test(cmd)) {
+    if (cmd === "pi" || cmd.startsWith("pi-")) {
       const started = Date.parse(m[2]);
       if (Number.isFinite(started)) pids.set(Number(m[1]), started);
     }
@@ -333,14 +333,11 @@ const pendingRenames = new Map<string, string>();
 /** Applies any queued rename whose session has since settled. Called on refresh. */
 function flushPendingRenames(rows: Row[]): void {
   if (pendingRenames.size === 0) return;
-  const which = spawnSync("/usr/bin/env", ["which", "tmux"], { encoding: "utf8", timeout: 3000 });
-  const tmux = which.status === 0 ? (which.stdout || "").trim() : "";
-  if (!tmux) return;
   for (const [tmuxName, desired] of [...pendingRenames]) {
     const row = rows.find((r) => r.kind === "session" && r.entry.tmuxName === tmuxName);
     if (!row || row.kind !== "session") continue;
     if (row.entry.state !== "idle") continue;
-    spawnSync(tmux, ["send-keys", "-t", tmuxName, `/name ${desired}`, "Enter"], { encoding: "utf8", timeout: 3000 });
+    spawnSync(TMUX, ["send-keys", "-t", tmuxName, `/name ${desired}`, "Enter"], { encoding: "utf8", timeout: 3000 });
     pendingRenames.delete(tmuxName);
   }
 }
@@ -390,7 +387,7 @@ function killTmuxSession(name: string): { ok: boolean; message: string } {
  * when tmux detaches, the wrapper relaunches the hub.
  */
 function requestWrapperAction(action: HubAction): boolean {
-  const target = process.env.PI_KING_ACTION_FILE ?? process.env.PI_AGENTS_ACTION_FILE;
+  const target = process.env.PI_KING_ACTION_FILE;
   if (!target) return false;
   try {
     writeFileSync(target, JSON.stringify(action));

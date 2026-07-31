@@ -22,6 +22,20 @@ A local control plane for long-running [Pi](https://pi.dev) sessions.
 
 ---
 
+## Requirements
+
+**tmux is required.** Persistence is tmux — pi-king does not implement its own
+process supervision, it hands the session to tmux and keeps track of what it
+handed over. Without tmux the dashboard still opens and the extension still
+loads, but there is nothing to background and nothing to reattach to.
+
+```bash
+brew install tmux          # macOS
+sudo apt install tmux      # Debian/Ubuntu
+```
+
+Also needs Node (whatever Pi itself requires) and a terminal that Pi can drive.
+
 ## Demo
 
 ![pi-king demo](media/demo.gif)
@@ -165,17 +179,6 @@ Longer reasoning in **[docs/SPEC.md](docs/SPEC.md)**. The short version:
 - **Standalone.** Stock Pi and the Node standard library only. Subagent rollup
   is feature-detected.
 
-## Platform support
-
-| | |
-|---|---|
-| macOS | developed and tested here |
-| Linux | should work; **not yet verified** |
-| Windows | untested; tmux dependency likely makes it WSL-only |
-
-Jump-to-tab for non-tmux sessions is macOS + Ghostty only, feature-detected,
-and degrades to a message pointing at `/bg`. Everything else is portable.
-
 ## Docs
 
 - **[docs/FORMAT.md](docs/FORMAT.md)** — the session-status contract
@@ -191,6 +194,36 @@ The wordmark is generated, not a magic constant:
 `/reload` inside a running session re-imports extensions from disk (it clears
 Pi's module cache), so a backgrounded session picks up newly installed or
 updated extensions without losing its history. No restart needed.
+
+## Limitations
+
+Stated plainly rather than discovered later:
+
+- **macOS only, in practice.**
+
+  | | |
+  |---|---|
+  | macOS | developed and tested here |
+  | Linux | should work — tmux is located at runtime, not assumed — but **never verified** |
+  | Windows | unsupported; the launcher is a POSIX shell script, so WSL at best |
+
+- **Jump-to-tab for non-tmux sessions is macOS + Ghostty only.** Feature-detected,
+  and degrades to a message pointing at `/bg`.
+- **The no-tmux path is untested.** It is written and it degrades deliberately,
+  but that branch has never actually fired in anger.
+- **Two dashboards at once is undefined.** Nothing coordinates two supervisors
+  reading and pruning the same status directory. One at a time.
+- **A crash between spawning and verifying a handoff can strand a session.**
+  `/bg` verifies the new tmux session exists before retiring the old process, but
+  a kill in that window leaves a session running that nothing is tracking. It is
+  still reachable with `tmux attach`.
+- **Attaching outside tmux needs the launcher.** A process cannot hand its
+  controlling terminal to a child without both fighting for stdin, so the
+  extension alone can only tell you the command to run. Inside tmux this does
+  not apply.
+- **Stats are optional and format-specific.** The metrics band reads a call-log
+  layout that no stock Pi install writes. Unset `PI_KING_CALL_LOGS` means no
+  band, which is the intended default.
 
 ## AI disclosure
 

@@ -1,7 +1,7 @@
 {
   "name": "pi-king",
-  "version": "0.1.0",
-  "description": "Background a Pi session and come back to it later. A local control plane for long-running Pi sessions.",
+  "version": "0.1.1",
+  "description": "Background a Pi session into tmux and come back to it later. A local control plane for long-running Pi sessions. Requires tmux.",
   "keywords": [
     "pi-package",
     "pi",
@@ -9,7 +9,8 @@
     "tmux",
     "session",
     "dashboard",
-    "persistence"
+    "persistence",
+    "session-manager"
   ],
   "license": "MIT",
   "type": "module",

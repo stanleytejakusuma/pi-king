@@ -232,17 +232,19 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
  * previous value (or undefined on first paint) and a refresh is kicked off in
  * the background, so the dashboard is navigable immediately on open.
  */
-export class StatsCache {
+export const STATS_TTL_MS = 60_000;
+
+class StatsCache {
   private value: UsageStats | undefined;
   private loaded = false;
   private fetchedAt = 0;
   private inFlight = false;
 
-  constructor(private onUpdate: () => void, private ttlMs = 60_000) {}
+  constructor(private onUpdate: () => void) {}
 
   /** Non-blocking. Triggers a background refresh when stale. */
   get(): { stats: UsageStats | undefined; loaded: boolean } {
-    if (!this.inFlight && Date.now() - this.fetchedAt > this.ttlMs) {
+    if (!this.inFlight && Date.now() - this.fetchedAt > STATS_TTL_MS) {
       this.inFlight = true;
       readUsageStats()
         .then((s) => { this.value = s; })
@@ -452,10 +454,10 @@ const QUOTES: readonly string[] = [
 ];
 
 /** Day-of-year rotation: stable for a whole day, no randomness, no state. */
-export function quoteOfTheDay(agentDir: string = AGENT_DIR): string {
+export function quoteOfTheDay(): string {
   let pool: string[] = [...QUOTES];
   try {
-    const custom = readFileSync(join(agentDir, "pi-king-quotes.txt"), "utf8")
+    const custom = readFileSync(join(AGENT_DIR, "pi-king-quotes.txt"), "utf8")
       .split("\n")
       .map((l) => l.trim())
       .filter((l) => l && !l.startsWith("#"));
