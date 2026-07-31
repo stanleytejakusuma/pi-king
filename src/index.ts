@@ -43,7 +43,7 @@
  * `#<shortId>` suffix pi-alerts.ts embeds in every title.
  */
 
-import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import type { Component, TUI, Theme } from "@earendil-works/pi-tui";
@@ -1048,6 +1048,21 @@ function installSessionTracker(pi: ExtensionAPI) {
       if (attempts >= 10) { clearInterval(settle); timers.delete(settle); }
     }, 1000);
     timers.add(settle);
+
+    // Heartbeat. A supervisor prunes status files whose owner looks dead, and
+    // that judgement can be wrong — a session mid-handoff briefly advertises
+    // the pid of the process that just exited. Without this one bad prune
+    // makes a live session invisible permanently, since an idle session emits
+    // no further events to trigger another write. Re-assert only when the file
+    // is actually missing, so steady-state cost is a single stat.
+    const heartbeat = setInterval(() => {
+      try {
+        if (handedOff || !isInteractive(ctx)) return;
+        if (!existsSync(statusPath(ctx))) persist(ctx);
+      } catch { /* transient fs error; retry next tick */ }
+    }, 15000);
+    if (typeof heartbeat.unref === "function") heartbeat.unref();
+    timers.add(heartbeat);
 
     // Optional: subagent rollup, only if a subagent extension is present.
     // Absent on a stock install, and its absence is not an error.
