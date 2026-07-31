@@ -232,9 +232,9 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
  * previous value (or undefined on first paint) and a refresh is kicked off in
  * the background, so the dashboard is navigable immediately on open.
  */
-export const STATS_TTL_MS = 60_000;
+const STATS_TTL_MS = 60_000;
 
-class StatsCache {
+export class StatsCache {
   private value: UsageStats | undefined;
   private loaded = false;
   private fetchedAt = 0;

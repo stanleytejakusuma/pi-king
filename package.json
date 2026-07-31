@@ -1,6 +1,6 @@
 {
   "name": "pi-king",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Background a Pi session into tmux and come back to it later. A local control plane for long-running Pi sessions. Requires tmux.",
   "keywords": [
     "pi-package",
@@ -38,5 +38,9 @@
   "bin": {
     "pi-king": "./bin/pi-king",
     "pi-agents": "./bin/pi-king"
+  },
+  "scripts": {
+    "prepublishOnly": "node tools/check-exports.mjs",
+    "check": "node tools/check-exports.mjs"
   }
 }
