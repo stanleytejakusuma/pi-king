@@ -1,0 +1,1263 @@
+/**
+ * pi-dashboard.ts — cross-project live supervisor for every active Pi session,
+ * with tmux-backed background/attach/create/rename/delete session management.
+ *
+ * Two entry points:
+ *  - `/pi-dashboard` slash command, usable from any existing interactive session.
+ *  - The `--agents-hub` flag (wired to the standalone `pi-agents` shell wrapper),
+ *    which opens the dashboard immediately at session_start and loops on it
+ *    until the user quits, instead of dropping into a normal chat prompt.
+ *
+ * Data layer (unchanged from the original design, per instruction not to rework
+ * it): `pi-alerts.ts` owns the per-session state model (working/idle/attention/
+ * error/trust) and persists a small JSON snapshot per session to
+ * `~/.pi/agent/session-status/<sessionId>.json` on every state transition; this
+ * extension only ever *reads* that directory, and prunes entries whose writer
+ * PID is gone (honest degradation — a crashed session simply disappears).
+ *
+ * Session management layer (new): real background/attach is implemented on top
+ * of tmux, not reinvented inside Pi's extension API. Checked before building on
+ * it: `pi --mode rpc` is a single-client stdin/stdout wrapper, not a multi-client
+ * attach server; `--resume`/`--session <id>` starts a *new* process against old
+ * history, it does not reattach to an already-running one. Pi has no native
+ * attach/detach primitive. tmux does, for free: `tmux detach-client` backgrounds
+ * the current pane without disturbing the process inside it; `tmux attach-session`
+ * takes over the current terminal with that exact live pane; `tmux new-session`/
+ * `rename-session`/`kill-session` cover create/rename/delete. Sessions are
+ * correlated between the two data sources (pi-alerts status files and tmux) by
+ * name: when a session is created *through* this dashboard, the same string is
+ * used as both the tmux session name and the `pi --name` value, so a status
+ * file's `name` field matching a live tmux session name means that entry is
+ * attach-capable. Ad-hoc sessions started by typing `pi` directly into a plain
+ * terminal (not created through the dashboard) have no tmux session to
+ * correlate with, so they fall back to the original Ghostty-tab-jump mechanism
+ * — a known, accepted tradeoff, not a bug.
+ *
+ * Navigation fallback (unchanged): Ghostty renders its own tab bar (confirmed
+ * empirically — the accessibility tree exposes zero tab UI elements), so
+ * System Events / AXRaise tab-matching is impossible. Ghostty's own AppleScript
+ * dictionary (`Ghostty.sdef`) is used instead: `tab.title` is broken in Ghostty
+ * 1.3.1 (confirmed empirically — raises `-1700` on every read) but
+ * `terminal.name` (the same title text) and `terminal.workingDirectory` both
+ * work, and `select tab` / `activate window` both work. Matched by the stable
+ * `#<shortId>` suffix pi-alerts.ts embeds in every title.
+ */
+
+import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import type { Component, TUI, Theme } from "@earendil-works/pi-tui";
+import { Input, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { homedir } from "node:os";
+
+/* ---------------------------------------------------------------- state -- */
+/** Coarse session lifecycle. Owned here so pi-king depends on stock Pi only. */
+export type TitleState = "working" | "idle" | "attention" | "error" | "trust";
+
+export const stateIcon: Record<TitleState, string> = {
+  working: "\u23f3", idle: "\u2713", attention: "\u1f514", error: "\u26a0", trust: "\u1f510",
+};
+
+export type SubagentStatus = {
+  id: string;
+  agentType?: string;
+  description: string;
+  status: "queued" | "running" | "completed" | "failed";
+  startedAt: number;
+  completedAt?: number;
+};
+
+export type SessionStatusFile = {
+  formatVersion: 1;
+  id: string;
+  name: string | undefined;
+  cwd: string;
+  project: string;
+  model: string | undefined;
+  pid: number;
+  startedAt: number;
+  lastActivity: number;
+  status: TitleState;
+  activity: string;
+  title: string;
+  sessionFile: string | undefined;
+  subagents: SubagentStatus[];
+  visible: boolean;
+  kingToken?: string;
+};
+
+/**
+ * Where sessions advertise themselves.
+ *
+ * Deliberately NOT derived from PI_CODING_AGENT_DIR. That variable is
+ * per-process: the supervisor may run against a minimal config dir while the
+ * sessions it spawns use the user's normal one, and two participants computing
+ * different paths simply never see each other. A rendezvous point must be the
+ * same for everyone, so it is a fixed default with one explicit override.
+ *
+ * PI_KING_STATUS_DIR exists for sandboxes and tests; if you set it, set it for
+ * every participant.
+ */
+export const SESSION_STATUS_DIR =
+  process.env.PI_KING_STATUS_DIR?.trim() || join(homedir(), ".pi", "king", "session-status");
+import {
+  PI_ART,
+  StatsCache,
+  sparkline,
+  readInventory,
+  readRecentProjects,
+  quoteOfTheDay,
+  type Inventory,
+  type RecentProject,
+  type UsageStats,
+} from "./data.ts";
+
+const REFRESH_MS = 1000;
+const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, trust: 0, working: 1, idle: 2 };
+const MESSAGE_LINGER_MS = 4000;
+const TMUX = "/opt/homebrew/bin/tmux";
+
+type DashboardEntry = {
+  sessionId: string;
+  shortId: string;
+  cwd: string;
+  project: string;
+  name: string | undefined;
+  state: TitleState;
+  lastActivity: string;
+  updatedAt: number;
+  subagents: SubagentStatus[];
+  kingToken: string | undefined;
+  tmuxName: string | undefined; // resolved live tmux session name, if correlated
+};
+
+type TmuxSession = { name: string; attached: boolean; windows: number; createdAt: number; token: string };
+
+/** A row that's a bare tmux session with no matching pi-alerts status file — an
+ * external/non-Pi process, or a Pi session that crashed without cleaning up its
+ * tmux wrapper. Still attachable/killable, just with no Pi-side metadata. */
+type OrphanRow = { kind: "orphan"; tmux: TmuxSession };
+type SessionRow = { kind: "session"; entry: DashboardEntry };
+type Row = SessionRow | OrphanRow;
+
+type HubAction =
+  | { type: "attach"; tmuxName: string }
+  | { type: "create"; name: string; dir: string };
+
+/**
+ * Liveness verified by *identity*, not mere existence.
+ *
+ * `process.kill(pid, 0)` only proves some process holds that pid — not that it
+ * is ours. Sessions killed with `tmux kill-session` never run their shutdown
+ * hook, so their status file survives; the OS later recycles that pid onto an
+ * unrelated process and the dead row springs back to life claiming to run.
+ * Observed directly: a finished session's file reported ALIVE on pid 2304
+ * after the pid had been reused.
+ *
+ * One `ps` snapshot per refresh, requiring the pid to still belong to a Pi
+ * process. Also cheaper than a kill(2) syscall per entry.
+ */
+function livePiPids(): Map<number, number> | undefined {
+  const res = spawnSync("/bin/ps", ["-eo", "pid=,lstart=,command="], { encoding: "utf8", timeout: 3000 });
+  if (res.status !== 0 || !res.stdout) return undefined; // unknown — do not prune
+  const pids = new Map<number, number>();
+  for (const line of res.stdout.split("\n")) {
+    // pid, fixed-width lstart ("Fri Jul 31 12:06:14 2026"), then command.
+    const m = /^\s*(\d+)\s+(\w{3} \w{3} ?\d+ \d{2}:\d{2}:\d{2} \d{4})\s+(.*)$/.exec(line);
+    if (!m) continue;
+    // Pi sets process.title, so ps reports the command as bare "pi" (or
+    // "pi-rpc") — never the node/cli.js command line. Verified empirically:
+    // matching on cli.js rejected every live session. Trailing space is
+    // significant: process.title pads the original argv buffer.
+    const cmd = m[3].trim();
+    if (cmd === "pi" || cmd.startsWith("pi-") || /pi-coding-agent|\bcli\.js\b/.test(cmd)) {
+      const started = Date.parse(m[2]);
+      if (Number.isFinite(started)) pids.set(Number(m[1]), started);
+    }
+  }
+  return pids;
+}
+
+/** Reads every session-status file, drops (and deletes) any whose writer PID is gone. */
+function readSessions(): DashboardEntry[] {
+  let files: string[];
+  try {
+    files = readdirSync(SESSION_STATUS_DIR).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const live = livePiPids();
+  const entries: DashboardEntry[] = [];
+  for (const file of files) {
+    const full = join(SESSION_STATUS_DIR, file);
+    let raw: SessionStatusFile;
+    try {
+      raw = JSON.parse(readFileSync(full, "utf8")) as SessionStatusFile;
+    } catch {
+      // Rare race with the writer's atomic tmp+rename, or a leftover .tmp file.
+      // Skip this cycle; it resolves itself on the next poll.
+      continue;
+    }
+    // Identity, not just existence. A pid alone is not proof: you have many Pi
+    // sessions open, so a dead session's leftover file can name a pid that now
+    // belongs to a *different* live Pi. Require the process start time to match
+    // what the session recorded for itself (60s tolerance covers the gap
+    // between process start and the first status write).
+    const procStart = live?.get(raw.pid);
+    const identityMismatch = procStart !== undefined && raw.startedAt > 0 &&
+      Math.abs(procStart - raw.startedAt) > 60_000;
+    if (live && (procStart === undefined || identityMismatch)) {
+      try {
+        unlinkSync(full);
+      } catch {
+        // Best-effort cleanup.
+      }
+      continue; // Honest degradation: a dead session simply isn't shown, ever.
+    }
+    // Only sessions that explicitly opted in — spawned through the dashboard
+    // or backgrounded via /bg — appear here. Being alive with a status file
+    // is not enough; every interactive session has one for pi-alerts' own
+    // notification purposes, most of which have nothing to do with this view.
+    if (!raw.visible) continue;
+    entries.push({
+      sessionId: raw.id,
+      shortId: raw.id.slice(0, 8),
+      cwd: raw.cwd,
+      project: raw.project,
+      name: raw.name,
+      state: raw.status,
+      lastActivity: raw.activity,
+      updatedAt: raw.lastActivity || Date.now(),
+      subagents: raw.subagents ?? [],
+      kingToken: raw.kingToken,
+      tmuxName: undefined,
+    });
+  }
+  // Group by directory first (contiguous runs so the renderer can emit a
+  // header when cwd changes), then by urgency within each directory.
+  entries.sort((a, b) =>
+    a.cwd.localeCompare(b.cwd) ||
+    STATE_PRIORITY[a.state] - STATE_PRIORITY[b.state] ||
+    b.updatedAt - a.updatedAt);
+  return entries;
+}
+
+/** Lists live tmux sessions. No server running is not an error — just zero sessions. */
+function listTmuxSessions(): TmuxSession[] {
+  const result = spawnSync(TMUX, ["list-sessions", "-F", "#{session_name}\t#{session_attached}\t#{session_windows}\t#{session_created}\t#{@pi_king_token}"], { encoding: "utf8", timeout: 3000 });
+  if (result.status !== 0 || !result.stdout) return [];
+  return result.stdout.trim().split("\n").filter(Boolean).map((line) => {
+    const [name, attached, windows, created, token] = line.split("\t");
+    return { name, attached: attached === "1", windows: Number(windows) || 0, createdAt: (Number(created) || 0) * 1000, token: token ?? "" };
+  });
+}
+
+/** Cross-references pi-alerts status entries with live tmux sessions by name. */
+function buildRows(): Row[] {
+  const entries = readSessions();
+  const tmuxSessions = listTmuxSessions();
+  const tmuxByToken = new Map(tmuxSessions.filter((t) => t.token).map((t) => [t.token, t]));
+  const tmuxByName = new Map(tmuxSessions.map((t) => [t.name, t]));
+  const matchedTmuxNames = new Set<string>();
+  const sessionRows: SessionRow[] = entries.map((entry) => {
+    // Token first: survives renames on either side. Name is only a fallback
+    // for sessions predating the token, or adopted rather than spawned.
+    const match = (entry.kingToken && tmuxByToken.get(entry.kingToken))
+      ?? (entry.name ? tmuxByName.get(entry.name) : undefined);
+    if (match) {
+      matchedTmuxNames.add(match.name);
+      return { kind: "session", entry: { ...entry, tmuxName: match.name } };
+    }
+    return { kind: "session", entry };
+  });
+  const orphanRows: OrphanRow[] = tmuxSessions
+    .filter((t) => !matchedTmuxNames.has(t.name))
+    .map((t) => ({ kind: "orphan", tmux: t }));
+  return [...sessionRows, ...orphanRows];
+}
+
+function tmuxError(result: ReturnType<typeof spawnSync>): string {
+  if (result.error) return result.error.message;
+  return (result.stderr || result.stdout || "tmux command failed").trim();
+}
+
+// Sessions created through the dashboard always get the normal, full
+// ~/.pi/agent config (skills, prompts, all extensions) regardless of what
+// env the tmux *server* itself inherited when it first started (which, if
+// started from the minimal pi-agents-hub process, would otherwise be
+// PI_CODING_AGENT_DIR=~/.pi/agent-hub — the hub's own lean config, wrong
+// for a real working session). `-e` on `new-session` sets the env for that
+// specific new session's process, independent of server-inherited env —
+// confirmed empirically, not assumed.
+const NORMAL_AGENT_DIR = `${process.env.HOME ?? ""}/.pi/agent`;
+
+function createTmuxSession(name: string, dir: string): { ok: boolean; message: string } {
+  // Identity token: stamped on the tmux session as a user option AND handed to
+  // Pi via env, so the pair stays correlated through any later rename.
+  const token = `pk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const result = spawnSync(TMUX, [
+    "new-session", "-d", "-s", name,
+    "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
+    // A new session inherits the tmux SERVER's environment, which may lack our
+    // PATH entirely. Pin it so `pi` resolves regardless of how the server started.
+    "-e", `PATH=${process.env.PATH ?? ""}`,
+    "-e", `PI_KING_TOKEN=${token}`,
+    // Dashboard-spawned sessions auto-opt-in to appearing on the dashboard
+    // (pi-alerts.ts checks this at session_start) — an ad-hoc `pi` typed
+    // directly into a plain terminal does not set this, and stays invisible
+    // to the dashboard unless it runs /bg itself.
+    "-e", "PI_DASHBOARD_SPAWNED=1",
+    "-c", dir, "--", "pi", "--name", name,
+  ], { encoding: "utf8", timeout: 5000 });
+  if (result.status !== 0) return { ok: false, message: `Failed to create session: ${tmuxError(result)}` };
+  spawnSync(TMUX, ["set-option", "-t", name, "@pi_king_token", token], { encoding: "utf8", timeout: 3000 });
+  return { ok: true, message: `Created "${name}" in ${dir}.` };
+}
+
+/** tmux name -> desired Pi session name, applied once that session goes idle.
+ * send-keys types into the live pane, so it must never fire mid-turn. */
+const pendingRenames = new Map<string, string>();
+
+/** Applies any queued rename whose session has since settled. Called on refresh. */
+function flushPendingRenames(rows: Row[]): void {
+  if (pendingRenames.size === 0) return;
+  const which = spawnSync("/usr/bin/env", ["which", "tmux"], { encoding: "utf8", timeout: 3000 });
+  const tmux = which.status === 0 ? (which.stdout || "").trim() : "";
+  if (!tmux) return;
+  for (const [tmuxName, desired] of [...pendingRenames]) {
+    const row = rows.find((r) => r.kind === "session" && r.entry.tmuxName === tmuxName);
+    if (!row || row.kind !== "session") continue;
+    if (row.entry.state !== "idle") continue;
+    spawnSync(tmux, ["send-keys", "-t", tmuxName, `/name ${desired}`, "Enter"], { encoding: "utf8", timeout: 3000 });
+    pendingRenames.delete(tmuxName);
+  }
+}
+
+function renameTmuxSession(oldName: string, newName: string, piIsIdle: boolean): { ok: boolean; message: string } {
+  const result = spawnSync(TMUX, ["rename-session", "-t", oldName, newName], { encoding: "utf8", timeout: 3000 });
+  if (result.status !== 0) return { ok: false, message: `Failed to rename: ${tmuxError(result)}` };
+
+  // Also rename the Pi session living inside it, via Pi's own /name command,
+  // so both halves agree and the rename is not half-applied.
+  //
+  // Only when that session is idle: send-keys types into the live pane, and
+  // injecting text mid-turn would land in an in-flight prompt. A tmux-only
+  // rename still displays correctly (the row prefers the tmux name), so
+  // skipping this is a cosmetic mismatch inside Pi, not a broken row.
+  if (piIsIdle) {
+    spawnSync(TMUX, ["send-keys", "-t", newName, `/name ${newName}`, "Enter"], { encoding: "utf8", timeout: 3000 });
+    return { ok: true, message: `Renamed to "${newName}".` };
+  }
+  // Busy: queue the Pi-side rename rather than dropping it. It applies
+  // automatically once the session settles.
+  pendingRenames.set(newName, newName);
+  return { ok: true, message: `Renamed to "${newName}" \u2014 session is busy; its own name will follow once it settles.` };
+}
+
+function killTmuxSession(name: string): { ok: boolean; message: string } {
+  const result = spawnSync(TMUX, ["kill-session", "-t", name], { encoding: "utf8", timeout: 3000 });
+  if (result.status !== 0) return { ok: false, message: `Failed to delete: ${tmuxError(result)}` };
+  return { ok: true, message: `Deleted "${name}".` };
+}
+
+/**
+ * Hands a chosen action back to the `pi-agents` wrapper script, which runs the
+ * actual tmux command *after this process has fully exited*.
+ *
+ * This indirection is load-bearing, not ceremony. The original implementation
+ * spawned `tmux attach-session` as a child with `stdio: "inherit"` while Pi's
+ * own TUI was still live — which left two processes (Pi's TUI event loop and
+ * the tmux client) concurrently reading the same terminal stdin and writing
+ * the same stdout. Keystrokes were split nondeterministically between them and
+ * terminal-mode state was fought over, which is what actually produced the
+ * "server exited unexpectedly" client death on a keypress. Pi exposes no API
+ * to suspend/release its TUI mid-session (verified — no suspend/releaseTerminal
+ * in the extension or interactive-mode surface), so the only correct fix is to
+ * ensure exactly one process owns the terminal at a time: Pi writes the action
+ * and exits; the wrapper then execs tmux with the terminal entirely to itself;
+ * when tmux detaches, the wrapper relaunches the hub.
+ */
+function requestWrapperAction(action: HubAction): boolean {
+  const target = process.env.PI_AGENTS_ACTION_FILE;
+  if (!target) return false;
+  try {
+    writeFileSync(target, JSON.stringify(action));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Best-effort "jump to the terminal tab running this session".
+ *
+ * This is the only platform-specific code in pi-king, and it is strictly a
+ * convenience for sessions that are NOT tmux-backed. It is feature-detected
+ * and degrades to a message that points at the real fix (/bg), so a user on
+ * Linux, or in any terminal but Ghostty, loses a nicety rather than hitting an
+ * error.
+ *
+ * Ghostty is used because it exposes a real AppleScript object model; its own
+ * tab bar is invisible to the accessibility tree, so generic UI scripting
+ * cannot see tabs at all. `tab.title` is broken in Ghostty 1.3.1 (raises
+ * -1700), hence matching on `terminal.name` instead.
+ */
+function jumpSupported(): boolean {
+  if (process.platform !== "darwin") return false;
+  try {
+    statSync("/Applications/Ghostty.app");
+    statSync("/usr/bin/osascript");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function jumpToGhosttyTab(shortId: string): { ok: boolean; message: string } {
+  if (!jumpSupported()) {
+    return {
+      ok: false,
+      message: "Jump-to-tab needs macOS + Ghostty. Run /bg in that session to make it attachable from here instead.",
+    };
+  }
+  const marker = `#${shortId}`;
+  const script = `
+tell application "Ghostty"
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        set term to terminal 1 of t
+        if (name of term) contains "${marker}" then
+          select tab t
+          activate window w
+          return "matched"
+        end if
+      end try
+    end repeat
+  end repeat
+  return "not-found"
+end tell`;
+  let result: ReturnType<typeof spawnSync>;
+  try {
+    result = spawnSync("/usr/bin/osascript", ["-e", script], { encoding: "utf8", timeout: 5000 });
+  } catch (err) {
+    return { ok: false, message: `Could not run osascript: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (result.error) return { ok: false, message: `osascript error: ${result.error.message}` };
+  if (result.status !== 0) return { ok: false, message: (result.stderr || "osascript exited non-zero").trim() };
+  return (result.stdout || "").trim() === "matched"
+    ? { ok: true, message: "Switched to that session's tab." }
+    : { ok: false, message: "Tab not found \u2014 it may have been closed. Run /bg there to make it attachable." };
+}
+
+function subagentSummary(subagents: SubagentStatus[]): string {
+  if (subagents.length === 0) return "";
+  const running = subagents.filter((s) => s.status === "running" || s.status === "queued").length;
+  const done = subagents.filter((s) => s.status === "completed").length;
+  const failed = subagents.filter((s) => s.status === "failed").length;
+  const parts: string[] = [];
+  if (running > 0) parts.push(`🤖${running} running`);
+  if (failed > 0) parts.push(`✗${failed}`);
+  if (done > 0) parts.push(`✓${done}`);
+  return parts.join(" ");
+}
+
+function elapsed(ms: number): string {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86_400) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86_400)}d`;
+}
+
+function clockLine(): string {
+  const d = new Date();
+  const day = d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+  const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  return `${day} · ${time}`;
+}
+
+/** One-line usage ticker, colour-coded by meaning rather than decoration:
+ * error rate takes its colour from a threshold (so a bad number is visible
+ * without reading it), and the top three models get descending emphasis so
+ * rank is legible at a glance. Renders nothing when the router wasn't used
+ * today — "0 calls" would falsely imply measured inactivity. */
+function tickerParts(th: Theme, stats: UsageStats | undefined, loaded: boolean): string | undefined {
+  if (!loaded) return th.fg("dim", "\u2026");
+  if (!stats) return undefined;
+  const rate = stats.calls > 0 ? (stats.errors / stats.calls) * 100 : 0;
+  // Thresholds: <2% routine, <5% worth noticing, above that is a problem.
+  const rateColor = rate < 2 ? "success" : rate < 5 ? "warning" : "error";
+  const spark = sparkline(stats.hourly);
+  const modelColors = ["accent", "success", "muted"] as const;
+
+  const segs: string[] = [
+    th.fg("accent", th.bold(stats.calls.toLocaleString())) + th.fg("dim", " calls today"),
+    th.fg(rateColor, `${stats.errors} err`) + th.fg("dim", ` (${rate.toFixed(1)}%)`),
+  ];
+  // A sparkline over a handful of calls is noise shaped like a chart; below a
+  // floor it says less than the number it sits next to, so it is omitted.
+  if (spark && stats.calls >= 50 && stats.hourly.length >= 4) {
+    segs.push(th.fg("accent", spark) + th.fg("dim", ` peak ${stats.peakHour}/h`));
+  }
+  stats.topModels.forEach((m, i) => {
+    segs.push(th.fg(modelColors[i] ?? "dim", m.model) + th.fg("dim", ` ${m.pct}%`));
+  });
+  if (stats.partial) segs.push(th.fg("warning", "(partial)"));
+  return segs.join(th.fg("dim", "  \u2502  "));
+}
+
+class Composer {
+  readonly input: Input;
+  constructor(prefill: string, private onSubmit: (value: string) => void, private onCancel: () => void) {
+    this.input = new Input();
+    this.input.focused = true;
+    this.input.value = prefill;
+    this.input.cursor = prefill.length;
+    this.input.onSubmit = (value: string) => this.onSubmit(value.trim());
+    this.input.onEscape = () => this.onCancel();
+  }
+}
+
+type ComposerStep =
+  | { kind: "new-name" }
+  | { kind: "new-dir"; name: string }
+  | { kind: "rename"; row: SessionRow | OrphanRow };
+
+class DashboardView implements Component {
+  private rows: Row[] = [];
+  private selected = 0;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private messageTimer: ReturnType<typeof setTimeout> | undefined;
+  private message: string | undefined;
+  private deleteArmedFor: string | undefined;
+  private composer: Composer | undefined;
+  private composerStep: ComposerStep | undefined;
+  /** Usage stats: 60s TTL, refreshed off the render path so first paint and
+   * navigation are never blocked by the ~0.5s aggregation. */
+  private statsCache = new StatsCache(() => this.tui.requestRender());
+  /** Snapshot taken once at open — static between config edits, so no TTL. */
+  private inventory: Inventory | undefined;
+  /** Landing-page fallback when nothing is backgrounded. */
+  private recent: RecentProject[] = [];
+  /** Stable for the whole day; resolved once at open. */
+  private quote = quoteOfTheDay();
+
+  constructor(
+    private tui: TUI,
+    private theme: Theme,
+    private done: (result: HubAction | undefined) => void,
+    private selfSessionId: string,
+    private invocationCwd: string,
+  ) {
+    this.refresh();
+    // Both are cheap and static for the lifetime of the overlay: an inventory
+    // snapshot (readdir + stat) and a recent-projects scan that reads only the
+    // first 512 bytes of one transcript per project.
+    try { this.inventory = readInventory(); } catch { this.inventory = undefined; }
+    try { this.recent = readRecentProjects(8); } catch { this.recent = []; }
+    this.timer = setInterval(() => {
+      this.refresh();
+      this.tui.requestRender();
+    }, REFRESH_MS);
+  }
+
+  private refresh(): void {
+    this.rows = buildRows();
+    flushPendingRenames(this.rows);
+    if (this.selected >= this.rows.length) this.selected = Math.max(0, this.rows.length - 1);
+  }
+
+  private showMessage(msg: string): void {
+    this.message = msg;
+    if (this.messageTimer) clearTimeout(this.messageTimer);
+    this.messageTimer = setTimeout(() => {
+      this.message = undefined;
+      this.tui.requestRender();
+    }, MESSAGE_LINGER_MS);
+    this.tui.requestRender();
+  }
+
+  private rowTmuxName(row: Row): string | undefined {
+    return row.kind === "orphan" ? row.tmux.name : row.entry.tmuxName;
+  }
+
+  private rowLabel(row: Row): string {
+    return row.kind === "orphan" ? row.tmux.name : (row.entry.name ?? row.entry.project);
+  }
+
+  private startComposer(step: ComposerStep, prefill: string): void {
+    this.deleteArmedFor = undefined;
+    this.composerStep = step;
+    this.composer = new Composer(
+      prefill,
+      (value) => this.handleComposerSubmit(value),
+      () => {
+        this.composer = undefined;
+        this.composerStep = undefined;
+        this.tui.requestRender();
+      },
+    );
+    this.tui.requestRender();
+  }
+
+  private handleComposerSubmit(value: string): void {
+    const step = this.composerStep;
+    this.composer = undefined;
+    this.composerStep = undefined;
+    if (!step) return;
+    if (!value) {
+      this.showMessage("Cancelled — empty input.");
+      return;
+    }
+    if (step.kind === "new-name") {
+      this.startComposer({ kind: "new-dir", name: value }, this.invocationCwd);
+      return;
+    }
+    if (step.kind === "new-dir") {
+      this.done({ type: "create", name: step.name, dir: value });
+      return;
+    }
+    if (step.kind === "rename") {
+      const tmuxName = this.rowTmuxName(step.row);
+      if (!tmuxName) {
+        this.showMessage("That session has no tmux name to rename.");
+        return;
+      }
+      const idle = step.row.kind === "session" && step.row.entry.state === "idle";
+      const result = renameTmuxSession(tmuxName, value, idle);
+      this.showMessage(result.message);
+      this.refresh();
+      this.tui.requestRender();
+      return;
+    }
+  }
+
+  handleInput(data: string): void {
+    if (this.composer) {
+      this.composer.input.handleInput(data);
+      this.tui.requestRender();
+      return;
+    }
+    // Esc (and the terminal's own Ctrl+C/Ctrl+D) are the only ways to quit —
+    // "q" is deliberately not a quit key here: it's too easy to hit by
+    // accident while navigating (e.g. inside a session name), and this is a
+    // dashboard people rely on staying open, not a pager.
+    if (matchesKey(data, "escape")) {
+      this.done(undefined);
+      return;
+    }
+    if (matchesKey(data, "down")) {
+      this.deleteArmedFor = undefined;
+      this.selected = Math.min(this.rows.length - 1, this.selected + 1);
+      this.tui.requestRender();
+      return;
+    }
+    if (matchesKey(data, "up")) {
+      this.deleteArmedFor = undefined;
+      this.selected = Math.max(0, this.selected - 1);
+      this.tui.requestRender();
+      return;
+    }
+    if (data === "r" || data === "R") {
+      this.refresh();
+      this.showMessage("Refreshed.");
+      return;
+    }
+    if (data === "n" || data === "N") {
+      this.startComposer({ kind: "new-name" }, "");
+      return;
+    }
+    const row = this.rows[this.selected];
+    if (data === "e" || data === "E") {
+      if (!row) return;
+      const tmuxName = this.rowTmuxName(row);
+      if (!tmuxName) {
+        this.showMessage("Only tmux-backed sessions can be renamed here.");
+        return;
+      }
+      this.startComposer({ kind: "rename", row }, tmuxName);
+      return;
+    }
+    if (data === "x" || data === "X") {
+      if (!row) return;
+      const tmuxName = this.rowTmuxName(row);
+      if (!tmuxName) {
+        this.showMessage("Only tmux-backed sessions can be deleted here.");
+        return;
+      }
+      if (this.deleteArmedFor === tmuxName) {
+        this.deleteArmedFor = undefined;
+        const result = killTmuxSession(tmuxName);
+        this.showMessage(result.message);
+        this.refresh();
+        this.tui.requestRender();
+      } else {
+        this.deleteArmedFor = tmuxName;
+        this.showMessage(`Press x again to delete "${tmuxName}".`);
+      }
+      return;
+    }
+    if (this.deleteArmedFor) this.deleteArmedFor = undefined;
+    if (matchesKey(data, "enter")) {
+      if (!row) return;
+      const tmuxName = this.rowTmuxName(row);
+      if (tmuxName) {
+        this.done({ type: "attach", tmuxName });
+        return;
+      }
+      if (row.kind === "session") {
+        const result = jumpToGhosttyTab(row.entry.shortId);
+        this.showMessage(result.message);
+      }
+      return;
+    }
+  }
+
+  render(width: number): string[] {
+    if (width < 40) return [];
+    const th = this.theme;
+    const W = width;
+    const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - visibleWidth(s)));
+    /** Left content, right content, flush to the full terminal width. */
+    // Typographic measure: beyond ~120 columns the eye loses the thread between
+    // a row's label and its right-flushed value, so the content block is capped
+    // and left-aligned rather than stretched to whatever width the terminal has.
+    const MEASURE = Math.min(W, 132);
+    const split = (left: string, right: string): string =>
+      left + " ".repeat(Math.max(1, MEASURE - visibleWidth(left) - visibleWidth(right))) + right;
+
+    const lines: string[] = [];
+    const { stats, loaded } = this.statsCache.get();
+
+    // ---- banner: art beside identity, row-for-row ----------------------
+    const side = [
+      "",
+      th.fg("accent", th.bold("p i - k i n g")),
+      th.fg("muted", "There are many agent harnesses"),
+      th.fg("muted", "but ") + th.fg("accent", th.bold("this one is yours")),
+      "",
+      th.fg("dim", "background a session \u00b7 come back later"),
+    ];
+    const artRamp = ["warning", "warning", "accent", "accent", "accent", "muted"] as const;
+    const artW = Math.max(...PI_ART.map((l) => l.length));
+    lines.push("");
+    for (let i = 0; i < PI_ART.length; i++) {
+      lines.push("  " + th.fg(artRamp[i] ?? "dim", pad(PI_ART[i], artW)) + "    " + (side[i] ?? ""));
+    }
+    lines.push("");
+
+    // ---- ticker + quote -------------------------------------------------
+    const ticker = tickerParts(th, stats, loaded);
+    const rule = th.fg("dim", "\u2500".repeat(Math.max(0, MEASURE - 4)));
+    lines.push("  " + rule);
+    lines.push(split("  " + (ticker ?? th.fg("dim", "no router activity today")), th.fg("dim", clockLine()) + "  "));
+    lines.push("  " + rule);
+    lines.push("  " + th.fg("dim", `\u201c${this.quote}\u201d`));
+    lines.push("");
+
+    // ---- fleet vitals ---------------------------------------------------
+    const sessions = this.rows.filter((r): r is SessionRow => r.kind === "session");
+    const byState = (s: TitleState) => sessions.filter((r) => r.entry.state === s).length;
+    const running = sessions.reduce((n, r) =>
+      n + r.entry.subagents.filter((s) => s.status === "running" || s.status === "queued").length, 0);
+    const vitals: string[] = [th.bold(String(this.rows.length)) + th.fg("dim", ` session${this.rows.length === 1 ? "" : "s"}`)];
+    const add = (n: number, label: string, hue: string) => { if (n > 0) vitals.push(th.fg(hue, String(n)) + th.fg("dim", ` ${label}`)); };
+    add(byState("working"), "working", "accent");
+    add(byState("idle"), "idle", "success");
+    add(byState("attention") + byState("trust"), "attention", "warning");
+    add(byState("error"), "error", "error");
+    add(running, "subagents running", "accent");
+    if (this.rows.length > 0) {
+      lines.push("  " + vitals.join(th.fg("dim", "  \u00b7  ")));
+      lines.push("");
+    }
+
+    // ---- sessions, grouped by directory ---------------------------------
+    if (this.rows.length === 0) {
+      lines.push("  " + th.fg("dim", "No backgrounded sessions. Press ") + th.fg("muted", "n") +
+        th.fg("dim", " to start one, or run ") + th.fg("muted", "/bg") + th.fg("dim", " inside a session to surface it here."));
+      if (this.recent.length > 0) {
+        lines.push("");
+        lines.push("  " + th.fg("success", "recent projects"));
+        for (const p of this.recent) {
+          const parent = p.path.slice(0, Math.max(0, p.path.length - p.project.length)).replace(process.env.HOME ?? "~", "~");
+          lines.push(split("     " + th.fg("dim", parent) + th.fg("accent", p.project), th.fg("dim", `${elapsed(p.lastActive)} ago`) + "  "));
+        }
+      }
+    } else {
+      // Column geometry: name and status columns are fixed so activity text
+      // lines up down the page instead of ragging against variable-width names.
+      const nameW = Math.min(34, Math.max(18, Math.floor(MEASURE * 0.22)));
+      const statusW = 22;
+      let lastGroup: string | undefined;
+      this.rows.forEach((r, i) => {
+        const group = r.kind === "orphan" ? "tmux (no Pi session)" : r.entry.cwd.replace(process.env.HOME ?? "~", "~");
+        if (group !== lastGroup) {
+          if (lastGroup !== undefined) lines.push("");
+          lines.push("  " + th.fg("muted", group));
+          lastGroup = group;
+        }
+        const sel = i === this.selected;
+        const marker = sel ? th.fg("accent", "\u276f") : " ";
+        if (r.kind === "orphan") {
+          const nm = pad(truncateToWidth(r.tmux.name, nameW, "\u2026", true), nameW);
+          lines.push(split(`  ${marker} ${th.fg("accent", "\u26fa")} ${sel ? th.bold(nm) : nm} ` +
+            pad(th.fg("dim", "external"), statusW) + th.fg("muted", "attach or delete only"),
+            th.fg("dim", elapsed(r.tmux.createdAt)) + "  "));
+          return;
+        }
+        const e = r.entry;
+        const hue = e.state === "error" ? "error"
+          : e.state === "attention" || e.state === "trust" ? "warning"
+          : e.state === "working" ? "accent" : "success";
+        const label = e.tmuxName ?? e.name ?? e.project;
+        const nm = pad(truncateToWidth(label, nameW, "\u2026", true), nameW);
+        const status = pad(`${stateIcon[e.state]} ${th.fg(hue, e.state)}`, statusW);
+        const sub = subagentSummary(e.subagents);
+        const right = th.fg("dim", [sub, elapsed(e.updatedAt)].filter(Boolean).join(" \u00b7 ")) + "  ";
+        const left = `  ${marker} ${e.tmuxName ? th.fg("accent", "\u26fa") : th.fg("dim", "\u233f")} ` +
+          (sel ? th.bold(nm) : nm) + " " + status +
+          th.fg("muted", truncateToWidth(e.lastActivity, Math.max(10, MEASURE - nameW - statusW - visibleWidth(right) - 12), "\u2026", true));
+        lines.push(split(left, right));
+      });
+    }
+
+    // ---- inventory ------------------------------------------------------
+    if (this.inventory) {
+      lines.push("");
+      for (const l of this.renderInventoryCards(MEASURE - 4)) lines.push("  " + l);
+    }
+
+    // ---- composer / message / keys --------------------------------------
+    lines.push("");
+    if (this.composer) {
+      const label = this.composerStep?.kind === "new-name" ? "New session name:"
+        : this.composerStep?.kind === "new-dir" ? "Directory:" : "Rename to:";
+      lines.push("  " + th.fg("accent", label) + " " + (this.composer.input.render(Math.max(10, MEASURE - visibleWidth(label) - 6))[0] ?? ""));
+      lines.push("  " + th.fg("dim", "Enter confirm \u00b7 Esc cancel"));
+    } else if (this.message) {
+      lines.push("  " + th.fg("accent", this.message));
+    } else {
+      const k = (s: string) => th.fg("muted", s);
+      const l = (s: string) => th.fg("dim", s);
+      const sel = this.rows[this.selected];
+      const verb = !sel || this.rowTmuxName(sel) ? "attach" : "jump";
+      lines.push("  " +
+        `${k("\u2191\u2193")}${l(" select ")}${k("enter")}${l(` ${verb}`)}` + l("   \u2502   ") +
+        `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${th.fg("error", "x")}${l(" delete")}` + l("   \u2502   ") +
+        `${k("r")}${l(" refresh ")}${k("esc")}${l(" close")}`);
+    }
+    return lines;
+  }
+
+  /** Lays inventory categories out as bordered, content-sized cards.
+   * Category title is embedded in the top border (â•­â”€ skills â”€â”€â•®) so it costs
+   * no interior line, and each category keeps its own hue for fast scanning. */
+  private renderInventoryCards(innerW: number): string[] {
+    const th = this.theme;
+    const inv = this.inventory;
+    if (!inv) return [];
+    const groups: Array<[string, string[], string]> = [
+      ["skills", inv.skills, "accent"],
+      ["prompts", inv.prompts, "success"],
+      ["extensions", inv.extensions, "warning"],
+      ["clis", inv.clis, "muted"],
+    ];
+    const present = groups.filter(([, items]) => items.length > 0);
+    if (present.length === 0) return [];
+
+    const cols = innerW >= 150 ? 2 : 1;
+    const gutter = 2;
+    const cardW = Math.floor((innerW - gutter * (cols - 1)) / cols);
+    const textW = cardW - 4;
+
+    const buildCard = ([label, items, hue]: [string, string[], string]): string[] => {
+      // Wrap items into lines that fit the card interior.
+      const wrapped: string[] = [];
+      let cur = "";
+      for (const item of items) {
+        const next = cur ? `${cur}, ${item}` : item;
+        if (visibleWidth(next) > textW && cur) {
+          wrapped.push(cur);
+          cur = item;
+        } else {
+          cur = next;
+        }
+      }
+      if (cur) wrapped.push(cur);
+
+      const title = ` ${label} ${th.fg("dim", String(items.length))} `;
+      const titleW = visibleWidth(title);
+      const fill = Math.max(0, cardW - 2 - titleW - 1);
+      const top = th.fg("dim", "\u256d\u2500") + th.fg(hue, title) + th.fg("dim", "\u2500".repeat(fill) + "\u256e");
+      const bot = th.fg("dim", `\u2570${"\u2500".repeat(Math.max(0, cardW - 2))}\u256f`);
+      const body = wrapped.map((w) => {
+        const padded = w + " ".repeat(Math.max(0, textW - visibleWidth(w)));
+        return th.fg("dim", "\u2502") + " " + th.fg("dim", padded) + " " + th.fg("dim", "\u2502");
+      });
+      return [top, ...body, bot];
+    };
+
+    const cards = present.map(buildCard);
+    const out: string[] = [];
+    for (let i = 0; i < cards.length; i += cols) {
+      const rowCards = cards.slice(i, i + cols);
+      const height = Math.max(...rowCards.map((c) => c.length));
+      for (let ln = 0; ln < height; ln++) {
+        const segs = rowCards.map((c) => c[ln] ?? " ".repeat(cardW));
+        out.push(segs.join(" ".repeat(gutter)));
+      }
+      if (i + cols < cards.length) out.push("");
+    }
+    return out;
+  }
+
+  invalidate(): void {
+    /* no cached state to clear */
+  }
+
+  dispose(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (this.messageTimer) {
+      clearTimeout(this.messageTimer);
+      this.messageTimer = undefined;
+    }
+  }
+}
+
+/** The hub never accepts chat input — the dashboard overlay owns all keyboard
+ * focus while open. A visible empty prompt row underneath it doesn't make
+ * sense for a dedicated tool, so it's blanked out rather than left showing. */
+class BlankEditor extends CustomEditor {
+  render(): string[] {
+    return [];
+  }
+}
+
+async function showDashboardOnce(ctx: ExtensionContext): Promise<HubAction | undefined> {
+  return ctx.ui.custom<HubAction | undefined>(
+    (tui, theme, _keybindings, done) => new DashboardView(tui, theme, done, ctx.sessionManager.getSessionId(), ctx.cwd),
+    {
+      overlay: true,
+      overlayOptions: { anchor: "top-center", width: "100%", maxHeight: "100%" },
+    },
+  );
+}
+
+/** Creates the session if needed, then defers the terminal-owning attach to
+ * the wrapper. Returns false when there's no wrapper to defer to. */
+function dispatchHubAction(action: HubAction): { deferred: boolean; message?: string } {
+  if (action.type === "create") {
+    const created = createTmuxSession(action.name, action.dir);
+    if (!created.ok) return { deferred: false, message: created.message };
+    return { deferred: requestWrapperAction({ type: "attach", tmuxName: action.name }), message: created.message };
+  }
+  return { deferred: requestWrapperAction(action) };
+}
+
+/* ------------------------------------------------- self-tracking ---------- */
+/**
+ * pi-king tracks its own session state from stock Pi lifecycle events and
+ * writes its own status file. It deliberately depends on nothing but Pi:
+ * no notification extension, no subagent package, no terminal-specific tools.
+ * Optional integrations are feature-detected and degrade to absent.
+ */
+function installSessionTracker(pi: ExtensionAPI) {
+  let state: TitleState = "idle";
+  let activity = "Session started.";
+  let visible = process.env.PI_DASHBOARD_SPAWNED === "1";
+  let startedAt = Date.now();
+  let hadRun = false;
+  /** Set when /bg is requested mid-turn; fires the moment the session settles. */
+  let bgQueued = false;
+  /** True once another process has taken ownership of this session id.
+   * Handoff resumes the SAME id, so the replacement writes the SAME status
+   * file. Without this flag our shutdown hook then deletes the file the new
+   * process just wrote, and the session vanishes from the dashboard despite
+   * running perfectly — observed exactly that. */
+  let handedOff = false;
+  const subagents = new Map<string, SubagentStatus>();
+  let ctxRef: ExtensionContext | undefined;
+
+  const isInteractive = (ctx: ExtensionContext) =>
+    ctx.mode === "tui" && Boolean(ctx.sessionManager.getSessionFile());
+  const statusPath = (ctx: ExtensionContext) =>
+    join(SESSION_STATUS_DIR, `${ctx.sessionManager.getSessionId()}.json`);
+
+  function persist(ctx: ExtensionContext): void {
+    if (!isInteractive(ctx)) return;
+    try {
+      mkdirSync(SESSION_STATUS_DIR, { recursive: true });
+      const cutoff = Date.now() - 5 * 60_000;
+      for (const [id, s] of subagents) if (s.completedAt && s.completedAt < cutoff) subagents.delete(id);
+      const snap: SessionStatusFile = {
+        formatVersion: 1,
+        id: ctx.sessionManager.getSessionId(),
+        name: ctx.sessionManager.getSessionName(),
+        cwd: ctx.cwd,
+        project: basename(ctx.cwd) || ctx.cwd,
+        model: ctx.model?.id,
+        pid: process.pid,
+        startedAt,
+        lastActivity: Date.now(),
+        status: state,
+        activity,
+        title: `${stateIcon[state]} ${ctx.sessionManager.getSessionName() ?? basename(ctx.cwd)}`,
+        sessionFile: ctx.sessionManager.getSessionFile(),
+        subagents: [...subagents.values()],
+        visible,
+        kingToken: process.env.PI_KING_TOKEN || undefined,
+      };
+      const target = statusPath(ctx);
+      const tmp = `${target}.tmp-${process.pid}`;
+      writeFileSync(tmp, JSON.stringify(snap, null, 2));
+      renameSync(tmp, target);
+    } catch {
+      // Status is best-effort; it must never disrupt the session it describes.
+    }
+  }
+
+  const set = (next: TitleState, ctx: ExtensionContext) => { state = next; persist(ctx); };
+
+  pi.on("session_start", (_e, ctx) => {
+    if (!isInteractive(ctx)) return;
+    ctxRef = ctx;
+    state = "idle"; activity = "Session started."; startedAt = Date.now();
+    hadRun = false; bgQueued = false; subagents.clear();
+    visible = process.env.PI_DASHBOARD_SPAWNED === "1";
+    persist(ctx);
+    // Retry briefly: on a resumed session the session file may not resolve on
+    // the first tick, and an idle session produces no further events to
+    // piggyback on. Cheap, bounded, and stops as soon as a write lands.
+    let attempts = 0;
+    const settle = setInterval(() => {
+      attempts++;
+      try {
+        if (isInteractive(ctx)) { persist(ctx); clearInterval(settle); }
+      } catch { /* keep trying */ }
+      if (attempts >= 10) clearInterval(settle);
+    }, 1000);
+
+    // Optional: subagent rollup, only if a subagent extension is present.
+    // Absent on a stock install, and its absence is not an error.
+    try {
+      const track = (status: SubagentStatus["status"]) => (data: unknown) => {
+        const a = data as { id?: string; type?: string; description?: string };
+        if (!a?.id || !ctxRef) return;
+        const prev = subagents.get(a.id);
+        subagents.set(a.id, {
+          id: a.id,
+          agentType: a.type ?? prev?.agentType,
+          description: (a.description ?? prev?.description ?? "background agent").slice(0, 100),
+          status,
+          startedAt: prev?.startedAt ?? Date.now(),
+          completedAt: status === "completed" || status === "failed" ? Date.now() : undefined,
+        });
+        if (status === "completed" || status === "failed") state = "attention";
+        persist(ctxRef);
+      };
+      pi.events?.on?.("subagents:created", track("queued"));
+      pi.events?.on?.("subagents:started", track("running"));
+      pi.events?.on?.("subagents:completed", track("completed"));
+      pi.events?.on?.("subagents:failed", track("failed"));
+    } catch {
+      // No subagent extension installed — rollup simply stays empty.
+    }
+  });
+
+  pi.on("before_agent_start", (e, ctx) => {
+    if (!isInteractive(ctx)) return;
+    const p = typeof e.prompt === "string" ? e.prompt.trim() : "";
+    if (p) activity = p.length > 140 ? `${p.slice(0, 139)}\u2026` : p;
+  });
+  pi.on("agent_start", (_e, ctx) => { if (isInteractive(ctx)) { hadRun = true; set("working", ctx); } });
+  pi.on("tool_execution_end", (e, ctx) => {
+    if (!isInteractive(ctx) || !e.isError) return;
+    activity = `${e.toolName} failed`;
+    set("error", ctx);
+  });
+  pi.on("agent_settled", (_e, ctx) => {
+    if (!isInteractive(ctx) || !hadRun) return;
+    activity = "Waiting for input.";
+    if (state !== "error" && state !== "attention") set("idle", ctx); else persist(ctx);
+    // Deferred /bg: run it now that nothing is in flight.
+    if (bgQueued) { bgQueued = false; void runBackgroundHandoff(ctx); }
+  });
+  pi.on("session_shutdown", (_e, ctx) => {
+    if (!isInteractive(ctx)) return;
+    // Do not remove the file if a handoff transferred this id to another
+    // process; that file is now theirs, not ours.
+    if (handedOff) return;
+    try { unlinkSync(statusPath(ctx)); } catch { /* already gone */ }
+  });
+
+  function hasLiveSubagents(): number {
+    return [...subagents.values()].filter((s) => s.status === "running" || s.status === "queued").length;
+  }
+
+  async function runBackgroundHandoff(ctx: ExtensionContext): Promise<void> {
+    if (process.env.TMUX) {
+      visible = true; persist(ctx);
+      ctx.ui.notify("Already under tmux \u2014 now visible on the pi-king dashboard.", "info");
+      return;
+    }
+    const which = spawnSync("/usr/bin/env", ["which", "tmux"], { encoding: "utf8", timeout: 3000 });
+    const tmux = which.status === 0 ? (which.stdout || "").trim() : "";
+    if (!tmux) {
+      visible = true; persist(ctx);
+      ctx.ui.notify("tmux not found on PATH \u2014 surfaced on the dashboard, but this session still ends with its terminal.", "warning");
+      return;
+    }
+    const sessionId = ctx.sessionManager.getSessionId();
+    const name = ctx.sessionManager.getSessionName() || `${basename(ctx.cwd) || "session"}-${sessionId.slice(0, 8)}`;
+    const token = `pk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    if (spawnSync(tmux, ["has-session", "-t", name], { encoding: "utf8", timeout: 3000 }).status === 0) {
+      ctx.ui.notify(`A tmux session named "${name}" already exists \u2014 not creating a duplicate. Attach to it from pi-agents.`, "warning");
+      return;
+    }
+    const created = spawnSync(tmux, [
+      "new-session", "-d", "-s", name,
+      "-e", `PI_KING_TOKEN=${token}`, "-e", "PI_DASHBOARD_SPAWNED=1",
+      // Pin the agent dir explicitly. A new tmux session inherits the tmux
+      // SERVER's environment, not ours \u2014 and that server may have been started
+      // by a process using a different PI_CODING_AGENT_DIR (the pi-agents hub
+      // runs against a minimal one). The resumed Pi would then look for this
+      // session's transcript under the wrong root, fail to find it, and exit
+      // instantly. Verified: inheriting the hub's dir DIES, passing ours SURVIVES.
+      "-e", `PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent")}`,
+      // Same reasoning for PATH: the server may not have ours.
+      "-e", `PATH=${process.env.PATH ?? ""}`,
+      "-c", ctx.cwd, "--", "pi", "--session", sessionId, "--name", name,
+    ], { encoding: "utf8", timeout: 8000 });
+    if (created.status !== 0) {
+      ctx.ui.notify(`Could not hand off to tmux: ${(created.stderr || "unknown").trim()}`, "error");
+      return;
+    }
+    spawnSync(tmux, ["set-option", "-t", name, "@pi_king_token", token], { encoding: "utf8", timeout: 3000 });
+    // Verify the replacement actually survived before destroying this copy.
+    await new Promise((r) => setTimeout(r, 2500));
+    if (spawnSync(tmux, ["has-session", "-t", name], { encoding: "utf8", timeout: 3000 }).status !== 0) {
+      ctx.ui.notify("Handoff failed \u2014 the tmux copy exited immediately, so this session was kept alive.", "error");
+      return;
+    }
+    // Ownership of this session id now belongs to the tmux-hosted process.
+    // Deliberately do NOT unlink: it has already written its own status under
+    // this same id, and removing it here would erase a live session.
+    handedOff = true;
+    // Deliberately does NOT open the dashboard for you.
+    //
+    // When Pi exits, the shell reclaims the terminal. Anything we leave behind
+    // then fights the shell for stdin \u2014 observed as interleaved, corrupted
+    // rendering. Node cannot exec-replace itself, so the only way to win that
+    // race is a wrapper process, and a second command to remember is worse
+    // than typing `pi-agents` when you actually want it.
+    ctx.ui.notify(
+      `Backgrounded as "${name}" \u2014 history came with it.\n` +
+      `Reattach from pi-agents, or: tmux attach -t ${name}`,
+      "info",
+    );
+    setTimeout(() => ctx.shutdown(), 1200);
+  }
+
+  pi.registerCommand("bg", {
+    description: "Background this session into tmux (queues until the current turn finishes)",
+    handler: async (_args, ctx) => {
+      if (!isInteractive(ctx)) return;
+      const busy = !ctx.isIdle();
+      const running = hasLiveSubagents();
+      if (busy || running > 0) {
+        // Queue rather than refuse. A handoff mid-turn would discard the
+        // in-flight response and kill running subagents, so it waits for the
+        // session to settle and fires itself — no second command to remember.
+        bgQueued = true;
+        visible = true; persist(ctx);
+        const why = busy && running > 0 ? `the current turn and ${running} subagent(s)`
+          : busy ? "the current turn" : `${running} running subagent(s)`;
+        ctx.ui.notify(`Will background once ${why} finish\u2026 (surfaced on the dashboard meanwhile)`, "info");
+        return;
+      }
+      await runBackgroundHandoff(ctx);
+    },
+  });
+}
+
+export default function piDashboard(pi: ExtensionAPI) {
+  installSessionTracker(pi);
+  pi.registerFlag("agents-hub", {
+    description: "Launch directly into the cross-session tmux-backed dashboard hub, looping until quit",
+    type: "boolean",
+  });
+
+  pi.registerCommand("pi-dashboard", {
+    description: "Live cross-project dashboard: attach/create/rename/delete tmux-backed Pi sessions",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("The dashboard requires an interactive TUI session.", "error");
+        return;
+      }
+      try {
+        const action = await showDashboardOnce(ctx);
+        if (action) {
+          // Invoked as a slash command from inside somebody's real working
+          // session — there is no wrapper to hand the terminal to, and we must
+          // not fight that session's TUI for stdin. Tell the user how to attach
+          // instead of hijacking their terminal.
+          const tmuxName = action.type === "attach" ? action.tmuxName : action.name;
+          const result = dispatchHubAction(action);
+          if (!result.deferred) {
+            ctx.ui.notify(
+              `${result.message ? `${result.message}\n` : ""}Run this from a shell to attach: tmux attach-session -t ${tmuxName}`,
+              "info",
+            );
+          }
+        }
+      } catch (err) {
+        ctx.ui.notify(`Dashboard failed: ${err instanceof Error ? `${err.message}\n${err.stack}` : String(err)}`, "error");
+      }
+    },
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (!pi.getFlag("agents-hub")) return;
+    if (ctx.mode !== "tui") {
+      ctx.ui.notify("pi-agents requires an interactive terminal.", "error");
+      ctx.shutdown();
+      return;
+    }
+    // This is a dedicated dashboard app, not a chat session — replace Pi's
+    // default chat header/footer chrome (irrelevant here: cwd, model, token
+    // stats) with a one-line identity banner and a blank footer, rather than
+    // leaving Pi's own chat UI visibly underneath the overlay.
+    // The banner now lives inside the dashboard panel itself (see render()),
+    // not in a separate header surface. Previously they were two detached
+    // objects: the header pinned top-left, the overlay centred ~250px below
+    // and indented, which read as unrelated. Header is blanked instead.
+    ctx.ui.setHeader(() => ({ render: () => [], invalidate: () => {} }));
+    ctx.ui.setFooter(() => ({ render: () => [], invalidate: () => {} }));
+    ctx.ui.setEditorComponent((tui, theme, keybindings) => new BlankEditor(tui, theme, keybindings));
+    // The hub loops on the dashboard: attach/create hand the terminal to tmux,
+    // and once the user detaches, control returns here and the dashboard
+    // re-opens — a persistent home base, not a one-shot view.
+    for (;;) {
+      let action: HubAction | undefined;
+      try {
+        action = await showDashboardOnce(ctx);
+      } catch (err) {
+        ctx.ui.notify(`Dashboard failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+        break;
+      }
+      if (!action) break;
+      const result = dispatchHubAction(action);
+      // Deferred to the wrapper: exit now so tmux gets the terminal to itself.
+      // The wrapper relaunches this hub once the user detaches.
+      if (result.deferred) break;
+      if (result.message) ctx.ui.notify(result.message, "error");
+    }
+    ctx.shutdown();
+  });
+}
