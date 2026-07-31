@@ -18,10 +18,10 @@ you have real work backgrounded.**
 ```bash
 tmux kill-server 2>/dev/null
 rm -rf ~/.pi/king/session-status
-command -v pi-agents && tmux -V && pi --version
+command -v pi-king && tmux -V && pi --version
 ```
 
-**PASS:** `pi-agents` resolves, tmux present, `pi` responds, no tmux server.
+**PASS:** `pi-king` resolves, tmux present, `pi` responds, no tmux server.
 
 ---
 
@@ -29,7 +29,7 @@ command -v pi-agents && tmux -V && pi --version
 
 ### A1. Launch
 ```bash
-cd ~/codebase && pi-agents
+cd ~/codebase && pi-king
 ```
 **PASS:** Braille π-with-helmet banner; motto; metrics band bounded by two
 rules; quote of the day; `recent projects`; four inventory cards (skills,
@@ -41,9 +41,9 @@ With nothing backgrounded.
 vitals line (suppressed when there is no fleet).
 
 ### A3. Metrics honesty
-**PASS:** If the router logged calls today: count, error rate, model mix. If
+**PASS:** If calls were logged today: count, error rate, model mix. If
 fewer than 50 calls: **no sparkline** (a chart shaped from a handful of points
-implies a measurement it did not make). If the router unused today: metrics
+implies a measurement it did not make). If no calls logged today: metrics
 segments absent entirely — never `0 calls`.
 
 ---
@@ -183,10 +183,10 @@ garbage; session rows drop to one column.
 
 ### F3. Stats degradation
 ```bash
-mv ~/.router/call_logs ~/.router/call_logs.bak && pi-agents
+mv "$PI_KING_CALL_LOGS" "$PI_KING_CALL_LOGS.bak" && pi-king
 ```
 **PASS:** Metrics segments vanish; clock, sessions, and inventory unaffected.
-Restore with `mv ~/.router/call_logs.bak ~/.router/call_logs`.
+Restore with `mv "$PI_KING_CALL_LOGS.bak" "$PI_KING_CALL_LOGS"`.
 
 ### F4. Jump fallback
 Select a `⌁` (non-tmux) row → `Enter`.

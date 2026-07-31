@@ -26,8 +26,15 @@ A local control plane for long-running [Pi](https://pi.dev) sessions.
 
 https://github.com/user-attachments/assets/REPLACE-AFTER-UPLOAD
 
-A session is backgrounded with `/bg`, listed in the dashboard, then reattached
-with its history intact — the same process, not a replay of its transcript.
+Three sessions in three projects are backgrounded with `/bg`, listed together
+in the dashboard, and one is reattached with its history intact — the same
+process, not a replay of its transcript.
+
+Recorded in a throwaway environment built by `tools/demo-env.sh`: placeholder
+skills and prompts, synthetic call logs, and a provider under a neutral name.
+A recording holds every panel on screen for its full length, so without that
+it would document the author's machine rather than this tool. Reproduce with
+`tools/record-demo.sh`.
 
 ![dashboard](media/dashboard.png)
 
@@ -120,6 +127,16 @@ settles, so an in-flight response and any running subagents finish normally
 rather than being killed.
 
 Detach from an attached session with tmux's own `Ctrl+B d`.
+
+## Configuration
+
+Everything is optional; unset means the corresponding panel is simply absent.
+
+| Variable | Effect |
+|---|---|
+| `PI_KING_CALL_LOGS` | Directory of per-day call-log JSON. Unset means no metrics band. |
+| `PI_KING_CLIS` | Comma-separated CLIs to report presence of. Defaults to common dev tools. |
+| `PI_KING_STATUS_DIR` | Overrides the session-status directory. Testing only. |
 
 ## Design notes
 

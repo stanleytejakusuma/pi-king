@@ -1,5 +1,5 @@
 /**
- * pi-dashboard-data.ts — data sources for the pi-agents dashboard banner,
+ * data.ts — data sources for the pi-king dashboard banner,
  * stats line, inventory block, and landing page.
  *
  * Kept separate from pi-dashboard.ts so the rendering code stays readable and
@@ -24,8 +24,19 @@ import { join, basename } from "node:path";
 import { homedir } from "node:os";
 
 const HOME = homedir();
-const AGENT_DIR = join(HOME, ".pi", "agent");
-const CALL_LOGS = join(HOME, ".router", "call_logs");
+/** Inventory reflects the configuration actually in force, so it must follow
+ * PI_CODING_AGENT_DIR rather than assume the default location. */
+const AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || join(HOME, ".pi", "agent");
+
+/** Directory of per-day call-log JSON, if one exists on this machine.
+ *
+ * Deliberately has no default. The metrics band reads a log format produced by
+ * a router sitting in front of the model providers, and there is no format any
+ * stock Pi install writes. Hardcoding one vendor's path would name a specific
+ * third-party tool in a general-purpose package and would show nothing for
+ * everyone who does not run it. Unset means the band is simply absent, which
+ * matches the rule that missing data renders as nothing. See README. */
+const CALL_LOGS = process.env.PI_KING_CALL_LOGS?.trim() || undefined;
 
 /* ------------------------------------------------------------------ art -- */
 
@@ -64,11 +75,13 @@ export type Inventory = {
 };
 
 /** CLIs worth reporting presence of — variable across machines and not printed
- * anywhere else, unlike skills/prompts which Pi lists at startup. */
-const CLI_CANDIDATES = [
-  "claude", "codegraph", "codex", "gh", "jq", "omniroute",
-  "rg", "terminal-notifier", "tmux", "vault",
-];
+ * anywhere else, unlike skills/prompts which Pi lists at startup. Kept to
+ * widely-used developer tools; override with PI_KING_CLIS (comma-separated) to
+ * track your own. Listing someone's private tooling by default would leak the
+ * shape of their setup into any screenshot they share. */
+const CLI_CANDIDATES = process.env.PI_KING_CLIS?.trim()
+  ? process.env.PI_KING_CLIS.split(",").map((c) => c.trim()).filter(Boolean)
+  : ["bat", "docker", "fd", "gh", "jq", "rg", "tmux"];
 
 function listDir(path: string, pick: (entry: string, full: string) => string | undefined): string[] {
   try {
@@ -141,17 +154,19 @@ function shortModel(id: string): string {
 }
 
 /**
- * Aggregates today's the router call logs.
+ * Aggregates today's call logs from the directory named by PI_KING_CALL_LOGS.
  *
  * Cost is real: ~2,100 files for a busy day, measured at ~0.5s. That is far
  * too slow for the dashboard's 1s render tick, so this is async and callers
  * must cache it (see StatsCache) rather than awaiting it on the render path.
  *
- * Returns undefined when today's directory does not exist — meaning the router
- * simply wasn't used today. Callers must render nothing rather than "0 calls",
- * which would falsely imply measured inactivity.
+ * Returns undefined when no log directory is configured, or when today's
+ * directory does not exist — meaning no calls were routed today. Callers must
+ * render nothing rather than "0 calls", which would falsely imply measured
+ * inactivity rather than absent measurement.
  */
 export async function readUsageStats(): Promise<UsageStats | undefined> {
+  if (!CALL_LOGS) return undefined;
   const dir = join(CALL_LOGS, today());
   let files: string[];
   try {

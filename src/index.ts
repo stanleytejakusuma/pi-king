@@ -4,7 +4,7 @@
  *
  * Two entry points:
  *  - `/pi-dashboard` slash command, usable from any existing interactive session.
- *  - The `--agents-hub` flag (wired to the standalone `pi-agents` shell wrapper),
+ *  - The `--agents-hub` flag (wired to the standalone `pi-king` shell wrapper),
  *    which opens the dashboard immediately at session_start and loops on it
  *    until the user quits, instead of dropping into a normal chat prompt.
  *
@@ -285,7 +285,7 @@ function tmuxError(result: ReturnType<typeof spawnSync>): string {
 // Sessions created through the dashboard always get the normal, full
 // ~/.pi/agent config (skills, prompts, all extensions) regardless of what
 // env the tmux *server* itself inherited when it first started (which, if
-// started from the minimal pi-agents-hub process, would otherwise be
+// started from the minimal pi-king hub process, would otherwise be
 // PI_CODING_AGENT_DIR=~/.pi/agent-hub — the hub's own lean config, wrong
 // for a real working session). `-e` on `new-session` sets the env for that
 // specific new session's process, independent of server-inherited env —
@@ -362,7 +362,7 @@ function killTmuxSession(name: string): { ok: boolean; message: string } {
 }
 
 /**
- * Hands a chosen action back to the `pi-agents` wrapper script, which runs the
+ * Hands a chosen action back to the `pi-king` wrapper script, which runs the
  * actual tmux command *after this process has fully exited*.
  *
  * This indirection is load-bearing, not ceremony. The original implementation
@@ -481,7 +481,7 @@ function clockLine(): string {
 /** One-line usage ticker, colour-coded by meaning rather than decoration:
  * error rate takes its colour from a threshold (so a bad number is visible
  * without reading it), and the top three models get descending emphasis so
- * rank is legible at a glance. Renders nothing when the router wasn't used
+ * rank is legible at a glance. Renders nothing when no calls were logged
  * today — "0 calls" would falsely imply measured inactivity. */
 function tickerParts(th: Theme, stats: UsageStats | undefined, loaded: boolean): string | undefined {
   if (!loaded) return th.fg("dim", "\u2026");
@@ -1144,7 +1144,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     const name = ctx.sessionManager.getSessionName() || `${basename(ctx.cwd) || "session"}-${sessionId.slice(0, 8)}`;
     const token = `pk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     if (spawnSync(tmux, ["has-session", "-t", name], { encoding: "utf8", timeout: 3000 }).status === 0) {
-      ctx.ui.notify(`A tmux session named "${name}" already exists \u2014 not creating a duplicate. Attach to it from pi-agents.`, "warning");
+      ctx.ui.notify(`A tmux session named "${name}" already exists \u2014 not creating a duplicate. Attach to it from pi-king.`, "warning");
       return;
     }
     const created = spawnSync(tmux, [
@@ -1152,7 +1152,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       "-e", `PI_KING_TOKEN=${token}`, "-e", "PI_DASHBOARD_SPAWNED=1",
       // Pin the agent dir explicitly. A new tmux session inherits the tmux
       // SERVER's environment, not ours \u2014 and that server may have been started
-      // by a process using a different PI_CODING_AGENT_DIR (the pi-agents hub
+      // by a process using a different PI_CODING_AGENT_DIR (the pi-king hub
       // runs against a minimal one). The resumed Pi would then look for this
       // session's transcript under the wrong root, fail to find it, and exit
       // instantly. Verified: inheriting the hub's dir DIES, passing ours SURVIVES.
@@ -1182,10 +1182,10 @@ function installSessionTracker(pi: ExtensionAPI) {
     // then fights the shell for stdin \u2014 observed as interleaved, corrupted
     // rendering. Node cannot exec-replace itself, so the only way to win that
     // race is a wrapper process, and a second command to remember is worse
-    // than typing `pi-agents` when you actually want it.
+    // than typing `pi-king` when you actually want it.
     ctx.ui.notify(
       `Backgrounded as "${name}" \u2014 history came with it.\n` +
-      `Reattach from pi-agents, or: tmux attach -t ${name}`,
+      `Reattach from pi-king, or: tmux attach -t ${name}`,
       "info",
     );
     setTimeout(() => ctx.shutdown(), 1200);
@@ -1252,7 +1252,7 @@ export default function piDashboard(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!pi.getFlag("agents-hub")) return;
     if (ctx.mode !== "tui") {
-      ctx.ui.notify("pi-agents requires an interactive terminal.", "error");
+      ctx.ui.notify("pi-king requires an interactive terminal.", "error");
       ctx.shutdown();
       return;
     }

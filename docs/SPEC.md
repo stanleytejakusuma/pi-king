@@ -146,7 +146,7 @@ several and must be fixed before release.
    feature-detected; the tool must be fully usable in any terminal.
 3. **Configurable.** Poll interval, opt-in default, tmux binary, keybindings,
    and which panels render should come from config, not constants.
-4. **Optional stats.** The usage panel reads `~/.router/call_logs`, which is
+4. **Optional stats.** The usage panel reads the directory named by `PI_KING_CALL_LOGS`, which is
    specific to one router. It must be off by default and pluggable.
 5. **Degrade, never fabricate.** Missing data renders nothing — never a zero
    that implies a measurement. No progress bars, because Pi exposes no
