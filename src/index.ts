@@ -363,10 +363,24 @@ function renameTmuxSession(oldName: string, newName: string, piIsIdle: boolean):
   return { ok: true, message: `Renamed to "${newName}" \u2014 session is busy; its own name will follow once it settles.` };
 }
 
+/** Frees any client attached to a session without ending it. The Pi process
+ * keeps running and the session stays listed; this is the safe counterpart to
+ * killing, for when you only want the terminal back. */
+function detachTmuxSession(name: string): { ok: boolean; message: string } {
+  const attached = spawnSync(TMUX, ["display-message", "-p", "-t", name, "#{session_attached}"], { encoding: "utf8", timeout: 3000 });
+  const count = Number((attached.stdout || "").trim()) || 0;
+  if (count === 0) {
+    return { ok: true, message: `"${name}" has no attached client — it is already running unattended.` };
+  }
+  const result = spawnSync(TMUX, ["detach-client", "-s", name], { encoding: "utf8", timeout: 3000 });
+  if (result.status !== 0) return { ok: false, message: `Failed to detach: ${tmuxError(result)}` };
+  return { ok: true, message: `Detached ${count} client${count === 1 ? "" : "s"} from "${name}". Still running.` };
+}
+
 function killTmuxSession(name: string): { ok: boolean; message: string } {
   const result = spawnSync(TMUX, ["kill-session", "-t", name], { encoding: "utf8", timeout: 3000 });
   if (result.status !== 0) return { ok: false, message: `Failed to delete: ${tmuxError(result)}` };
-  return { ok: true, message: `Deleted "${name}".` };
+  return { ok: true, message: `Killed "${name}". Its transcript survives — resume with: pi --session <id>` };
 }
 
 /**
@@ -688,11 +702,28 @@ class DashboardView implements Component {
       this.startComposer({ kind: "rename", row }, tmuxName);
       return;
     }
-    if (data === "x" || data === "X") {
+    // x detaches, X kills. The destructive action no longer sits on the key a
+    // hand reaches for first: detaching is what you usually want (take the
+    // terminal back, leave the session running), and killing ends a live
+    // process whose in-flight work cannot be recovered.
+    if (data === "x") {
       if (!row) return;
       const tmuxName = this.rowTmuxName(row);
       if (!tmuxName) {
-        this.showMessage("Only tmux-backed sessions can be deleted here.");
+        this.showMessage("Only tmux-backed sessions can be detached.");
+        return;
+      }
+      const result = detachTmuxSession(tmuxName);
+      this.showMessage(result.message);
+      this.refresh();
+      this.tui.requestRender();
+      return;
+    }
+    if (data === "X") {
+      if (!row) return;
+      const tmuxName = this.rowTmuxName(row);
+      if (!tmuxName) {
+        this.showMessage("Only tmux-backed sessions can be killed here.");
         return;
       }
       if (this.deleteArmedFor === tmuxName) {
@@ -703,7 +734,7 @@ class DashboardView implements Component {
         this.tui.requestRender();
       } else {
         this.deleteArmedFor = tmuxName;
-        this.showMessage(`Press x again to delete "${tmuxName}".`);
+        this.showMessage(`Press X again to KILL "${tmuxName}" — ends the running process. x detaches instead.`);
       }
       return;
     }
@@ -729,10 +760,17 @@ class DashboardView implements Component {
     const W = width;
     const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - visibleWidth(s)));
     /** Left content, right content, flush to the full terminal width. */
-    // Typographic measure: beyond ~120 columns the eye loses the thread between
-    // a row's label and its right-flushed value, so the content block is capped
-    // and left-aligned rather than stretched to whatever width the terminal has.
-    const MEASURE = Math.min(W, 132);
+    // Typographic measure. Beyond a certain width the eye loses the thread
+    // between a row's label and its right-flushed value, so the content block
+    // does not simply stretch to whatever width the terminal has. But a fixed
+    // cap is wrong in the other direction: on a wide terminal it left-aligns
+    // everything into a narrow strip and wastes most of the screen. Scale with
+    // the terminal and stop at a width where a label and its value are still
+    // visually paired. Override with PI_KING_WIDTH if your eyes disagree.
+    const override = Number(process.env.PI_KING_WIDTH);
+    const MEASURE = Number.isFinite(override) && override > 40
+      ? Math.min(W, override)
+      : Math.min(W, Math.max(132, Math.floor(W * 0.82)), 200);
     const split = (left: string, right: string): string =>
       left + " ".repeat(Math.max(1, MEASURE - visibleWidth(left) - visibleWidth(right))) + right;
 
@@ -854,7 +892,7 @@ class DashboardView implements Component {
       const verb = !sel || this.rowTmuxName(sel) ? "attach" : "jump";
       lines.push("  " +
         `${k("\u2191\u2193")}${l(" select ")}${k("enter")}${l(` ${verb}`)}` + l("   \u2502   ") +
-        `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${th.fg("error", "x")}${l(" delete")}` + l("   \u2502   ") +
+        `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${k("x")}${l(" detach ")}${th.fg("error", "X")}${l(" kill")}` + l("   \u2502   ") +
         `${k("r")}${l(" refresh ")}${k("esc")}${l(" close")}`);
     }
     return lines;

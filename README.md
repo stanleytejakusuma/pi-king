@@ -44,6 +44,26 @@ Three sessions in three projects are backgrounded with `/bg`, listed together
 in the dashboard, and one is reattached with its history intact — the same
 process, not a replay of its transcript.
 
+### 1. Background a session
+
+`/bg` hands the session to tmux and frees the terminal. History goes with it.
+
+![backgrounding a session](media/backgrounding.png)
+
+### 2. See everything still running
+
+Grouped by project, with live state and elapsed time. The metrics band and
+inventory panels appear only when there is something to show.
+
+![the dashboard](media/dashboard.png)
+
+### 3. Reattach with history intact
+
+The session answers from its own context — the same process, resumed, not a
+transcript replayed into a new one.
+
+![reattaching](media/reattach.png)
+
 Recorded in a throwaway environment built by `tools/demo-env.sh`: placeholder
 skills and prompts, synthetic call logs, and a provider under a neutral name.
 A recording holds every panel on screen for its full length, so without that
@@ -163,6 +183,7 @@ Everything is optional; unset means the corresponding panel is simply absent.
 | `PI_KING_CALL_LOGS` | Directory of per-day call-log JSON. Unset means no metrics band. |
 | `PI_KING_CLIS` | Comma-separated CLIs to report presence of. Defaults to common dev tools. |
 | `PI_KING_STATUS_DIR` | Overrides the session-status directory. Testing only. |
+| `PI_KING_WIDTH` | Caps the content width in columns. Defaults to scaling with the terminal. |
 
 ## Design notes
 

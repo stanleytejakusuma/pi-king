@@ -56,3 +56,10 @@ ffmpeg -y -loglevel error -i media/demo.mp4 -i /tmp/pi-king-pal.png \
   -lavfi "fps=10,scale=1000:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3" media/demo.gif
 rm -f /tmp/pi-king-pal.png
 echo "wrote media/demo.mp4 and media/demo.gif"
+
+# Stills for the README. Pulled from the same recording so they cannot drift
+# from what the demo actually shows.
+ffmpeg -y -loglevel error -ss 41 -i media/demo.mp4 -frames:v 1 media/dashboard.png
+ffmpeg -y -loglevel error -ss 57 -i media/demo.mp4 -frames:v 1 media/reattach.png
+ffmpeg -y -loglevel error -ss 17 -i media/demo.mp4 -vf "crop=iw:520:0:0" -frames:v 1 media/backgrounding.png
+echo "wrote media/dashboard.png, media/reattach.png, media/backgrounding.png"
