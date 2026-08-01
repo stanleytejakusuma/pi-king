@@ -201,3 +201,32 @@ scripted proxy.
    extensions stop each inventing a polling directory (`FORMAT.md` is the
    interim answer).
 3. Multi-window tmux: currently one window per session. Panes/splits unhandled.
+
+## Invariants
+
+These are load-bearing. Violating any of them causes silent damage rather than a
+visible error, which is why they are written down.
+
+**One live process per transcript.** A Pi session's transcript is append-only and
+has no locking. Two processes resuming the same session id both append, and the
+result is a transcript whose parent chain forks. Nothing detects this at write
+time. `/bg` prints a resume command that is correct only after the backgrounded
+session ends; running it while that session is alive is the realistic way to
+break this, so the extension checks on startup whether its own session id is
+already claimed by a live process and says so.
+
+**Identity is a process, not a label.** Correlation between a Pi session and a
+tmux session is by pane pid, matched against the pid recorded in the status file
+and verified by process start time. Earlier versions correlated by a token
+stored in a tmux user option; a tmux option is writable by anything running as
+the same user, so it could be moved onto an attacker's session, and following
+that pairing would attach the user to a pane they did not choose. A pid cannot
+be moved.
+
+**Ambiguity fails closed.** When two rows claim the same pane pid, both are
+discarded rather than one being chosen. There is deliberately no fallback to
+name matching: pairing on resemblance is the same mistake as pairing on a token,
+and an unmatched session rendering as unmatched is harmless.
+
+**Missing data renders as nothing.** Never a zero. A zero asserts a measurement
+that was not made.

@@ -129,6 +129,13 @@ pi-king            # opens the dashboard, owns the attach loop
 
 `pi-agents` is installed as an alias for the same launcher.
 
+**Why two steps.** They install different things. `pi install` registers the
+extension inside Pi, which is what gives you `/bg`, session tracking and the
+`/pi-dashboard` command; it does not put anything on your PATH. The npm global
+install provides the `pi-king` launcher, a standalone process that owns the
+terminal while tmux has it. You need the launcher only for attaching from
+outside tmux. Inside tmux, the extension alone is enough.
+
 Requires [tmux](https://github.com/tmux/tmux) for persistence. Without it,
 pi-king still runs and lists sessions — it just cannot background them, and
 says so.

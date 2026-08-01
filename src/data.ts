@@ -88,7 +88,8 @@ function listDir(path: string, pick: (entry: string, full: string) => string | u
     return readdirSync(path)
       .map((e) => pick(e, join(path, e)))
       .filter((v): v is string => Boolean(v))
-      .sort();
+      .sort()
+      .map((n) => clean(n, 80));
   } catch {
     return [];
   }
@@ -113,6 +114,19 @@ function onPath(cmd: string): boolean {
  * Measured at ~0.1s in Python, dominated by interpreter startup; here it is a
  * handful of readdir/stat calls.
  */
+/** Strips terminal control sequences from a string that came from outside this
+ * process: a directory name, a session name, a field in someone else's status
+ * file. Directory names may legally contain ESC on macOS and Linux, and nothing
+ * validates the contents of a status file, so rendering these raw lets an
+ * unrelated string reposition the cursor, repaint the screen, or forge a row
+ * that looks like a different session. Also applied before send-keys, where a
+ * newline would submit a line and leave the remainder as a prompt typed into a
+ * running agent. */
+export function clean(value: string, max = 200): string {
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").slice(0, max);
+}
+
 export function readInventory(): Inventory {
   return {
     skills: listDir(join(AGENT_DIR, "skills"), (e, full) => {
@@ -343,7 +357,7 @@ export function readRecentProjects(limit = 5): RecentProject[] {
       continue;
     }
     if (!cwd) continue;
-    out.push({ project: basename(cwd) || cwd, path: cwd, lastActive });
+    out.push({ project: clean(basename(cwd) || cwd, 60), path: clean(cwd, 200), lastActive });
   }
   return out;
 }

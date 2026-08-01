@@ -101,7 +101,7 @@ export type SessionStatusFile = {
  */
 export const SESSION_STATUS_DIR =
   process.env.PI_KING_STATUS_DIR?.trim() || join(homedir(), ".pi", "king", "session-status");
-import {
+import { clean,
   PI_ART,
   StatsCache,
   sparkline,
@@ -143,7 +143,7 @@ type DashboardEntry = {
   tmuxName: string | undefined; // resolved live tmux session name, if correlated
 };
 
-type TmuxSession = { name: string; attached: boolean; windows: number; createdAt: number; token: string };
+type TmuxSession = { name: string; attached: boolean; windows: number; createdAt: number; panePid: number; token: string };
 
 /** A row that's a bare tmux session with no matching pi-alerts status file — an
  * external/non-Pi process, or a Pi session that crashed without cleaning up its
@@ -153,7 +153,7 @@ type SessionRow = { kind: "session"; entry: DashboardEntry };
 type Row = SessionRow | OrphanRow;
 
 type HubAction =
-  | { type: "attach"; tmuxName: string }
+  | { type: "attach"; tmuxName: string; expectedPid?: number }
   | { type: "create"; name: string; dir: string };
 
 /**
@@ -205,6 +205,14 @@ function readSessions(): DashboardEntry[] {
     let raw: SessionStatusFile;
     try {
       raw = JSON.parse(readFileSync(full, "utf8")) as SessionStatusFile;
+      // Nothing validates what is in a status file: the directory is writable by
+      // anything running as this user, and these fields are rendered straight
+      // into the terminal. Strip control sequences at the boundary rather than
+      // at each render site, where one missed call reopens it.
+      for (const k of ["name", "activity", "cwd", "project", "title", "model", "tmuxName"] as const) {
+        const v = (raw as Record<string, unknown>)[k];
+        if (typeof v === "string") (raw as Record<string, unknown>)[k] = clean(v);
+      }
     } catch {
       // Rare race with the writer's atomic tmp+rename, or a leftover .tmp file.
       // Skip this cycle; it resolves itself on the next poll.
@@ -256,11 +264,25 @@ function readSessions(): DashboardEntry[] {
 
 /** Lists live tmux sessions. No server running is not an error — just zero sessions. */
 function listTmuxSessions(): TmuxSession[] {
-  const result = spawnSync(TMUX, ["list-sessions", "-F", "#{session_name}\t#{session_attached}\t#{session_windows}\t#{session_created}\t#{@pi_king_token}"], { encoding: "utf8", timeout: 3000 });
+  const result = spawnSync(TMUX, ["list-sessions", "-F", "#{session_name}\t#{session_attached}\t#{session_windows}\t#{session_created}\t#{pane_pid}\t#{@pi_king_token}"], { encoding: "utf8", timeout: 3000 });
   if (result.status !== 0 || !result.stdout) return [];
-  return result.stdout.trim().split("\n").filter(Boolean).map((line) => {
-    const [name, attached, windows, created, token] = line.split("\t");
-    return { name, attached: attached === "1", windows: Number(windows) || 0, createdAt: (Number(created) || 0) * 1000, token: token ?? "" };
+  return result.stdout.trim().split("\n").filter(Boolean).flatMap((line) => {
+    // tmux rejects control characters in session names but NOT in user option
+    // values, so a value containing a newline splits into what looks like an
+    // extra session with attacker-chosen fields. Requiring the exact field
+    // count discards those fragments: a forged line cannot also carry the right
+    // number of tabs once the real value has consumed the line.
+    const parts = line.split("\t");
+    if (parts.length !== 6) return [];
+    const [name, attached, windows, created, panePid, token] = parts;
+    return [{
+      name,
+      attached: attached === "1",
+      windows: Number(windows) || 0,
+      createdAt: (Number(created) || 0) * 1000,
+      panePid: Number(panePid) || 0,
+      token: token ?? "",
+    }];
   });
 }
 
@@ -268,24 +290,39 @@ function listTmuxSessions(): TmuxSession[] {
 function buildRows(): Row[] {
   const entries = readSessions();
   const tmuxSessions = listTmuxSessions();
-  // A token is only an identity if it is unique. Two sessions carrying the same
-  // one cannot be told apart, and Map construction silently keeps the last
-  // writer — which pairs a session with the wrong tmux session and displays it
-  // under another session's name and directory. Showing the wrong identity is
-  // worse than showing none, so ambiguous tokens are dropped from the index and
-  // those sessions fall through to name matching.
-  const tokenCounts = new Map<string, number>();
-  for (const t of tmuxSessions) if (t.token) tokenCounts.set(t.token, (tokenCounts.get(t.token) ?? 0) + 1);
-  const tmuxByToken = new Map(
-    tmuxSessions.filter((t) => t.token && tokenCounts.get(t.token) === 1).map((t) => [t.token, t]),
-  );
-  const tmuxByName = new Map(tmuxSessions.map((t) => [t.name, t]));
+  // Correlation is by PROCESS, not by token.
+  //
+  // The token lived in a tmux user option, and a tmux option is a sticker
+  // rather than a lock: any process running as this user can read one session's
+  // token, write it onto a session it controls, and overwrite the original. The
+  // token then appears exactly once, on the wrong session, so counting
+  // duplicates does not detect it. Following that pairing would attach the user
+  // to a pane chosen by whoever moved the sticker.
+  //
+  // A pid cannot be moved. /bg execs pi as the pane command, so the pane's pid
+  // IS the Pi process, and the status file records the pid of the process that
+  // wrote it. Requiring those to agree makes the pairing unforgeable by anything
+  // that cannot already impersonate the process itself.
+  // A pane pid is unique by construction: one pane, one process. Two rows
+  // claiming the same one therefore cannot both be real, and the surplus row is
+  // a forgery smuggled in through a newline in a user option value. Map
+  // building would silently keep the last writer, handing the attacker the
+  // pairing. Drop every row involved instead: an unresolvable identity must
+  // fail closed, because the fallback is attaching the user to a pane chosen by
+  // whoever tampered.
+  const panePidCounts = new Map<number, number>();
+  for (const t of tmuxSessions) if (t.panePid > 0) panePidCounts.set(t.panePid, (panePidCounts.get(t.panePid) ?? 0) + 1);
+  const tmuxByPanePid = new Map<number, TmuxSession>();
+  for (const t of tmuxSessions) {
+    if (t.panePid > 0 && panePidCounts.get(t.panePid) === 1) tmuxByPanePid.set(t.panePid, t);
+  }
   const matchedTmuxNames = new Set<string>();
   const sessionRows: SessionRow[] = entries.map((entry) => {
-    // Token first: survives renames on either side. Name is only a fallback
-    // for sessions predating the token, or adopted rather than spawned.
-    const match = (entry.kingToken && tmuxByToken.get(entry.kingToken))
-      ?? (entry.name ? tmuxByName.get(entry.name) : undefined);
+    // No name fallback. Matching on a name that merely looks right is the same
+    // class of mistake as trusting the token: it pairs on resemblance instead of
+    // identity, and it is exactly what an attacker gets to choose. An unmatched
+    // session renders as unmatched, which is honest and harmless.
+    const match = entry.pid ? tmuxByPanePid.get(entry.pid) : undefined;
     if (match) {
       matchedTmuxNames.add(match.name);
       return { kind: "session", entry: { ...entry, tmuxName: match.name } };
@@ -351,7 +388,7 @@ function flushPendingRenames(rows: Row[]): void {
     const row = rows.find((r) => r.kind === "session" && r.entry.tmuxName === tmuxName);
     if (!row || row.kind !== "session") continue;
     if (row.entry.state !== "idle") continue;
-    spawnSync(TMUX, ["send-keys", "-t", tmuxName, `/name ${desired}`, "Enter"], { encoding: "utf8", timeout: 3000 });
+    spawnSync(TMUX, ["send-keys", "-t", tmuxName, `/name ${clean(desired)}`, "Enter"], { encoding: "utf8", timeout: 3000 });
     pendingRenames.delete(tmuxName);
   }
 }
@@ -368,7 +405,7 @@ function renameTmuxSession(oldName: string, newName: string, piIsIdle: boolean):
   // rename still displays correctly (the row prefers the tmux name), so
   // skipping this is a cosmetic mismatch inside Pi, not a broken row.
   if (piIsIdle) {
-    spawnSync(TMUX, ["send-keys", "-t", newName, `/name ${newName}`, "Enter"], { encoding: "utf8", timeout: 3000 });
+    spawnSync(TMUX, ["send-keys", "-t", newName, `/name ${clean(newName)}`, "Enter"], { encoding: "utf8", timeout: 3000 });
     return { ok: true, message: `Renamed to "${newName}".` };
   }
   // Busy: queue the Pi-side rename rather than dropping it. It applies
@@ -763,7 +800,11 @@ class DashboardView implements Component {
       if (!row) return;
       const tmuxName = this.rowTmuxName(row);
       if (tmuxName) {
-        this.done({ type: "attach", tmuxName });
+        // Pass the pid this row is believed to belong to, so the attach path can
+        // re-confirm with tmux directly instead of trusting the bulk listing it
+        // was built from. Orphan rows have no Pi process to verify against.
+        const expectedPid = row.kind === "session" ? row.entry.pid : undefined;
+        this.done({ type: "attach", tmuxName, expectedPid });
         return;
       }
       if (row.kind === "session") {
@@ -1023,8 +1064,26 @@ async function showDashboardOnce(ctx: ExtensionContext): Promise<HubAction | und
  *
  * Outside tmux the wrapper is still required, because a process cannot hand its
  * controlling terminal to a child without both fighting over stdin. */
+/** Confirms a tmux session really is the one running `expectedPid`, by asking
+ * tmux about that session directly instead of trusting a line from a bulk
+ * listing. The listing can be polluted by a forged row; a targeted query cannot,
+ * because a session that does not exist returns nothing and a session the
+ * attacker does own reports its own pid. */
+function tmuxSessionOwnsPid(name: string, expectedPid: number): boolean {
+  if (!expectedPid) return false;
+  const r = spawnSync(TMUX, ["display-message", "-p", "-t", name, "#{pane_pid}"], { encoding: "utf8", timeout: 3000 });
+  if (r.status !== 0) return false;
+  return Number((r.stdout || "").trim()) === expectedPid;
+}
+
 function goToSession(action: HubAction): boolean {
   if (action.type === "attach" && process.env.TMUX) {
+    // Re-verify against tmux before moving the user. buildRows worked from a
+    // bulk listing that a forged row can pollute; this asks about the one
+    // session we are about to enter.
+    if (action.expectedPid !== undefined && !tmuxSessionOwnsPid(action.tmuxName, action.expectedPid)) {
+      return false;
+    }
     const r = spawnSync(TMUX, ["switch-client", "-t", action.tmuxName], { encoding: "utf8", timeout: 3000 });
     if (r.status === 0) return true;
     // Fall through: switch-client fails if the target died between listing and
@@ -1081,7 +1140,10 @@ function installSessionTracker(pi: ExtensionAPI) {
   function persist(ctx: ExtensionContext): void {
     if (!isInteractive(ctx)) return;
     try {
-      mkdirSync(SESSION_STATUS_DIR, { recursive: true });
+      // 0700/0600: these files carry session names, absolute working directories and
+      // pids. Default permissions expose all of that to every other account on a
+      // shared host for no benefit; nothing but this user needs to read them.
+      mkdirSync(SESSION_STATUS_DIR, { recursive: true, mode: 0o700 });
       const cutoff = Date.now() - 5 * 60_000;
       for (const [id, s] of subagents) if (s.completedAt && s.completedAt < cutoff) subagents.delete(id);
       const snap: SessionStatusFile = {
@@ -1104,7 +1166,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       };
       const target = statusPath(ctx);
       const tmp = `${target}.tmp-${process.pid}`;
-      writeFileSync(tmp, JSON.stringify(snap, null, 2));
+      writeFileSync(tmp, JSON.stringify(snap, null, 2), { mode: 0o600 });
       renameSync(tmp, target);
     } catch {
       // Status is best-effort; it must never disrupt the session it describes.
@@ -1120,6 +1182,32 @@ function installSessionTracker(pi: ExtensionAPI) {
     hadRun = false; bgQueued = false; subagents.clear();
     visible = process.env.PI_DASHBOARD_SPAWNED === "1";
     persist(ctx);
+      // Collision guard. pi-king is what makes this reachable: before it, a
+      // session's liveness was visible because it sat in an open terminal. Now a
+      // session can be alive, headless, for days, and /bg prints a resume
+      // command that is correct only after that session ends. Running it while
+      // the session still lives puts a second process on one transcript, both
+      // appending, and the damage is silent.
+      //
+      // The extension loads inside the duplicate too, so it can catch itself:
+      // if this session id is already claimed by a process that is verifiably
+      // alive and is not us, say so immediately.
+      try {
+        // Read our own status file directly rather than the dashboard listing,
+        // which filters to sessions marked visible and would miss a duplicate.
+        const myId = ctx.sessionManager.getSessionId();
+        const claimed = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${myId}.json`), "utf8")) as SessionStatusFile;
+        const owner = Number(claimed.pid) || 0;
+        if (owner && owner !== process.pid && livePiPids()?.has(owner)) {
+          ctx.ui.notify(
+            `Session ${myId.slice(0, 8)} is already running as pid ${owner}. ` +
+            `Two processes appending to one transcript will corrupt its history. ` +
+            `Attach to the existing one rather than continuing here.`,
+            "error",
+          );
+        }
+      } catch { /* no file, unreadable, or first run: nothing to warn about */ }
+
     // Retry briefly: on a resumed session the session file may not resolve on
     // the first tick, and an idle session produces no further events to
     // piggyback on. Cheap, bounded, and stops as soon as a write lands.
