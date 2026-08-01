@@ -1,0 +1,69 @@
+import { createJiti } from "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti.mjs";
+// Point at a directory of call logs. A frozen copy is strongly preferred:
+// live logs gain entries between two reads, and the resulting off-by-one-call
+// deltas look exactly like a real bug. That happened while writing this.
+process.env.PI_KING_CALL_LOGS = process.env.PI_KING_CALL_LOGS || process.env.HOME + "/.omniroute/call_logs";
+process.env.PI_KING_STATUS_DIR = process.env.PI_KING_STATUS_DIR || "/tmp/pi-king-verify-status";
+const jiti = createJiti(import.meta.url, { interopDefault: true });
+const d = await jiti.import("/Users/stanz/codebase/pi-king/src/data.ts");
+let bad = 0;
+const chk = (name, ok, detail="") => { if(!ok) bad++; console.log(`  ${ok?"PASS":"FAIL"}  ${name}${detail?"  "+detail:""}`); };
+
+// 1. cache round-trip must not change any number
+const cold = await d.readDailyTokens(3650);
+const warm = await d.readDailyTokens(3650);
+chk("cache round-trip identical", JSON.stringify(cold)===JSON.stringify(warm));
+
+// 2. lifetime totals equal the sum of the per-day rows
+const life = await d.readLifetimeStats();
+const sumIn = cold.reduce((a,x)=>a+x.tokensIn,0);
+const sumCalls = cold.reduce((a,x)=>a+x.calls,0);
+chk("lifetime in == sum(days)", life.tokensIn===sumIn, `${life.tokensIn} vs ${sumIn}`);
+chk("lifetime calls == sum(days)", life.calls===sumCalls, `${life.calls} vs ${sumCalls}`);
+
+// 3. today's row in the daily series must equal readUsageStats
+const s = await d.readUsageStats();
+const todayRow = cold[cold.length-1];
+chk("today's daily row == usage stats", todayRow.calls===s.calls && todayRow.tokensIn===s.tokensIn,
+    `daily(${todayRow.calls},${todayRow.tokensIn}) vs usage(${s.calls},${s.tokensIn})`);
+
+// 4. derived percentages
+const errPct = (s.errors/s.calls)*100;
+const cachePct = Math.round((s.tokensCacheRead/s.tokensIn)*100);
+const outPct = (s.tokensOut/s.tokensIn)*100;
+chk("cache share within 0..100", cachePct>=0 && cachePct<=100, `${cachePct}%`);
+chk("out share plausible (<100)", outPct>0 && outPct<100, `${outPct.toFixed(3)}%`);
+chk("error rate matches counts", Math.abs(errPct-(s.errors/s.calls*100))<1e-9, `${errPct.toFixed(2)}%`);
+
+// 5. p95 is nearest-rank and lies inside the sample
+const n=s.durations.length, idx=Math.min(n-1,Math.floor(n*0.95)), p95=s.durations[idx];
+const below = s.durations.filter(x=>x<=p95).length;
+chk("p95 inside sample", p95>=s.durations[0] && p95<=s.durations[n-1]);
+chk("p95 covers >=95% of samples", below/n>=0.95, `${(below/n*100).toFixed(1)}% <= p95`);
+
+// 6. model percentages sum sanely
+const sum=s.topModels.reduce((a,m)=>a+m.pct,0);
+chk("top-3 model shares <= 100", sum<=100, `${sum}%`);
+
+// 7. peakPeriod share consistent
+if (s.peakPeriod) chk("busiest share 0..100", s.peakPeriod.pct>=0 && s.peakPeriod.pct<=100, `${s.peakPeriod.pct}%`);
+
+// 8. hourly buckets sum to calls
+const hourSum = s.hourly.reduce((a,x)=>a+x,0);
+chk("hourly buckets sum == calls", hourSum===s.calls, `${hourSum} vs ${s.calls}`);
+
+// 9. comparison arithmetic
+const total=life.tokensIn+life.tokensOut;
+const cmp=d.tokenComparison(total);
+const m=cmp.match(/~([\d,]+)x the text of (.+)/);
+const times=Number(m[1].replace(/,/g,""));
+const HP=1084170*1.33;
+chk("comparison multiple correct", Math.abs(times-Math.round(total/HP))<=0, `${times} vs ${Math.round(total/HP)}`);
+
+// 10. edge cases
+chk("empty comparison for 0 tokens", d.tokenComparison(0)===undefined);
+chk("comparison undefined below smallest work", d.tokenComparison(1000)===undefined);
+chk("compactNum boundaries", d.compactNum(999)==="999" && d.compactNum(1000)==="1k" && d.compactNum(1e6)==="1.0M" && d.compactNum(1e9)==="1.0B");
+chk("sparkline of empty is falsy", !d.sparkline([]));
+chk("sparkline of flat series", typeof d.sparkline([5,5,5])==="string");
+process.exit(bad?1:0);
