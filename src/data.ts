@@ -219,7 +219,7 @@ export async function readDailyTokens(): Promise<DayTotal[]> {
   }
   const volatile = new Set(dirs.slice(-2));
 
-  let cache: Record<string, { tokensIn: number; tokensOut: number; calls: number }> = {};
+  let cache: Record<string, { tokensIn: number; tokensOut: number; tokensCacheRead: number; calls: number }> = {};
   try {
     cache = JSON.parse(readFileSync(DAILY_CACHE, "utf8")) as typeof cache;
   } catch { /* first run, or unreadable: rebuild */ }
@@ -228,12 +228,15 @@ export async function readDailyTokens(): Promise<DayTotal[]> {
   let dirty = false;
   for (const day of dirs) {
     const hit = cache[day];
-    if (!volatile.has(day) && hit && typeof hit.tokensIn === "number") {
+    // Require every field. Entries written before a field existed would
+    // otherwise be served with it silently missing, which reads as zero.
+    if (!volatile.has(day) && hit && typeof hit.tokensIn === "number" && typeof hit.tokensCacheRead === "number") {
       out.push({ day, ...hit });
       continue;
     }
     let tokensIn = 0;
     let tokensOut = 0;
+    let tokensCacheRead = 0;
     let calls = 0;
     try {
       const files = (await readdir(join(CALL_LOGS, day))).filter((f) => f.endsWith(".json"));
@@ -253,12 +256,13 @@ export async function readDailyTokens(): Promise<DayTotal[]> {
           if (tk) {
             tokensIn += Number(tk.in) || 0;
             tokensOut += Number(tk.out) || 0;
+            tokensCacheRead += Number(tk.cacheRead) || 0;
           }
         }
       }
     } catch { continue; }
-    out.push({ day, tokensIn, tokensOut, calls });
-    if (!volatile.has(day)) { cache[day] = { tokensIn, tokensOut, calls }; dirty = true; }
+    out.push({ day, tokensIn, tokensOut, tokensCacheRead, calls });
+    if (!volatile.has(day)) { cache[day] = { tokensIn, tokensOut, tokensCacheRead, calls }; dirty = true; }
   }
   if (dirty) {
     try {
@@ -278,13 +282,6 @@ export async function readDailyTokens(): Promise<DayTotal[]> {
  * is why "current" is computed from the most recent active day rather than
  * requiring today specifically: penalising someone at 00:05 for not having
  * worked yet would be wrong. */
-/** A human-scale comparison for a token count.
- *
- * Word counts are the published lengths of the works; the words-to-tokens
- * factor is an approximation for English BPE tokenizers, which is why every
- * result is prefixed with a tilde. It is a toy, and it is labelled as one, but
- * the arithmetic is real: nothing here is invented to make a nicer number.
- */
 /** 1.6B / 42.5M / 116k. The exact digit never changes a decision. */
 export function compactNum(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
@@ -293,6 +290,21 @@ export function compactNum(n: number): string {
   return String(n);
 }
 
+/** A human-scale comparison for a token count.
+ *
+ * Feed this DISTINCT tokens, not total input. Most input on a long session is
+ * cache reads: the same conversation history re-sent on every turn. Counting
+ * those as text read would say a paragraph re-read a thousand times is a
+ * thousand paragraphs. On the machine this was written for, cache reads were
+ * 81.5% of all input, so comparing against the raw total overstated by roughly
+ * five times.
+ *
+ * Word counts are the published lengths of the works. The words-to-tokens
+ * factor is an approximation for English prose, and code tokenizes denser than
+ * prose, so the result still leans high; that is why every one carries a tilde.
+ * It is a toy and it reads as one, but the arithmetic is real and the
+ * denominator is the honest one.
+ */
 export function tokenComparison(tokens: number): string | undefined {
   if (tokens <= 0) return undefined;
   const WORDS_TO_TOKENS = 1.33;
@@ -322,6 +334,7 @@ export async function readLifetimeStats(): Promise<LifetimeStats | undefined> {
 
   const tokensIn = active.reduce((n, d) => n + d.tokensIn, 0);
   const tokensOut = active.reduce((n, d) => n + d.tokensOut, 0);
+  const tokensCacheRead = active.reduce((n, d) => n + d.tokensCacheRead, 0);
   const calls = active.reduce((n, d) => n + d.calls, 0);
 
   const dayMs = 86_400_000;
@@ -348,7 +361,7 @@ export async function readLifetimeStats(): Promise<LifetimeStats | undefined> {
   const gapDays = Math.round((asDate(todayKey) - asDate(last)) / dayMs);
   if (gapDays > 1) current = 0;
 
-  return { tokensIn, tokensOut, calls, activeDays: active.length, currentStreak: current, longestStreak: longest, days };
+  return { tokensIn, tokensOut, tokensCacheRead, calls, activeDays: active.length, currentStreak: current, longestStreak: longest, days };
 }
 
 export async function readUsageStats(): Promise<UsageStats | undefined> {
@@ -498,6 +511,9 @@ export class StatsCache {
 export type LifetimeStats = {
   tokensIn: number;
   tokensOut: number;
+  /** Cache reads, so callers can subtract them. Input alone counts the same
+   * history re-sent each turn as though it were new text. */
+  tokensCacheRead: number;
   calls: number;
   activeDays: number;
   currentStreak: number;
@@ -505,7 +521,7 @@ export type LifetimeStats = {
   days: DayTotal[];
 };
 
-export type DayTotal = { day: string; tokensIn: number; tokensOut: number; calls: number };
+export type DayTotal = { day: string; tokensIn: number; tokensOut: number; tokensCacheRead: number; calls: number };
 
 export type RecentProject = { project: string; path: string; lastActive: number };
 

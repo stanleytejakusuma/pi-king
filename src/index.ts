@@ -940,7 +940,12 @@ class DashboardView implements Component {
         const heat = life.days.map((d) => shades[Math.min(4, Math.ceil((d.tokensIn / peak) * 4))]).join("");
         lines.push("  " + th.fg("dim", "daily volume  ") + th.fg("accent", heat) +
           th.fg("dim", `  ${life.days[0]?.day ?? ""} \u2192 ${life.days[life.days.length - 1]?.day ?? ""}`));
-        const cmp = tokenComparison(total);
+        // Distinct tokens only: input minus cache reads, plus output. Cache
+        // reads are the same history re-sent each turn, and counting them here
+        // would inflate the comparison by however chatty the sessions were
+        // rather than by how much text actually passed through.
+        const distinct = Math.max(0, life.tokensIn - life.tokensCacheRead) + life.tokensOut;
+        const cmp = tokenComparison(distinct);
         if (cmp) {
           lines.push("");
           lines.push("  " + th.fg("muted", `You have pushed ${cmp} through this machine.`));

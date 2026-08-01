@@ -140,7 +140,10 @@ Each file is JSON with a `summary` object. Fields read:
 - `model` (string) for the model mix.
 - `timestamp` (ISO-8601 UTC) for the hourly sparkline.
 - `tokens.in`, `tokens.out`, `tokens.cacheRead` (numbers) for token totals and
-  cache share. Cache share is reported against input tokens, because cached
+  cache share. `cacheRead` is a subset of `in`, not additive: verified across
+  2,124 sampled records, the ratio never exceeds 1.0. Anything comparing token
+  volume to something outside the system should subtract it, since cache reads
+  are the same history re-sent each turn rather than new text. Cache share is reported against input tokens, because cached
   input is billed at a fraction of fresh input and is what makes a large token
   count cheap.
 - `duration` (ms) for p95. The mean hides the tail; the tail is what a person

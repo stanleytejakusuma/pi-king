@@ -52,13 +52,19 @@ if (s.peakPeriod) chk("busiest share 0..100", s.peakPeriod.pct>=0 && s.peakPerio
 const hourSum = s.hourly.reduce((a,x)=>a+x,0);
 chk("hourly buckets sum == calls", hourSum===s.calls, `${hourSum} vs ${s.calls}`);
 
-// 9. comparison arithmetic
+// 9. comparison arithmetic, against DISTINCT tokens
+const distinct=Math.max(0,life.tokensIn-life.tokensCacheRead)+life.tokensOut;
 const total=life.tokensIn+life.tokensOut;
-const cmp=d.tokenComparison(total);
+chk("cache reads are a subset of input", life.tokensCacheRead<=life.tokensIn,
+    `${life.tokensCacheRead} <= ${life.tokensIn}`);
+chk("distinct excludes cache reads", distinct<total || life.tokensCacheRead===0,
+    `distinct ${d.compactNum(distinct)} < total ${d.compactNum(total)}`);
+chk("lifetime cacheRead == sum(days)", life.tokensCacheRead===cold.reduce((a,x)=>a+x.tokensCacheRead,0));
+const cmp=d.tokenComparison(distinct);
 const m=cmp.match(/~([\d,]+)x the text of (.+)/);
 const times=Number(m[1].replace(/,/g,""));
 const HP=1084170*1.33;
-chk("comparison multiple correct", Math.abs(times-Math.round(total/HP))<=0, `${times} vs ${Math.round(total/HP)}`);
+chk("comparison multiple correct", Math.abs(times-Math.round(distinct/HP))<=0, `${times} vs ${Math.round(distinct/HP)}`);
 
 // 10. edge cases
 chk("empty comparison for 0 tokens", d.tokenComparison(0)===undefined);
