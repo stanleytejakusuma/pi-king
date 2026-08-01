@@ -18,9 +18,9 @@
  *    silently. A fabricated authoritative-looking number is worse than none.
  */
 
-import { openSync, readSync, closeSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { openSync, readSync, closeSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
-import { join, basename } from "node:path";
+import { join, basename, dirname } from "node:path";
 import { homedir } from "node:os";
 
 const HOME = homedir();
@@ -37,6 +37,11 @@ const AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || join(HOME, ".pi", "
  * everyone who does not run it. Unset means the band is simply absent, which
  * matches the rule that missing data renders as nothing. See README. */
 const CALL_LOGS = process.env.PI_KING_CALL_LOGS?.trim() || undefined;
+
+/** Where per-day token totals are memoised. Kept beside the session status
+ * files rather than inside the log directory, which belongs to whatever writes
+ * the logs and should not accumulate our bookkeeping. */
+const DAILY_CACHE = join(process.env.PI_KING_STATUS_DIR?.trim() || join(HOME, ".pi", "king", "session-status"), "..", "usage-cache.json");
 
 /* ------------------------------------------------------------------ art -- */
 
@@ -188,6 +193,72 @@ function shortModel(id: string): string {
  * render nothing rather than "0 calls", which would falsely imply measured
  * inactivity rather than absent measurement.
  */
+/** Per-day input-token totals, oldest first, for the daily sparkline.
+ *
+ * A mean is not offered deliberately. Measured usage spans a 70x range across
+ * eight days, so a single average collapses "barely touched it" and "ran it all
+ * week" into one number that describes neither. A sparkline shows the burst
+ * instead of hiding it, and the eye does the comparison without arithmetic.
+ *
+ * Caching: a past day's logs never change, so its total is computed once and
+ * kept. Today and yesterday are always rescanned, because a session running
+ * across midnight writes into yesterday's directory after that day has ended,
+ * and freezing it early would undercount it. Only the two most recent
+ * directories are ever re-read.
+ */
+export async function readDailyTokens(days = 8): Promise<{ day: string; tokensIn: number }[]> {
+  if (!CALL_LOGS) return [];
+  let dirs: string[];
+  try {
+    dirs = (await readdir(CALL_LOGS)).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+  } catch {
+    return [];
+  }
+  dirs = dirs.slice(-days);
+  const volatile = new Set(dirs.slice(-2));
+
+  let cache: Record<string, number> = {};
+  try {
+    cache = JSON.parse(readFileSync(DAILY_CACHE, "utf8")) as Record<string, number>;
+  } catch { /* first run, or unreadable: rebuild */ }
+
+  const out: { day: string; tokensIn: number }[] = [];
+  let dirty = false;
+  for (const day of dirs) {
+    if (!volatile.has(day) && typeof cache[day] === "number") {
+      out.push({ day, tokensIn: cache[day] });
+      continue;
+    }
+    let total = 0;
+    try {
+      const files = (await readdir(join(CALL_LOGS, day))).filter((f) => f.endsWith(".json"));
+      const BATCH = 64;
+      for (let i = 0; i < files.length; i += BATCH) {
+        const parsed = await Promise.all(files.slice(i, i + BATCH).map(async (f) => {
+          try {
+            return JSON.parse(await readFile(join(CALL_LOGS, day, f), "utf8")) as { summary?: Record<string, unknown> };
+          } catch {
+            return undefined;
+          }
+        }));
+        for (const r of parsed) {
+          const tk = r?.summary?.tokens as Record<string, unknown> | undefined;
+          if (tk) total += Number(tk.in) || 0;
+        }
+      }
+    } catch { continue; }
+    out.push({ day, tokensIn: total });
+    if (!volatile.has(day)) { cache[day] = total; dirty = true; }
+  }
+  if (dirty) {
+    try {
+      mkdirSync(dirname(DAILY_CACHE), { recursive: true, mode: 0o700 });
+      writeFileSync(DAILY_CACHE, JSON.stringify(cache), { mode: 0o600 });
+    } catch { /* cache is an optimisation; losing it costs a rescan */ }
+  }
+  return out;
+}
+
 export async function readUsageStats(): Promise<UsageStats | undefined> {
   if (!CALL_LOGS) return undefined;
   const dir = join(CALL_LOGS, today());
@@ -272,19 +343,21 @@ const STATS_TTL_MS = 60_000;
 
 export class StatsCache {
   private value: UsageStats | undefined;
+  private daily: { day: string; tokensIn: number }[] = [];
   private loaded = false;
   private fetchedAt = 0;
   private inFlight = false;
 
   constructor(private onUpdate: () => void) {}
 
-  /** Non-blocking. Triggers a background refresh when stale. */
-  get(): { stats: UsageStats | undefined; loaded: boolean } {
+  /** Non-blocking. Triggers a background refresh when stale. Both reads happen
+   * on the same tick so the band never mixes a fresh today with a stale history. */
+  get(): { stats: UsageStats | undefined; daily: { day: string; tokensIn: number }[]; loaded: boolean } {
     if (!this.inFlight && Date.now() - this.fetchedAt > STATS_TTL_MS) {
       this.inFlight = true;
-      readUsageStats()
-        .then((s) => { this.value = s; })
-        .catch(() => { this.value = undefined; })
+      Promise.all([readUsageStats(), readDailyTokens()])
+        .then(([s, d]) => { this.value = s; this.daily = d; })
+        .catch(() => { this.value = undefined; this.daily = []; })
         .finally(() => {
           this.loaded = true;
           this.fetchedAt = Date.now();
@@ -292,7 +365,7 @@ export class StatsCache {
           this.onUpdate();
         });
     }
-    return { stats: this.value, loaded: this.loaded };
+    return { stats: this.value, daily: this.daily, loaded: this.loaded };
   }
 }
 

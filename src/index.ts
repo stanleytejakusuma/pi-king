@@ -556,7 +556,7 @@ function clockLine(): string {
  * without reading it), and the top three models get descending emphasis so
  * rank is legible at a glance. Renders nothing when no calls were logged
  * today — "0 calls" would falsely imply measured inactivity. */
-function tickerParts(th: Theme, stats: UsageStats | undefined, loaded: boolean, budget = Infinity): string | undefined {
+function tickerParts(th: Theme, stats: UsageStats | undefined, daily: { day: string; tokensIn: number }[], loaded: boolean, budget = Infinity): string | undefined {
   if (!loaded) return th.fg("dim", "\u2026");
   if (!stats) return undefined;
   const rate = stats.calls > 0 ? (stats.errors / stats.calls) * 100 : 0;
@@ -586,8 +586,13 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, loaded: boolean, 
   // mix. Token volume and cache share survive a narrow terminal; which model
   // served them is the first thing worth losing.
   if (stats.tokensIn > 0 || stats.tokensOut > 0) {
+    // out/in: rising share means the agents are generating more than they are
+    // reading, which is the difference between writing code and combing through
+    // a repository. Both numbers are already here; the ratio is what is read.
+    const outShare = stats.tokensIn > 0 ? (stats.tokensOut / stats.tokensIn) * 100 : 0;
     segs.push(th.fg("dim", "tok ") + th.fg("accent", compact(stats.tokensIn)) +
-      th.fg("dim", " in / ") + th.fg("accent", compact(stats.tokensOut)) + th.fg("dim", " out"));
+      th.fg("dim", " in / ") + th.fg("accent", compact(stats.tokensOut)) +
+      th.fg("dim", ` out (${outShare < 1 ? outShare.toFixed(1) : Math.round(outShare)}%)`));
   }
   if (stats.tokensCacheRead > 0) {
     // Cache share is why a large input count can still be cheap, so it gets the
@@ -600,9 +605,20 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, loaded: boolean, 
     // actually experiences.
     segs.push(th.fg("dim", "p95 ") + th.fg(p95 > 30_000 ? "warning" : "accent", `${(p95 / 1000).toFixed(1)}s`));
   }
-  stats.topModels.forEach((m, i) => {
-    segs.push(th.fg(modelColors[i] ?? "dim", m.model) + th.fg("dim", ` ${m.pct}%`));
-  });
+  // Daily input-token history. Today is the last bar and is dimmed, because it
+  // is a partial day: comparing a half-finished day against completed ones is a
+  // false signal, so it is shown but visually set apart rather than ranked.
+  if (daily.length >= 3) {
+    const bars = sparkline(daily.map((d) => d.tokensIn));
+    if (bars) {
+      segs.push(th.fg("dim", `${daily.length}d `) +
+        th.fg("accent", bars.slice(0, -1)) + th.fg("muted", bars.slice(-1)));
+    }
+  }
+  // Only the leader. The runner-up's share does not change what anyone does
+  // next, and it was the first thing shed on a narrow terminal anyway.
+  const lead = stats.topModels[0];
+  if (lead) segs.push(th.fg(modelColors[0], lead.model) + th.fg("dim", ` ${lead.pct}%`));
   if (stats.partial) segs.push(th.fg("warning", "(partial)"));
   // The band shares its row with a right-flushed clock. If the segments overrun
   // the space left for it, the clock is pushed past the terminal edge and
@@ -856,7 +872,7 @@ class DashboardView implements Component {
       left + " ".repeat(Math.max(1, MEASURE - visibleWidth(left) - visibleWidth(right))) + right;
 
     const lines: string[] = [];
-    const { stats, loaded } = this.statsCache.get();
+    const { stats, daily, loaded } = this.statsCache.get();
 
     // ---- banner: art beside identity, row-for-row ----------------------
     const side = [
@@ -879,7 +895,7 @@ class DashboardView implements Component {
     // Budget: the row is "  " + ticker ... clock + "  ", so the ticker may use
     // everything except the clock, the two-space margins and a separating gap.
     const clockText = clockLine();
-    const ticker = tickerParts(th, stats, loaded, Math.max(20, MEASURE - visibleWidth(clockText) - 8));
+    const ticker = tickerParts(th, stats, daily, loaded, Math.max(20, MEASURE - visibleWidth(clockText) - 8));
     const rule = th.fg("dim", "\u2500".repeat(Math.max(0, MEASURE - 4)));
     lines.push("  " + rule);
     lines.push(split("  " + (ticker ?? th.fg("dim", "no router activity today")), th.fg("dim", clockText) + "  "));
