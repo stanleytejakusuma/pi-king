@@ -221,7 +221,8 @@ and verified by process start time. Earlier versions correlated by a token
 stored in a tmux user option; a tmux option is writable by anything running as
 the same user, so it could be moved onto an attacker's session, and following
 that pairing would attach the user to a pane they did not choose. A pid cannot
-be moved.
+be moved. The token and everything that maintained it have been removed rather
+than left in place, so nothing suggests it is still load-bearing.
 
 **Ambiguity fails closed.** When two rows claim the same pane pid, both are
 discarded rather than one being chosen. There is deliberately no fallback to

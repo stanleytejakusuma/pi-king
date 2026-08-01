@@ -84,7 +84,6 @@ export type SessionStatusFile = {
   sessionFile: string | undefined;
   subagents: SubagentStatus[];
   visible: boolean;
-  kingToken?: string;
 };
 
 /**
@@ -139,11 +138,10 @@ type DashboardEntry = {
   lastActivity: string;
   updatedAt: number;
   subagents: SubagentStatus[];
-  kingToken: string | undefined;
   tmuxName: string | undefined; // resolved live tmux session name, if correlated
 };
 
-type TmuxSession = { name: string; attached: boolean; windows: number; createdAt: number; panePid: number; token: string };
+type TmuxSession = { name: string; attached: boolean; windows: number; createdAt: number; panePid: number };
 
 /** A row that's a bare tmux session with no matching pi-alerts status file — an
  * external/non-Pi process, or a Pi session that crashed without cleaning up its
@@ -249,7 +247,6 @@ function readSessions(): DashboardEntry[] {
       lastActivity: raw.activity,
       updatedAt: raw.lastActivity || Date.now(),
       subagents: raw.subagents ?? [],
-      kingToken: raw.kingToken,
       tmuxName: undefined,
     });
   }
@@ -264,7 +261,7 @@ function readSessions(): DashboardEntry[] {
 
 /** Lists live tmux sessions. No server running is not an error — just zero sessions. */
 function listTmuxSessions(): TmuxSession[] {
-  const result = spawnSync(TMUX, ["list-sessions", "-F", "#{session_name}\t#{session_attached}\t#{session_windows}\t#{session_created}\t#{pane_pid}\t#{@pi_king_token}"], { encoding: "utf8", timeout: 3000 });
+  const result = spawnSync(TMUX, ["list-sessions", "-F", "#{session_name}\t#{session_attached}\t#{session_windows}\t#{session_created}\t#{pane_pid}"], { encoding: "utf8", timeout: 3000 });
   if (result.status !== 0 || !result.stdout) return [];
   return result.stdout.trim().split("\n").filter(Boolean).flatMap((line) => {
     // tmux rejects control characters in session names but NOT in user option
@@ -273,15 +270,14 @@ function listTmuxSessions(): TmuxSession[] {
     // count discards those fragments: a forged line cannot also carry the right
     // number of tabs once the real value has consumed the line.
     const parts = line.split("\t");
-    if (parts.length !== 6) return [];
-    const [name, attached, windows, created, panePid, token] = parts;
+    if (parts.length !== 5) return [];
+    const [name, attached, windows, created, panePid] = parts;
     return [{
       name,
       attached: attached === "1",
       windows: Number(windows) || 0,
       createdAt: (Number(created) || 0) * 1000,
       panePid: Number(panePid) || 0,
-      token: token ?? "",
     }];
   });
 }
@@ -355,16 +351,12 @@ function tmuxError(result: ReturnType<typeof spawnSync>): string {
 const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.env.HOME ?? ""}/.pi/agent`;
 
 function createTmuxSession(name: string, dir: string): { ok: boolean; message: string } {
-  // Identity token: stamped on the tmux session as a user option AND handed to
-  // Pi via env, so the pair stays correlated through any later rename.
-  const token = `pk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const result = spawnSync(TMUX, [
     "new-session", "-d", "-s", name,
     "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
     // A new session inherits the tmux SERVER's environment, which may lack our
     // PATH entirely. Pin it so `pi` resolves regardless of how the server started.
     "-e", `PATH=${process.env.PATH ?? ""}`,
-    "-e", `PI_KING_TOKEN=${token}`,
     // Dashboard-spawned sessions auto-opt-in to appearing on the dashboard
     // (pi-alerts.ts checks this at session_start) — an ad-hoc `pi` typed
     // directly into a plain terminal does not set this, and stays invisible
@@ -373,7 +365,6 @@ function createTmuxSession(name: string, dir: string): { ok: boolean; message: s
     "-c", dir, "--", "pi", "--name", name,
   ], { encoding: "utf8", timeout: 5000 });
   if (result.status !== 0) return { ok: false, message: `Failed to create session: ${tmuxError(result)}` };
-  spawnSync(TMUX, ["set-option", "-t", name, "@pi_king_token", token], { encoding: "utf8", timeout: 3000 });
   return { ok: true, message: `Created "${name}" in ${dir}.` };
 }
 
@@ -1261,7 +1252,6 @@ function installSessionTracker(pi: ExtensionAPI) {
         sessionFile: ctx.sessionManager.getSessionFile(),
         subagents: [...subagents.values()],
         visible,
-        kingToken: process.env.PI_KING_TOKEN || undefined,
       };
       const target = statusPath(ctx);
       const tmp = `${target}.tmp-${process.pid}`;
@@ -1415,14 +1405,13 @@ function installSessionTracker(pi: ExtensionAPI) {
     }
     const sessionId = ctx.sessionManager.getSessionId();
     const name = ctx.sessionManager.getSessionName() || `${basename(ctx.cwd) || "session"}-${sessionId.slice(0, 8)}`;
-    const token = `pk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     if (spawnSync(tmux, ["has-session", "-t", name], { encoding: "utf8", timeout: 3000 }).status === 0) {
       ctx.ui.notify(`A tmux session named "${name}" already exists \u2014 not creating a duplicate. Attach to it from pi-king.`, "warning");
       return;
     }
     const created = spawnSync(tmux, [
       "new-session", "-d", "-s", name,
-      "-e", `PI_KING_TOKEN=${token}`, "-e", "PI_DASHBOARD_SPAWNED=1",
+      "-e", "PI_DASHBOARD_SPAWNED=1",
       // Pin the agent dir explicitly. A new tmux session inherits the tmux
       // SERVER's environment, not ours \u2014 and that server may have been started
       // by a process using a different PI_CODING_AGENT_DIR (the pi-king hub
@@ -1445,7 +1434,6 @@ function installSessionTracker(pi: ExtensionAPI) {
       ctx.ui.notify(`Could not hand off to tmux: ${(created.stderr || "unknown").trim()}`, "error");
       return;
     }
-    spawnSync(tmux, ["set-option", "-t", name, "@pi_king_token", token], { encoding: "utf8", timeout: 3000 });
     // Verify the replacement actually survived before destroying this copy.
     await new Promise((r) => setTimeout(r, 2500));
     if (spawnSync(tmux, ["has-session", "-t", name], { encoding: "utf8", timeout: 3000 }).status !== 0) {

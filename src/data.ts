@@ -472,8 +472,11 @@ export class StatsCache {
   get(): { stats: UsageStats | undefined; daily: DayTotal[]; loaded: boolean } {
     if (!this.inFlight && Date.now() - this.fetchedAt > STATS_TTL_MS) {
       this.inFlight = true;
-      Promise.all([readUsageStats(), readDailyTokens(), readLifetimeStats()])
-        .then(([s, d, l]) => { this.value = s; this.daily = d; this.life = l; })
+      // readLifetimeStats already walks every day and returns them, so asking
+      // separately for the last eight rescanned today and yesterday a second
+      // time on every refresh for data it was about to receive anyway.
+      Promise.all([readUsageStats(), readLifetimeStats()])
+        .then(([s, l]) => { this.value = s; this.life = l; this.daily = l ? l.days.slice(-8) : []; })
         .catch(() => { this.value = undefined; this.daily = []; this.life = undefined; })
         .finally(() => {
           this.loaded = true;
