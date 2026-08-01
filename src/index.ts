@@ -564,10 +564,6 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: { day: str
   const rateColor = rate < 2 ? "success" : rate < 5 ? "warning" : "error";
   const spark = sparkline(stats.hourly);
   const modelColors = ["accent", "success", "muted"] as const;
-  /** Compact counts: 1.2M reads faster than 1,234,567 and the exact digit
-   * carries no decision. */
-  const compact = (n: number): string =>
-    n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1_000 ? `${Math.round(n / 1_000)}k` : String(n);
   const cacheShare = stats.tokensIn > 0 ? Math.round((stats.tokensCacheRead / stats.tokensIn) * 100) : 0;
   const p95 = stats.durations.length > 0
     ? stats.durations[Math.min(stats.durations.length - 1, Math.floor(stats.durations.length * 0.95))]
@@ -590,8 +586,8 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: { day: str
     // reading, which is the difference between writing code and combing through
     // a repository. Both numbers are already here; the ratio is what is read.
     const outShare = stats.tokensIn > 0 ? (stats.tokensOut / stats.tokensIn) * 100 : 0;
-    segs.push(th.fg("dim", "tok ") + th.fg("accent", compact(stats.tokensIn)) +
-      th.fg("dim", " in / ") + th.fg("accent", compact(stats.tokensOut)) +
+    segs.push(th.fg("dim", "tok ") + th.fg("accent", compactNum(stats.tokensIn)) +
+      th.fg("dim", " in / ") + th.fg("accent", compactNum(stats.tokensOut)) +
       th.fg("dim", ` out (${outShare < 1 ? outShare.toFixed(1) : Math.round(outShare)}%)`));
   }
   if (stats.tokensCacheRead > 0) {
@@ -614,6 +610,18 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: { day: str
       segs.push(th.fg("dim", `${daily.length}d `) +
         th.fg("accent", bars.slice(0, -1)) + th.fg("muted", bars.slice(-1)));
     }
+    // Mean over COMPLETED days only. Including today drags the average down by
+    // however much of the day is left, which would make the number wrong rather
+    // than merely coarse.
+    const done = daily.slice(0, -1);
+    if (done.length >= 2) {
+      const mean = done.reduce((sum, d) => sum + d.tokensIn, 0) / done.length;
+      segs.push(th.fg("dim", "avg ") + th.fg("accent", compactNum(Math.round(mean))) + th.fg("dim", "/day"));
+    }
+  }
+  if (stats.peakPeriod) {
+    segs.push(th.fg("dim", "busiest ") + th.fg("accent", stats.peakPeriod.label) +
+      th.fg("dim", ` ${stats.peakPeriod.pct}%`));
   }
   // Only the leader. The runner-up's share does not change what anyone does
   // next, and it was the first thing shed on a narrow terminal anyway.
@@ -649,6 +657,9 @@ type ComposerStep =
 class DashboardView implements Component {
   private rows: Row[] = [];
   private selected = 0;
+  /** The stats screen replaces the session list rather than sitting under it:
+   * both are full-height, and stacking them would push one off the terminal. */
+  private showStats = false;
   private timer: ReturnType<typeof setInterval> | undefined;
   private messageTimer: ReturnType<typeof setTimeout> | undefined;
   private message: string | undefined;
@@ -781,6 +792,11 @@ class DashboardView implements Component {
       this.tui.requestRender();
       return;
     }
+    if (data === "s" || data === "S") {
+      this.showStats = !this.showStats;
+      this.tui.requestRender();
+      return;
+    }
     if (data === "r" || data === "R") {
       this.refresh();
       this.showMessage("Refreshed.");
@@ -903,6 +919,47 @@ class DashboardView implements Component {
     lines.push("  " + th.fg("dim", `\u201c${this.quote}\u201d`));
     lines.push("");
 
+    // ---- stats screen ----------------------------------------------------
+    if (this.showStats) {
+      const life = this.statsCache.lifetime();
+      if (!life) {
+        lines.push("  " + th.fg("dim", "No usage history. Set PI_KING_CALL_LOGS to a directory of call logs."));
+      } else {
+        const total = life.tokensIn + life.tokensOut;
+        const cell = (label: string, value: string): string =>
+          th.fg("dim", label.padEnd(16)) + th.fg("accent", th.bold(value));
+        const pairs: [string, string][] = [
+          ["total tokens", compactNum(total)],
+          ["calls", life.calls.toLocaleString()],
+          ["active days", String(life.activeDays)],
+          ["current streak", `${life.currentStreak}d`],
+          ["longest streak", `${life.longestStreak}d`],
+          ["tokens in / out", `${compactNum(life.tokensIn)} / ${compactNum(life.tokensOut)}`],
+        ];
+        for (let i = 0; i < pairs.length; i += 2) {
+          const a = cell(pairs[i][0], pairs[i][1]);
+          const b = pairs[i + 1] ? cell(pairs[i + 1][0], pairs[i + 1][1]) : "";
+          lines.push("  " + a + " ".repeat(Math.max(2, 40 - visibleWidth(a))) + b);
+        }
+        lines.push("");
+        // Daily volume as a heatmap row, oldest to newest. Density is relative
+        // to the busiest day, so a quiet week still shows its own shape.
+        const peak = Math.max(...life.days.map((d) => d.tokensIn), 1);
+        const shades = " \u2591\u2592\u2593\u2588";
+        const heat = life.days.map((d) => shades[Math.min(4, Math.ceil((d.tokensIn / peak) * 4))]).join("");
+        lines.push("  " + th.fg("dim", "daily volume  ") + th.fg("accent", heat) +
+          th.fg("dim", `  ${life.days[0]?.day ?? ""} \u2192 ${life.days[life.days.length - 1]?.day ?? ""}`));
+        const cmp = tokenComparison(total);
+        if (cmp) {
+          lines.push("");
+          lines.push("  " + th.fg("muted", `You have pushed ${cmp} through this machine.`));
+        }
+      }
+      lines.push("");
+      lines.push("  " + th.fg("dim", "s") + th.fg("muted", " back to sessions"));
+      return lines;
+    }
+
     // ---- fleet vitals ---------------------------------------------------
     const sessions = this.rows.filter((r): r is SessionRow => r.kind === "session");
     const byState = (s: TitleState) => sessions.filter((r) => r.entry.state === s).length;
@@ -992,7 +1049,7 @@ class DashboardView implements Component {
       const verb = !sel || this.rowTmuxName(sel) ? "attach" : "jump";
       lines.push("  " +
         `${k("\u2191\u2193")}${l(" select ")}${k("enter")}${l(` ${verb}`)}` + l("   \u2502   ") +
-        `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${k("x")}${l(" detach ")}${th.fg("error", "X")}${l(" kill")}` + l("   \u2502   ") +
+        `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${k("x")}${l(" detach ")}${th.fg("error", "X")}${l(" kill")}` + l("   \u2502   ") + `${k("s")}${l(" stats")}` + l("   \u2502   ") +
         `${k("r")}${l(" refresh ")}${k("esc")}${l(" close")}`);
     }
     return lines;

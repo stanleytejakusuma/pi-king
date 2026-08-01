@@ -157,6 +157,9 @@ export type UsageStats = {
   tokensIn: number;
   tokensOut: number;
   tokensCacheRead: number;
+  /** Busiest part of the day by call count, in local time, with its share.
+   * Undefined when there are too few calls for the answer to mean anything. */
+  peakPeriod?: { label: string; pct: number };
   /** Request durations in ms, sorted, for percentile reporting. The mean hides
    * the tail, and the tail is what a person waiting on a session notices. */
   durations: number[];
@@ -206,7 +209,7 @@ function shortModel(id: string): string {
  * and freezing it early would undercount it. Only the two most recent
  * directories are ever re-read.
  */
-export async function readDailyTokens(days = 8): Promise<{ day: string; tokensIn: number }[]> {
+export async function readDailyTokens(days = 8): Promise<DayTotal[]> {
   if (!CALL_LOGS) return [];
   let dirs: string[];
   try {
@@ -217,19 +220,22 @@ export async function readDailyTokens(days = 8): Promise<{ day: string; tokensIn
   dirs = dirs.slice(-days);
   const volatile = new Set(dirs.slice(-2));
 
-  let cache: Record<string, number> = {};
+  let cache: Record<string, { tokensIn: number; tokensOut: number; calls: number }> = {};
   try {
-    cache = JSON.parse(readFileSync(DAILY_CACHE, "utf8")) as Record<string, number>;
+    cache = JSON.parse(readFileSync(DAILY_CACHE, "utf8")) as typeof cache;
   } catch { /* first run, or unreadable: rebuild */ }
 
-  const out: { day: string; tokensIn: number }[] = [];
+  const out: DayTotal[] = [];
   let dirty = false;
   for (const day of dirs) {
-    if (!volatile.has(day) && typeof cache[day] === "number") {
-      out.push({ day, tokensIn: cache[day] });
+    const hit = cache[day];
+    if (!volatile.has(day) && hit && typeof hit.tokensIn === "number") {
+      out.push({ day, ...hit });
       continue;
     }
-    let total = 0;
+    let tokensIn = 0;
+    let tokensOut = 0;
+    let calls = 0;
     try {
       const files = (await readdir(join(CALL_LOGS, day))).filter((f) => f.endsWith(".json"));
       const BATCH = 64;
@@ -242,13 +248,18 @@ export async function readDailyTokens(days = 8): Promise<{ day: string; tokensIn
           }
         }));
         for (const r of parsed) {
-          const tk = r?.summary?.tokens as Record<string, unknown> | undefined;
-          if (tk) total += Number(tk.in) || 0;
+          if (!r?.summary) continue;
+          calls++;
+          const tk = r.summary.tokens as Record<string, unknown> | undefined;
+          if (tk) {
+            tokensIn += Number(tk.in) || 0;
+            tokensOut += Number(tk.out) || 0;
+          }
         }
       }
     } catch { continue; }
-    out.push({ day, tokensIn: total });
-    if (!volatile.has(day)) { cache[day] = total; dirty = true; }
+    out.push({ day, tokensIn, tokensOut, calls });
+    if (!volatile.has(day)) { cache[day] = { tokensIn, tokensOut, calls }; dirty = true; }
   }
   if (dirty) {
     try {
@@ -257,6 +268,88 @@ export async function readDailyTokens(days = 8): Promise<{ day: string; tokensIn
     } catch { /* cache is an optimisation; losing it costs a rescan */ }
   }
   return out;
+}
+
+/** Lifetime figures for the stats screen, derived from every day of logs on
+ * disk rather than today's slice. Uses the same per-day cache, so the cost is
+ * one rescan of today and yesterday.
+ *
+ * Streaks count days with at least one call. A streak that ended yesterday is
+ * still reported as current until today produces no calls by end of day, which
+ * is why "current" is computed from the most recent active day rather than
+ * requiring today specifically: penalising someone at 00:05 for not having
+ * worked yet would be wrong. */
+/** A human-scale comparison for a token count.
+ *
+ * Word counts are the published lengths of the works; the words-to-tokens
+ * factor is an approximation for English BPE tokenizers, which is why every
+ * result is prefixed with a tilde. It is a toy, and it is labelled as one, but
+ * the arithmetic is real: nothing here is invented to make a nicer number.
+ */
+/** 1.6B / 42.5M / 116k. The exact digit never changes a decision. */
+export function compactNum(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return String(n);
+}
+
+export function tokenComparison(tokens: number): string | undefined {
+  if (tokens <= 0) return undefined;
+  const WORDS_TO_TOKENS = 1.33;
+  const WORKS: [string, number][] = [
+    ["Animal Farm", 29_966],
+    ["The Hobbit", 95_356],
+    ["Pride and Prejudice", 122_189],
+    ["The Lord of the Rings", 481_103],
+    ["War and Peace", 587_287],
+    ["the Harry Potter series", 1_084_170],
+  ];
+  // Prefer the work that yields a multiple a person can hold in their head:
+  // the largest work still exceeded at least twice over.
+  let best: [string, number] | undefined;
+  for (const [title, words] of WORKS) {
+    if (tokens / (words * WORDS_TO_TOKENS) >= 2) best = [title, words];
+  }
+  if (!best) return undefined;
+  const times = Math.round(tokens / (best[1] * WORDS_TO_TOKENS));
+  return `~${times.toLocaleString()}x the text of ${best[0]}`;
+}
+
+export async function readLifetimeStats(): Promise<LifetimeStats | undefined> {
+  const days = await readDailyTokens(3650);
+  const active = days.filter((d) => d.calls > 0);
+  if (active.length === 0) return undefined;
+
+  const tokensIn = active.reduce((n, d) => n + d.tokensIn, 0);
+  const tokensOut = active.reduce((n, d) => n + d.tokensOut, 0);
+  const calls = active.reduce((n, d) => n + d.calls, 0);
+
+  const dayMs = 86_400_000;
+  const asDate = (d: string): number => new Date(`${d}T00:00:00`).getTime();
+  let longest = 0;
+  let run = 0;
+  let prev = 0;
+  for (const d of active) {
+    const t = asDate(d.day);
+    run = prev && t - prev === dayMs ? run + 1 : 1;
+    longest = Math.max(longest, run);
+    prev = t;
+  }
+  // Current streak: walk back from the last active day while days stay adjacent.
+  let current = 0;
+  for (let i = active.length - 1; i >= 0; i--) {
+    if (i === active.length - 1) { current = 1; continue; }
+    if (asDate(active[i + 1].day) - asDate(active[i].day) === dayMs) current++;
+    else break;
+  }
+  const today = new Date();
+  const todayKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  const last = active[active.length - 1].day;
+  const gapDays = Math.round((asDate(todayKey) - asDate(last)) / dayMs);
+  if (gapDays > 1) current = 0;
+
+  return { tokensIn, tokensOut, calls, activeDays: active.length, currentStreak: current, longestStreak: longest, days };
 }
 
 export async function readUsageStats(): Promise<UsageStats | undefined> {
@@ -311,10 +404,13 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
       if (Number.isFinite(dur) && dur > 0) durations.push(dur);
       const model = shortModel(String(s.model ?? "unknown"));
       counts.set(model, (counts.get(model) ?? 0) + 1);
-      // Timestamps are ISO-8601 UTC; hour lives at offset 11..13.
+      // Timestamps are ISO-8601 UTC. Slicing the hour out of the string buckets
+      // by UTC, which put the busiest hour seven columns from where it happened
+      // for anyone not on UTC, in a row that sits beside a local clock. Parse
+      // and convert so the sparkline and the clock describe the same day.
       const ts = typeof s.timestamp === "string" ? s.timestamp : "";
       if (ts.length >= 13) {
-        const h = Number(ts.slice(11, 13));
+        const h = new Date(ts).getHours();
         if (Number.isFinite(h)) byHour.set(h, (byHour.get(h) ?? 0) + 1);
       }
     }
@@ -330,8 +426,25 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
   const hourly: number[] = [];
   for (let h = 0; h <= lastHour; h++) hourly.push(byHour.get(h) ?? 0);
 
+  // Four coarse buckets. Finer slicing implies a precision that call counts at
+  // this volume do not support.
+  const PERIODS: [string, number[]][] = [
+    ["morning", [5, 6, 7, 8, 9, 10, 11]],
+    ["afternoon", [12, 13, 14, 15, 16]],
+    ["evening", [17, 18, 19, 20, 21]],
+    ["night", [22, 23, 0, 1, 2, 3, 4]],
+  ];
+  let peakPeriod: { label: string; pct: number } | undefined;
+  if (calls >= 20) {
+    const scored = PERIODS.map(([label, hrs]) => ({
+      label,
+      n: hrs.reduce((sum, h) => sum + (byHour.get(h) ?? 0), 0),
+    })).sort((a, b) => b.n - a.n);
+    if (scored[0].n > 0) peakPeriod = { label: scored[0].label, pct: Math.round((scored[0].n / calls) * 100) };
+  }
+
   durations.sort((a, b) => a - b);
-  return { calls, errors, tokensIn, tokensOut, tokensCacheRead, durations, topModels, hourly, peakHour: Math.max(0, ...hourly), partial };
+  return { calls, errors, tokensIn, tokensOut, tokensCacheRead, peakPeriod, durations, topModels, hourly, peakHour: Math.max(0, ...hourly), partial };
 }
 
 /**
@@ -343,7 +456,8 @@ const STATS_TTL_MS = 60_000;
 
 export class StatsCache {
   private value: UsageStats | undefined;
-  private daily: { day: string; tokensIn: number }[] = [];
+  private daily: DayTotal[] = [];
+  private life: LifetimeStats | undefined;
   private loaded = false;
   private fetchedAt = 0;
   private inFlight = false;
@@ -352,12 +466,15 @@ export class StatsCache {
 
   /** Non-blocking. Triggers a background refresh when stale. Both reads happen
    * on the same tick so the band never mixes a fresh today with a stale history. */
-  get(): { stats: UsageStats | undefined; daily: { day: string; tokensIn: number }[]; loaded: boolean } {
+  /** Lifetime figures for the stats screen. Same refresh cycle as the band. */
+  lifetime(): LifetimeStats | undefined { return this.life; }
+
+  get(): { stats: UsageStats | undefined; daily: DayTotal[]; loaded: boolean } {
     if (!this.inFlight && Date.now() - this.fetchedAt > STATS_TTL_MS) {
       this.inFlight = true;
-      Promise.all([readUsageStats(), readDailyTokens()])
-        .then(([s, d]) => { this.value = s; this.daily = d; })
-        .catch(() => { this.value = undefined; this.daily = []; })
+      Promise.all([readUsageStats(), readDailyTokens(), readLifetimeStats()])
+        .then(([s, d, l]) => { this.value = s; this.daily = d; this.life = l; })
+        .catch(() => { this.value = undefined; this.daily = []; this.life = undefined; })
         .finally(() => {
           this.loaded = true;
           this.fetchedAt = Date.now();
@@ -370,6 +487,18 @@ export class StatsCache {
 }
 
 /* ------------------------------------------------------ recent projects -- */
+
+export type LifetimeStats = {
+  tokensIn: number;
+  tokensOut: number;
+  calls: number;
+  activeDays: number;
+  currentStreak: number;
+  longestStreak: number;
+  days: DayTotal[];
+};
+
+export type DayTotal = { day: string; tokensIn: number; tokensOut: number; calls: number };
 
 export type RecentProject = { project: string; path: string; lastActive: number };
 
