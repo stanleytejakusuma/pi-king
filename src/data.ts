@@ -454,6 +454,11 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
  */
 const STATS_TTL_MS = 60_000;
 
+/** Days in the band's sparkline. A trailing week: seven bars map to the unit
+ * people already think in, and the row has to share space with everything else
+ * on it. */
+const DAILY_WINDOW = 7;
+
 export class StatsCache {
   private value: UsageStats | undefined;
   private daily: DayTotal[] = [];
@@ -476,7 +481,7 @@ export class StatsCache {
       // separately for the last eight rescanned today and yesterday a second
       // time on every refresh for data it was about to receive anyway.
       Promise.all([readUsageStats(), readLifetimeStats()])
-        .then(([s, l]) => { this.value = s; this.life = l; this.daily = l ? l.days.slice(-8) : []; })
+        .then(([s, l]) => { this.value = s; this.life = l; this.daily = l ? l.days.slice(-DAILY_WINDOW) : []; })
         .catch(() => { this.value = undefined; this.daily = []; this.life = undefined; })
         .finally(() => {
           this.loaded = true;
