@@ -564,6 +564,14 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, loaded: boolean, 
   const rateColor = rate < 2 ? "success" : rate < 5 ? "warning" : "error";
   const spark = sparkline(stats.hourly);
   const modelColors = ["accent", "success", "muted"] as const;
+  /** Compact counts: 1.2M reads faster than 1,234,567 and the exact digit
+   * carries no decision. */
+  const compact = (n: number): string =>
+    n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1_000 ? `${Math.round(n / 1_000)}k` : String(n);
+  const cacheShare = stats.tokensIn > 0 ? Math.round((stats.tokensCacheRead / stats.tokensIn) * 100) : 0;
+  const p95 = stats.durations.length > 0
+    ? stats.durations[Math.min(stats.durations.length - 1, Math.floor(stats.durations.length * 0.95))]
+    : 0;
 
   const segs: string[] = [
     th.fg("accent", th.bold(stats.calls.toLocaleString())) + th.fg("dim", " calls today"),
@@ -573,6 +581,24 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, loaded: boolean, 
   // floor it says less than the number it sits next to, so it is omitted.
   if (spark && stats.calls >= 50 && stats.hourly.length >= 4) {
     segs.push(th.fg("accent", spark) + th.fg("dim", ` peak ${stats.peakHour}/h`));
+  }
+  // Order matters: shedding drops from the end, so these sit ahead of the model
+  // mix. Token volume and cache share survive a narrow terminal; which model
+  // served them is the first thing worth losing.
+  if (stats.tokensIn > 0 || stats.tokensOut > 0) {
+    segs.push(th.fg("dim", "tok ") + th.fg("accent", compact(stats.tokensIn)) +
+      th.fg("dim", " in / ") + th.fg("accent", compact(stats.tokensOut)) + th.fg("dim", " out"));
+  }
+  if (stats.tokensCacheRead > 0) {
+    // Cache share is why a large input count can still be cheap, so it gets the
+    // same threshold colouring as the error rate: good reads green.
+    const cacheColor = cacheShare >= 80 ? "success" : cacheShare >= 50 ? "warning" : "muted";
+    segs.push(th.fg(cacheColor, `${cacheShare}%`) + th.fg("dim", " cached"));
+  }
+  if (p95 > 0) {
+    // The mean hides the tail, and the tail is what someone waiting on a session
+    // actually experiences.
+    segs.push(th.fg("dim", "p95 ") + th.fg(p95 > 30_000 ? "warning" : "accent", `${(p95 / 1000).toFixed(1)}s`));
   }
   stats.topModels.forEach((m, i) => {
     segs.push(th.fg(modelColors[i] ?? "dim", m.model) + th.fg("dim", ` ${m.pct}%`));

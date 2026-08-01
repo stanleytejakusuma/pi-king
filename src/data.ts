@@ -146,6 +146,15 @@ export function readInventory(): Inventory {
 /* ---------------------------------------------------------------- stats -- */
 
 export type UsageStats = {
+  /** Token totals for the day. cacheRead is broken out because it is the number
+   * that actually predicts spend: cached input is billed at a fraction of fresh
+   * input, so a high cache share means a large token count is cheap. */
+  tokensIn: number;
+  tokensOut: number;
+  tokensCacheRead: number;
+  /** Request durations in ms, sorted, for percentile reporting. The mean hides
+   * the tail, and the tail is what a person waiting on a session notices. */
+  durations: number[];
   calls: number;
   errors: number;
   topModels: Array<{ model: string; pct: number }>;
@@ -194,6 +203,10 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
   const byHour = new Map<number, number>();
   let calls = 0;
   let errors = 0;
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let tokensCacheRead = 0;
+  const durations: number[] = [];
   let partial = false;
 
   // Bounded concurrency: unbounded Promise.all over thousands of files spikes
@@ -217,6 +230,14 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
       calls++;
       const status = typeof s.status === "number" ? s.status : 0;
       if (status >= 400) errors++;
+      const tk = s.tokens as Record<string, unknown> | undefined;
+      if (tk) {
+        tokensIn += Number(tk.in) || 0;
+        tokensOut += Number(tk.out) || 0;
+        tokensCacheRead += Number(tk.cacheRead) || 0;
+      }
+      const dur = Number(s.duration);
+      if (Number.isFinite(dur) && dur > 0) durations.push(dur);
       const model = shortModel(String(s.model ?? "unknown"));
       counts.set(model, (counts.get(model) ?? 0) + 1);
       // Timestamps are ISO-8601 UTC; hour lives at offset 11..13.
@@ -238,7 +259,8 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
   const hourly: number[] = [];
   for (let h = 0; h <= lastHour; h++) hourly.push(byHour.get(h) ?? 0);
 
-  return { calls, errors, topModels, hourly, peakHour: Math.max(0, ...hourly), partial };
+  durations.sort((a, b) => a - b);
+  return { calls, errors, tokensIn, tokensOut, tokensCacheRead, durations, topModels, hourly, peakHour: Math.max(0, ...hourly), partial };
 }
 
 /**

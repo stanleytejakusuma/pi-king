@@ -126,3 +126,28 @@ the right shape for the problem.
 
 `formatVersion` is bumped on any breaking change. Additive optional fields do
 not bump it.
+
+## Usage metrics (optional)
+
+The metrics band reads per-day call logs from the directory named by
+`PI_KING_CALL_LOGS`. Unset means the band is absent, which is the default: no
+stock Pi install writes this format, and inventing a default path would name one
+vendor's tool in a general-purpose package.
+
+Each file is JSON with a `summary` object. Fields read:
+
+- `status` (number) HTTP status. 400 and above counts as an error.
+- `model` (string) for the model mix.
+- `timestamp` (ISO-8601 UTC) for the hourly sparkline.
+- `tokens.in`, `tokens.out`, `tokens.cacheRead` (numbers) for token totals and
+  cache share. Cache share is reported against input tokens, because cached
+  input is billed at a fraction of fresh input and is what makes a large token
+  count cheap.
+- `duration` (ms) for p95. The mean hides the tail; the tail is what a person
+  waiting on a session experiences.
+
+Unknown fields are ignored. A file that fails to parse marks the day partial
+rather than being counted as zero.
+
+Cost is deliberately not reported. The logs carry no price data, and a hardcoded
+price table would silently rot into wrong numbers.
