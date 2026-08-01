@@ -27,6 +27,12 @@ const todayRow = cold[cold.length-1];
 chk("today's daily row == usage stats", todayRow.calls===s.calls && todayRow.tokensIn===s.tokensIn,
     `daily(${todayRow.calls},${todayRow.tokensIn}) vs usage(${s.calls},${s.tokensIn})`);
 
+// 3b. today's net tokens
+const netToday = Math.max(0, s.tokensIn - s.tokensCacheRead);
+chk("today's cacheRead subset of in", s.tokensCacheRead <= s.tokensIn, `${s.tokensCacheRead} <= ${s.tokensIn}`);
+chk("today's net = in - cacheRead", netToday === s.tokensIn - s.tokensCacheRead, `${netToday}`);
+chk("today's net <= in", netToday <= s.tokensIn);
+
 // 4. derived percentages
 const errPct = (s.errors/s.calls)*100;
 const cachePct = Math.round((s.tokensCacheRead/s.tokensIn)*100);

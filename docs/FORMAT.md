@@ -152,5 +152,10 @@ Each file is JSON with a `summary` object. Fields read:
 Unknown fields are ignored. A file that fails to parse marks the day partial
 rather than being counted as zero.
 
+Net tokens are reported as `in` minus `cacheRead`. Input alone counts the same
+conversation history re-sent on every turn, which on a long day differs from
+new text by an order of magnitude. Net is the figure that tracks how much fresh
+ground was covered; input is the figure that tracks what was billed.
+
 Cost is deliberately not reported. The logs carry no price data, and a hardcoded
 price table would silently rot into wrong numbers.

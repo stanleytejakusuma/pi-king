@@ -577,9 +577,17 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
     // reading, which is the difference between writing code and combing through
     // a repository. Both numbers are already here; the ratio is what is read.
     const outShare = stats.tokensIn > 0 ? (stats.tokensOut / stats.tokensIn) * 100 : 0;
-    segs.push(th.fg("dim", "tok ") + th.fg("accent", compactNum(stats.tokensIn)) +
-      th.fg("dim", " in / ") + th.fg("accent", compactNum(stats.tokensOut)) +
-      th.fg("dim", ` out (${outShare < 1 ? outShare.toFixed(1) : Math.round(outShare)}%)`));
+    // Net is input with cache reads taken out: the text actually sent fresh
+    // this session rather than the history re-sent on every turn. On a long
+    // day the two differ by an order of magnitude, and net is the one that
+    // tracks how much new ground was covered.
+    const net = Math.max(0, stats.tokensIn - stats.tokensCacheRead);
+    segs.push(
+      th.fg("dim", "tok in ") + th.fg("accent", compactNum(stats.tokensIn)) +
+      th.fg("dim", " \u00b7 out ") + th.fg("accent", compactNum(stats.tokensOut)) +
+      th.fg("dim", " \u00b7 net ") + th.fg("accent", compactNum(net)) +
+      th.fg("dim", ` (${outShare < 1 ? outShare.toFixed(1) : Math.round(outShare)}% out)`),
+    );
   }
   if (stats.tokensCacheRead > 0) {
     // Cache share is why a large input count can still be cheap, so it gets the
@@ -925,7 +933,10 @@ class DashboardView implements Component {
           ["active days", String(life.activeDays)],
           ["current streak", `${life.currentStreak}d`],
           ["longest streak", `${life.longestStreak}d`],
-          ["tokens in / out", `${compactNum(life.tokensIn)} / ${compactNum(life.tokensOut)}`],
+          ["tokens in", compactNum(life.tokensIn)],
+          ["tokens out", compactNum(life.tokensOut)],
+          ["net tokens", compactNum(Math.max(0, life.tokensIn - life.tokensCacheRead))],
+          ["cache reads", `${compactNum(life.tokensCacheRead)} (${life.tokensIn > 0 ? Math.round((life.tokensCacheRead / life.tokensIn) * 100) : 0}%)`],
         ];
         for (let i = 0; i < pairs.length; i += 2) {
           const a = cell(pairs[i][0], pairs[i][1]);
