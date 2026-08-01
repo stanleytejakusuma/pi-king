@@ -209,7 +209,7 @@ function shortModel(id: string): string {
  * and freezing it early would undercount it. Only the two most recent
  * directories are ever re-read.
  */
-export async function readDailyTokens(days = 8): Promise<DayTotal[]> {
+export async function readDailyTokens(): Promise<DayTotal[]> {
   if (!CALL_LOGS) return [];
   let dirs: string[];
   try {
@@ -217,7 +217,6 @@ export async function readDailyTokens(days = 8): Promise<DayTotal[]> {
   } catch {
     return [];
   }
-  dirs = dirs.slice(-days);
   const volatile = new Set(dirs.slice(-2));
 
   let cache: Record<string, { tokensIn: number; tokensOut: number; calls: number }> = {};
@@ -317,7 +316,7 @@ export function tokenComparison(tokens: number): string | undefined {
 }
 
 export async function readLifetimeStats(): Promise<LifetimeStats | undefined> {
-  const days = await readDailyTokens(3650);
+  const days = await readDailyTokens();
   const active = days.filter((d) => d.calls > 0);
   if (active.length === 0) return undefined;
 
@@ -594,14 +593,21 @@ export function readRecentProjects(limit = 5): RecentProject[] {
   return out;
 }
 
-/** Unicode block sparkline. Returns "" for empty input rather than a fake
- * flat line, so "no data" never renders as "measured zero". */
+/** Unicode block sparkline. Returns "" for empty input rather than a fake flat
+ * line, so "no data" never renders as "measured zero".
+ *
+ * Exactly zero renders as a gap, not as the shortest bar. The block set starts
+ * at the one-eighth block, so without this a day with no activity and a day
+ * with a trace of it drew the same mark. That is harmless for volume and wrong
+ * beside the streak counters, where the day that renders as a small bar is
+ * precisely the day that ended a streak. A gap says nothing happened; the
+ * shortest bar says something did. */
 export function sparkline(series: number[]): string {
   if (series.length === 0) return "";
   const blocks = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588";
   const max = Math.max(...series);
   if (max <= 0) return "";
-  return series.map((v) => blocks[Math.min(7, Math.floor((v / max) * 7))]).join("");
+  return series.map((v) => (v <= 0 ? " " : blocks[Math.min(7, Math.floor((v / max) * 7))])).join("");
 }
 
 /* ---------------------------------------------------------------- quote -- */

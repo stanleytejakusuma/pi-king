@@ -547,7 +547,7 @@ function clockLine(): string {
  * without reading it), and the top three models get descending emphasis so
  * rank is legible at a glance. Renders nothing when no calls were logged
  * today — "0 calls" would falsely imply measured inactivity. */
-function tickerParts(th: Theme, stats: UsageStats | undefined, daily: { day: string; tokensIn: number }[], loaded: boolean, budget = Infinity): string | undefined {
+function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[], loaded: boolean, budget = Infinity): string | undefined {
   if (!loaded) return th.fg("dim", "\u2026");
   if (!stats) return undefined;
   const rate = stats.calls > 0 ? (stats.errors / stats.calls) * 100 : 0;

@@ -10,8 +10,8 @@ let bad = 0;
 const chk = (name, ok, detail="") => { if(!ok) bad++; console.log(`  ${ok?"PASS":"FAIL"}  ${name}${detail?"  "+detail:""}`); };
 
 // 1. cache round-trip must not change any number
-const cold = await d.readDailyTokens(3650);
-const warm = await d.readDailyTokens(3650);
+const cold = await d.readDailyTokens();
+const warm = await d.readDailyTokens();
 chk("cache round-trip identical", JSON.stringify(cold)===JSON.stringify(warm));
 
 // 2. lifetime totals equal the sum of the per-day rows
@@ -66,4 +66,8 @@ chk("comparison undefined below smallest work", d.tokenComparison(1000)===undefi
 chk("compactNum boundaries", d.compactNum(999)==="999" && d.compactNum(1000)==="1k" && d.compactNum(1e6)==="1.0M" && d.compactNum(1e9)==="1.0B");
 chk("sparkline of empty is falsy", !d.sparkline([]));
 chk("sparkline of flat series", typeof d.sparkline([5,5,5])==="string");
+// A day with no activity must not draw the same mark as a day with a trace of
+// it: that day is the one that breaks a streak.
+chk("zero renders as a gap", d.sparkline([100,0,100])[1] === " ", JSON.stringify(d.sparkline([100,0,100])));
+chk("non-zero never renders as a gap", !d.sparkline([100,1,100]).includes(" "), JSON.stringify(d.sparkline([100,1,100])));
 process.exit(bad?1:0);
