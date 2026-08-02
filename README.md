@@ -129,6 +129,11 @@ pi-king            # opens the dashboard, owns the attach loop
 
 `pi-agents` is installed as an alias for the same launcher.
 
+The launcher starts Pi with only pi-king's extension loaded. It lists sessions
+and hands the terminal to tmux; it never calls a model, so loading the rest of
+your setup is startup cost for nothing. Sessions you start from it are separate
+processes and load your full configuration as normal.
+
 **Why two steps.** They install different things. `pi install` registers the
 extension inside Pi, which is what gives you `/bg`, session tracking and the
 `/pi-dashboard` command; it does not put anything on your PATH. The npm global

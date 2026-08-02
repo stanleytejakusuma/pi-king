@@ -26,6 +26,7 @@ while [ -L "$SELF" ]; do
   esac
 done
 HUB_DIR="$(cd "$(dirname "$SELF")/.." && pwd)/hub"
+EXTENSION="$(cd "$(dirname "$SELF")/.." && pwd)/src/index.ts"
 ACTION_FILE="$(mktemp -t pi-king-action)"
 export PI_KING_ACTION_FILE="$ACTION_FILE"
 
@@ -54,7 +55,19 @@ cd "$HUB_DIR" || exit 1
 while true; do
   : > "$ACTION_FILE"
 
-  pi --no-session --no-tools --no-context-files --no-skills --agents-hub "$@"
+  # Load only this package's extension. The hub is a launcher: it lists
+  # sessions and hands the terminal to tmux, and it never calls a model, so
+  # every other extension is startup cost for nothing. On the machine this was
+  # written on that was 5.2s against 1.3s, almost all of it one router
+  # extension. Sessions STARTED from here are unaffected: they are separate
+  # processes and load the full configuration.
+  if [ -f "$EXTENSION" ]; then
+    pi --no-session --no-tools --no-context-files --no-skills        --no-extensions --extension "$EXTENSION" --agents-hub "$@"
+  else
+    # Installed some other way: fall back to loading normally rather than
+    # starting with no dashboard at all.
+    pi --no-session --no-tools --no-context-files --no-skills --agents-hub "$@"
+  fi
 
   # No action written => the user quit the dashboard. Done.
   [ -s "$ACTION_FILE" ] || break
