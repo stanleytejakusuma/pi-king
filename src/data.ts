@@ -209,7 +209,11 @@ function shortModel(id: string): string {
  * and freezing it early would undercount it. Only the two most recent
  * directories are ever re-read.
  */
-export async function readDailyTokens(): Promise<DayTotal[]> {
+/** When the caller has already scanned today's directory (readUsageStats
+ * does, for the band), it passes the result here so today is not read twice
+ * per refresh. Both scans count identically — same files, same summary
+ * fields — so substituting one for the other cannot change a number. */
+export async function readDailyTokens(todayOverride?: DayTotal): Promise<DayTotal[]> {
   if (!CALL_LOGS) return [];
   let dirs: string[];
   try {
@@ -227,6 +231,10 @@ export async function readDailyTokens(): Promise<DayTotal[]> {
   const out: DayTotal[] = [];
   let dirty = false;
   for (const day of dirs) {
+    if (todayOverride && day === todayOverride.day) {
+      out.push(todayOverride);
+      continue;
+    }
     const hit = cache[day];
     // Require every field. Entries written before a field existed would
     // otherwise be served with it silently missing, which reads as zero.
@@ -283,6 +291,14 @@ export async function readDailyTokens(): Promise<DayTotal[]> {
  * requiring today specifically: penalising someone at 00:05 for not having
  * worked yet would be wrong. */
 /** 1.6B / 42.5M / 116k. The exact digit never changes a decision. */
+/** Input minus cache reads: the text actually sent fresh, as opposed to the
+ * conversation history re-sent on every turn. Clamped because a malformed log
+ * could otherwise produce a negative count; cacheRead is a subset of `in`
+ * whenever the data is sane. */
+export function netTokens(tokensIn: number, tokensCacheRead: number): number {
+  return Math.max(0, tokensIn - tokensCacheRead);
+}
+
 export function compactNum(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -327,8 +343,8 @@ export function tokenComparison(tokens: number): string | undefined {
   return `~${times.toLocaleString()}x the text of ${best[0]}`;
 }
 
-export async function readLifetimeStats(): Promise<LifetimeStats | undefined> {
-  const days = await readDailyTokens();
+export async function readLifetimeStats(todayOverride?: DayTotal): Promise<LifetimeStats | undefined> {
+  const days = await readDailyTokens(todayOverride);
   const active = days.filter((d) => d.calls > 0);
   if (active.length === 0) return undefined;
 
@@ -481,19 +497,27 @@ export class StatsCache {
 
   constructor(private onUpdate: () => void) {}
 
-  /** Non-blocking. Triggers a background refresh when stale. Both reads happen
-   * on the same tick so the band never mixes a fresh today with a stale history. */
   /** Lifetime figures for the stats screen. Same refresh cycle as the band. */
   lifetime(): LifetimeStats | undefined { return this.life; }
 
+  /** Non-blocking. Triggers a background refresh when stale. Both figures come
+   * from one pass so the band never mixes a fresh today with a stale history. */
   get(): { stats: UsageStats | undefined; daily: DayTotal[]; loaded: boolean } {
     if (!this.inFlight && Date.now() - this.fetchedAt > STATS_TTL_MS) {
       this.inFlight = true;
-      // readLifetimeStats already walks every day and returns them, so asking
-      // separately for the last eight rescanned today and yesterday a second
-      // time on every refresh for data it was about to receive anyway.
-      Promise.all([readUsageStats(), readLifetimeStats()])
-        .then(([s, l]) => { this.value = s; this.life = l; this.daily = l ? l.days.slice(-DAILY_WINDOW) : []; })
+      // Sequential on purpose: readUsageStats scans today's directory for the
+      // band, and its totals are handed to readLifetimeStats so the lifetime
+      // walk skips that directory rather than scanning it a second time in
+      // the same refresh. Both count identically — same files, same summary
+      // fields — so the substitution cannot change a number.
+      readUsageStats()
+        .then(async (s) => {
+          const override: DayTotal | undefined = s
+            ? { day: today(), tokensIn: s.tokensIn, tokensOut: s.tokensOut, tokensCacheRead: s.tokensCacheRead, calls: s.calls }
+            : undefined;
+          const l = await readLifetimeStats(override);
+          this.value = s; this.life = l; this.daily = l ? l.days.slice(-DAILY_WINDOW) : [];
+        })
         .catch(() => { this.value = undefined; this.daily = []; this.life = undefined; })
         .finally(() => {
           this.loaded = true;
@@ -560,7 +584,7 @@ function firstLine(path: string, max = 512): string {
  * Cost stays low: one readdir per project dir plus a 512-byte read of one
  * file. Transcripts are never parsed.
  */
-export function readRecentProjects(limit = 5): RecentProject[] {
+export function readRecentProjects(limit: number): RecentProject[] {
   const root = join(AGENT_DIR, "sessions");
   let entries: string[];
   try {

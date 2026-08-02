@@ -60,10 +60,13 @@ import { homedir } from "node:os";
 
 /* ---------------------------------------------------------------- state -- */
 /** Coarse session lifecycle. Owned here so pi-king depends on stock Pi only. */
-export type TitleState = "working" | "idle" | "attention" | "error" | "trust";
+export type TitleState = "working" | "idle" | "attention" | "error" | "trust" | "exited";
 
+// \u{...} with braces: a bare \u takes exactly four hex digits, so \u1f514
+// silently parsed as U+1F51 followed by a literal "4" and the attention icon
+// rendered as a Greek vowel with a digit stuck to it. Shipped that way.
 export const stateIcon: Record<TitleState, string> = {
-  working: "\u23f3", idle: "\u2713", attention: "\u1f514", error: "\u26a0", trust: "\u1f510",
+  working: "\u23f3", idle: "\u2713", attention: "\u{1f514}", error: "\u26a0", trust: "\u{1f510}", exited: "\u25cb",
 };
 
 export type SubagentStatus = {
@@ -110,6 +113,7 @@ export const SESSION_STATUS_DIR =
 import {
   clean,
   compactNum,
+  netTokens,
   tokenComparison,
   PI_ART,
   StatsCache,
@@ -124,7 +128,7 @@ import {
 } from "./data.ts";
 
 const REFRESH_MS = 1000;
-const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, trust: 0, working: 1, idle: 2 };
+const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, trust: 0, working: 1, idle: 2, exited: 3 };
 const MESSAGE_LINGER_MS = 4000;
 /** Resolved once at load rather than hardcoded. tmux lives in different places
  * depending on how it was installed: /opt/homebrew/bin on Apple Silicon,
@@ -202,7 +206,9 @@ function livePiPids(): Map<number, number> | undefined {
   return pids;
 }
 
-/** Reads every session-status file, drops (and deletes) any whose writer PID is gone. */
+/** Reads every session-status file. A card whose writer process is gone is
+ * not deleted: the transcript it points at survives, and the card is the only
+ * thing that remembers how to resume it. It renders as "exited" instead. */
 function readSessions(): DashboardEntry[] {
   let files: string[];
   try {
@@ -238,14 +244,12 @@ function readSessions(): DashboardEntry[] {
     const procStart = live?.get(raw.pid);
     const identityMismatch = procStart !== undefined && raw.startedAt > 0 &&
       Math.abs(procStart - raw.startedAt) > 60_000;
-    if (live && (procStart === undefined || identityMismatch)) {
-      try {
-        unlinkSync(full);
-      } catch {
-        // Best-effort cleanup.
-      }
-      continue; // Honest degradation: a dead session simply isn't shown, ever.
-    }
+    // Same identity check as before — pid AND process start time — so a
+    // recycled pid cannot resurrect a dead card as live. What changed is only
+    // what death means: the card stays, marked exited, because deleting it
+    // would delete the one pointer that knows how to resume the transcript.
+    const dead = live !== undefined && (procStart === undefined || identityMismatch);
+    if (dead) raw.status = "exited";
     // Only sessions that explicitly opted in — spawned through the dashboard
     // or backgrounded via /bg — appear here. Being alive with a status file
     // is not enough; every interactive session has one for pi-alerts' own
@@ -334,7 +338,10 @@ function buildRows(): Row[] {
     // class of mistake as trusting the token: it pairs on resemblance instead of
     // identity, and it is exactly what an attacker gets to choose. An unmatched
     // session renders as unmatched, which is honest and harmless.
-    const match = entry.pid ? tmuxByPanePid.get(entry.pid) : undefined;
+    // An exited card's pid belongs to nobody; the OS may hand it to any new
+    // process, including one that is a tmux pane. Matching it would attach a
+    // dead card to a random live session.
+    const match = entry.pid && entry.state !== "exited" ? tmuxByPanePid.get(entry.pid) : undefined;
     if (match) {
       matchedTmuxNames.add(match.name);
       return { kind: "session", entry: { ...entry, tmuxName: match.name } };
@@ -366,7 +373,7 @@ function tmuxError(result: ReturnType<typeof spawnSync>): string {
  * a configuration they had not chosen. */
 const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.env.HOME ?? ""}/.pi/agent`;
 
-function createTmuxSession(name: string, dir: string): { ok: boolean; message: string } {
+function createTmuxSession(name: string, dir: string, resumeSessionId?: string): { ok: boolean; message: string } {
   const result = spawnSync(TMUX, [
     "new-session", "-d", "-s", name,
     "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
@@ -374,14 +381,21 @@ function createTmuxSession(name: string, dir: string): { ok: boolean; message: s
     // PATH entirely. Pin it so `pi` resolves regardless of how the server started.
     "-e", `PATH=${process.env.PATH ?? ""}`,
     // Dashboard-spawned sessions auto-opt-in to appearing on the dashboard
-    // (pi-alerts.ts checks this at session_start) — an ad-hoc `pi` typed
-    // directly into a plain terminal does not set this, and stays invisible
-    // to the dashboard unless it runs /bg itself.
+    // (the session tracker below reads this at session_start) — an ad-hoc `pi`
+    // typed directly into a plain terminal does not set this, and stays
+    // invisible to the dashboard unless it runs /bg itself.
     "-e", "PI_DASHBOARD_SPAWNED=1",
+    // Same class of bug /bg once had: a supervisor pointed at a non-default
+    // status dir must pass it on, or the session it starts writes its card
+    // where this dashboard will never look.
+    ...(process.env.PI_KING_STATUS_DIR ? ["-e", `PI_KING_STATUS_DIR=${process.env.PI_KING_STATUS_DIR}`] : []),
     "-c", dir, "--", "pi", "--name", name,
+    // Resuming continues an existing transcript in place: same session id,
+    // same file. The new process overwrites the exited card with a live one.
+    ...(resumeSessionId ? ["--session", resumeSessionId] : []),
   ], { encoding: "utf8", timeout: 5000 });
   if (result.status !== 0) return { ok: false, message: `Failed to create session: ${tmuxError(result)}` };
-  return { ok: true, message: `Created "${name}" in ${dir}.` };
+  return { ok: true, message: resumeSessionId ? `Resumed "${name}" in ${dir}.` : `Created "${name}" in ${dir}.` };
 }
 
 /** tmux name -> desired Pi session name, applied once that session goes idle.
@@ -438,7 +452,7 @@ function detachTmuxSession(name: string): { ok: boolean; message: string } {
 function killTmuxSession(name: string): { ok: boolean; message: string } {
   const result = spawnSync(TMUX, ["kill-session", "-t", name], { encoding: "utf8", timeout: 3000 });
   if (result.status !== 0) return { ok: false, message: `Failed to delete: ${tmuxError(result)}` };
-  return { ok: true, message: `Killed "${name}". Its transcript survives — resume with: pi --session <id>` };
+  return { ok: true, message: `Killed "${name}". Its card stays; select it and press enter to resume.` };
 }
 
 /**
@@ -597,7 +611,7 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
     // this session rather than the history re-sent on every turn. On a long
     // day the two differ by an order of magnitude, and net is the one that
     // tracks how much new ground was covered.
-    const net = Math.max(0, stats.tokensIn - stats.tokensCacheRead);
+    const net = netTokens(stats.tokensIn, stats.tokensCacheRead);
     segs.push(
       th.fg("dim", "tok in ") + th.fg("accent", compactNum(stats.tokensIn)) +
       th.fg("dim", " \u00b7 out ") + th.fg("accent", compactNum(stats.tokensOut)) +
@@ -854,6 +868,27 @@ class DashboardView implements Component {
     }
     if (data === "X") {
       if (!row) return;
+      // An exited card holds no process; X here removes the card itself.
+      // Armed like kill — not because it is dangerous, but because one
+      // consistent rhythm for X is worth more than saving a keypress.
+      if (row.kind === "session" && row.entry.state === "exited") {
+        const id = row.entry.sessionId;
+        if (this.deleteArmedFor === id) {
+          this.deleteArmedFor = undefined;
+          try {
+            unlinkSync(join(SESSION_STATUS_DIR, `${id}.json`));
+            this.showMessage(`Card removed. The transcript is untouched: pi --session ${id}`);
+          } catch {
+            this.showMessage("Could not remove the card.");
+          }
+          this.refresh();
+          this.tui.requestRender();
+        } else {
+          this.deleteArmedFor = id;
+          this.showMessage("Press X again to remove this card. The transcript survives either way.");
+        }
+        return;
+      }
       const tmuxName = this.rowTmuxName(row);
       if (!tmuxName) {
         this.showMessage("Only tmux-backed sessions can be killed here.");
@@ -874,6 +909,29 @@ class DashboardView implements Component {
     if (this.deleteArmedFor) this.deleteArmedFor = undefined;
     if (matchesKey(data, "enter")) {
       if (!row) return;
+      // Enter on an exited card resurrects it: a fresh tmux session resuming
+      // the same transcript in the same directory, then attach as usual.
+      if (row.kind === "session" && row.entry.state === "exited") {
+        const e = row.entry;
+        if (!existsSync(e.cwd)) {
+          this.showMessage(`Directory is gone: ${e.cwd}. Resume by hand: pi --session ${e.sessionId}`);
+          return;
+        }
+        const base = (e.name ?? e.project).trim() || e.shortId;
+        let target = base;
+        let result = createTmuxSession(target, e.cwd, e.sessionId);
+        // A live session may already hold this name; retry once, disambiguated.
+        if (!result.ok) {
+          target = `${base}-${e.shortId}`;
+          result = createTmuxSession(target, e.cwd, e.sessionId);
+        }
+        if (!result.ok) {
+          this.showMessage(result.message);
+          return;
+        }
+        this.done({ type: "attach", tmuxName: target, expectedPid: undefined });
+        return;
+      }
       const tmuxName = this.rowTmuxName(row);
       if (tmuxName) {
         // Pass the pid this row is believed to belong to, so the attach path can
@@ -954,7 +1012,7 @@ class DashboardView implements Component {
           ["longest streak", `${life.longestStreak}d`],
           ["tokens in", compactNum(life.tokensIn)],
           ["tokens out", compactNum(life.tokensOut)],
-          ["net tokens", compactNum(Math.max(0, life.tokensIn - life.tokensCacheRead))],
+          ["net tokens", compactNum(netTokens(life.tokensIn, life.tokensCacheRead))],
           ["cache reads", `${compactNum(life.tokensCacheRead)} (${life.tokensIn > 0 ? Math.round((life.tokensCacheRead / life.tokensIn) * 100) : 0}%)`],
         ];
         for (let i = 0; i < pairs.length; i += 2) {
@@ -974,7 +1032,7 @@ class DashboardView implements Component {
         // reads are the same history re-sent each turn, and counting them here
         // would inflate the comparison by however chatty the sessions were
         // rather than by how much text actually passed through.
-        const distinct = Math.max(0, life.tokensIn - life.tokensCacheRead) + life.tokensOut;
+        const distinct = netTokens(life.tokensIn, life.tokensCacheRead) + life.tokensOut;
         const cmp = tokenComparison(distinct);
         if (cmp) {
           lines.push("");
@@ -1040,7 +1098,8 @@ class DashboardView implements Component {
         const e = r.entry;
         const hue = e.state === "error" ? "error"
           : e.state === "attention" || e.state === "trust" ? "warning"
-          : e.state === "working" ? "accent" : "success";
+          : e.state === "working" ? "accent"
+          : e.state === "exited" ? "dim" : "success";
         const label = e.tmuxName ?? e.name ?? e.project;
         const nm = pad(truncateToWidth(label, nameW, "\u2026", true), nameW);
         const status = pad(`${stateIcon[e.state]} ${th.fg(hue, e.state)}`, statusW);
@@ -1072,7 +1131,8 @@ class DashboardView implements Component {
       const k = (s: string) => th.fg("muted", s);
       const l = (s: string) => th.fg("dim", s);
       const sel = this.rows[this.selected];
-      const verb = !sel || this.rowTmuxName(sel) ? "attach" : "jump";
+      const verb = sel?.kind === "session" && sel.entry.state === "exited" ? "resume"
+        : !sel || this.rowTmuxName(sel) ? "attach" : "jump";
       lines.push("  " +
         `${k("\u2191\u2193")}${l(" select ")}${k("enter")}${l(` ${verb}`)}` + l("   \u2502   ") +
         `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${k("x")}${l(" detach ")}${th.fg("error", "X")}${l(" kill")}` + l("   \u2502   ") + `${k("s")}${l(" stats")}` + l("   \u2502   ") +
@@ -1255,6 +1315,18 @@ function installSessionTracker(pi: ExtensionAPI) {
    * alongside the freshly loaded instance. */
   const timers = new Set<ReturnType<typeof setInterval>>();
   const subagents = new Map<string, SubagentStatus>();
+  /** The prompt that started the current turn, kept so settling can say what
+   * finished instead of erasing it with a generic "Waiting for input.". */
+  let lastPrompt = "";
+  /** Approval detection. Pi has no "waiting for tool approval" event; the
+   * dialog sits exactly between tool_call and tool_execution_start, and an
+   * auto-approved tool crosses that gap in milliseconds. A per-call timer that
+   * outlives the gap therefore means a human is being asked. Keyed by call id
+   * because tools run in parallel: an auto-approved sibling must not clear the
+   * trust state that a still-blocked call earned. */
+  const approvalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const approvalPending = new Set<string>();
+  let osascriptOk: boolean | undefined;
   let ctxRef: ExtensionContext | undefined;
 
   const isInteractive = (ctx: ExtensionContext) =>
@@ -1298,6 +1370,41 @@ function installSessionTracker(pi: ExtensionAPI) {
   }
 
   const set = (next: TitleState, ctx: ExtensionContext) => { state = next; persist(ctx); };
+  /** True only when this session lives in tmux AND no client is attached —
+   * the one situation where the user cannot be watching this terminal.
+   * undefined = not in tmux, or tmux did not answer; treated as attended,
+   * because notifying someone who is already looking is noise. */
+  function detachedInTmux(): boolean {
+    if (!process.env.TMUX) return false;
+    try {
+      const r = spawnSync(TMUX, ["display-message", "-p", "#{session_attached}"], { encoding: "utf8", timeout: 2000 });
+      return r.status === 0 && String(r.stdout || "").trim() === "0";
+    } catch { return false; }
+  }
+  /** Desktop notification, only when nobody is watching (in tmux, detached).
+   * Attached-session alerting belongs to whatever notifier the user runs;
+   * this fires precisely in the gap that tool cannot see a need for.
+   * stdlib-only: osascript on macOS, feature-detected once; elsewhere this is
+   * a no-op rather than a dependency. Text goes through argv, never spliced
+   * into the AppleScript source — prompts are attacker-adjacent input. */
+  function notifyDetached(ctx: ExtensionContext, body: string): void {
+    if (process.platform !== "darwin" || !detachedInTmux()) return;
+    if (osascriptOk === undefined) osascriptOk = existsSync("/usr/bin/osascript");
+    if (!osascriptOk) return;
+    const title = `Pi — ${ctx.sessionManager.getSessionName() ?? basename(ctx.cwd)}`;
+    try {
+      const child = spawn("/usr/bin/osascript", [
+        "-e", "on run argv\n  display notification (item 1 of argv) with title (item 2 of argv)\nend run",
+        clean(body).slice(0, 200), title,
+      ], { stdio: "ignore" });
+      child.unref();
+    } catch { /* notification is best-effort, never worth disturbing the session */ }
+  }
+  function clearApprovals(): void {
+    for (const t of approvalTimers.values()) clearTimeout(t);
+    approvalTimers.clear();
+    approvalPending.clear();
+  }
 
   pi.on("session_start", (_e, ctx) => {
     if (!isInteractive(ctx)) return;
@@ -1355,6 +1462,12 @@ function installSessionTracker(pi: ExtensionAPI) {
       try {
         if (handedOff || !isInteractive(ctx)) return;
         if (!existsSync(statusPath(ctx))) persist(ctx);
+        // Attention means "finished while nobody was attached". The moment a
+        // client attaches, the user has seen it — typing is not required to
+        // acknowledge a result you read with your eyes.
+        if (state === "attention" && process.env.TMUX && !detachedInTmux()) {
+          set("idle", ctx);
+        }
       } catch { /* transient fs error; retry next tick */ }
     }, 15000);
     if (typeof heartbeat.unref === "function") heartbeat.unref();
@@ -1375,7 +1488,10 @@ function installSessionTracker(pi: ExtensionAPI) {
           startedAt: prev?.startedAt ?? Date.now(),
           completedAt: status === "completed" || status === "failed" ? Date.now() : undefined,
         });
-        if (status === "completed" || status === "failed") state = "attention";
+        if (status === "completed" || status === "failed") {
+          state = "attention";
+          notifyDetached(ctxRef, `Subagent ${status}: ${(a.description ?? "background agent").slice(0, 80)}`);
+        }
         persist(ctxRef);
       };
       pi.events?.on?.("subagents:created", track("queued"));
@@ -1390,18 +1506,94 @@ function installSessionTracker(pi: ExtensionAPI) {
   pi.on("before_agent_start", (e, ctx) => {
     if (!isInteractive(ctx)) return;
     const p = typeof e.prompt === "string" ? e.prompt.trim() : "";
-    if (p) activity = p.length > 140 ? `${p.slice(0, 139)}\u2026` : p;
+    if (p) {
+      lastPrompt = p.length > 140 ? `${p.slice(0, 139)}\u2026` : p;
+      activity = lastPrompt;
+    }
+    // A new prompt means the user is here; whatever demanded attention got it.
+    clearApprovals();
   });
   pi.on("agent_start", (_e, ctx) => { if (isInteractive(ctx)) { hadRun = true; set("working", ctx); } });
+  pi.on("tool_call", (e, ctx) => {
+    if (!isInteractive(ctx)) return undefined;
+    const id = e.toolCallId;
+    const timer = setTimeout(() => {
+      approvalTimers.delete(id);
+      // Only a working session can be waiting on approval; if the turn ended
+      // or errored in the meantime, this timer is stale.
+      if (state !== "working") return;
+      approvalPending.add(id);
+      activity = `Approval needed: ${e.toolName}`;
+      set("trust", ctx);
+      notifyDetached(ctx, `Approval needed: ${e.toolName}`);
+    }, 2000);
+    approvalTimers.set(id, timer);
+    return undefined;
+  });
+  pi.on("tool_execution_start", (e, ctx) => {
+    if (!isInteractive(ctx)) return;
+    const id = e.toolCallId;
+    const t = approvalTimers.get(id);
+    if (t) { clearTimeout(t); approvalTimers.delete(id); }
+    approvalPending.delete(id);
+    if (state === "trust" && approvalPending.size === 0) set("working", ctx);
+  });
   pi.on("tool_execution_end", (e, ctx) => {
     if (!isInteractive(ctx) || !e.isError) return;
     activity = `${e.toolName} failed`;
     set("error", ctx);
+    notifyDetached(ctx, `${e.toolName} failed`);
+  });
+  pi.on("after_provider_response", (e, ctx) => {
+    if (!isInteractive(ctx) || e.status < 400) return;
+    activity = `Provider error: HTTP ${e.status}`;
+    set("error", ctx);
+    notifyDetached(ctx, `Provider error: HTTP ${e.status}`);
+  });
+  pi.on("message_end", (e, ctx) => {
+    if (!isInteractive(ctx)) return;
+    const m = e.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+    if (!m || m.role !== "assistant") return;
+    // The assistant produced output, so no tool call is sitting at a dialog —
+    // including a call the user just denied, which never executes and would
+    // otherwise leave the trust state stuck.
+    clearApprovals();
+    if (state === "trust") set("working", ctx);
+    const failure = m.stopReason === "error"
+      ? (m.errorMessage || "Provider/agent request failed")
+      : /^(length|max_tokens|max_output_tokens)$/i.test(String(m.stopReason ?? ""))
+        ? `Output ceiling reached (${m.stopReason})` : undefined;
+    if (failure) {
+      activity = failure.length > 140 ? `${failure.slice(0, 139)}\u2026` : failure;
+      set("error", ctx);
+      notifyDetached(ctx, failure);
+      return;
+    }
+    // A later successful assistant message means an earlier transient error
+    // (an auto-retried provider hiccup) already resolved itself.
+    if (state === "error") set("working", ctx);
   });
   pi.on("agent_settled", (_e, ctx) => {
     if (!isInteractive(ctx) || !hadRun) return;
-    activity = "Waiting for input.";
-    if (state !== "error" && state !== "attention") set("idle", ctx); else persist(ctx);
+    clearApprovals();
+    // Say what finished, not that nothing is happening. The returning user's
+    // first question is "what did it just do", and the prompt is the best
+    // one-line answer this file has without fabricating a summary.
+    activity = lastPrompt ? `Done: ${lastPrompt}` : "Waiting for input.";
+    if (state !== "error" && state !== "attention") {
+      // Finishing while nobody is attached is the event this tool exists for.
+      // Attended settling stays a quiet idle; unattended settling must survive
+      // until the user actually comes back (see the heartbeat, which demotes
+      // it once a client attaches).
+      if (detachedInTmux()) {
+        set("attention", ctx);
+        notifyDetached(ctx, activity);
+      } else {
+        set("idle", ctx);
+      }
+    } else {
+      persist(ctx);
+    }
     // Deferred /bg: run it now that nothing is in flight.
     if (bgQueued) { bgQueued = false; void runBackgroundHandoff(ctx); }
   });
@@ -1412,11 +1604,26 @@ function installSessionTracker(pi: ExtensionAPI) {
     // registries. Clear unconditionally, before any early return.
     for (const t of timers) clearInterval(t);
     timers.clear();
+    clearApprovals();
     if (!isInteractive(ctx)) return;
-    // Do not remove the file if a handoff transferred this id to another
+    // Do not touch the file if a handoff transferred this id to another
     // process; that file is now theirs, not ours.
     if (handedOff) return;
-    try { unlinkSync(statusPath(ctx)); } catch { /* already gone */ }
+    // A session that never appeared on the dashboard leaves nothing behind:
+    // its card was invisible, so an exited card would be unreachable — a file
+    // that accumulates forever with no way to see or dismiss it. The
+    // transcript itself is Pi's and survives regardless.
+    if (!visible) {
+      try { unlinkSync(statusPath(ctx)); } catch { /* already gone */ }
+      return;
+    }
+    // The card outlives the process. It is the only pointer that knows how to
+    // resume this transcript, and deleting it on exit made every ended session
+    // unreachable from the dashboard. Written as exited rather than left at
+    // whatever state was current, so a crash and a clean quit read the same.
+    state = "exited";
+    activity = lastPrompt ? `Ended. Last: ${lastPrompt}` : "Session ended.";
+    persist(ctx);
   });
 
   function hasLiveSubagents(): number {

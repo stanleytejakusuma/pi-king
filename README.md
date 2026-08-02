@@ -227,6 +227,29 @@ The wordmark is generated, not a magic constant:
 Pi's module cache), so a backgrounded session picks up newly installed or
 updated extensions without losing its history. No restart needed.
 
+## Knowing when to come back
+
+Backgrounding a session is half the tool; the other half is finding out what
+happened while you were gone.
+
+- A session that finishes a turn while detached is marked **attention** and
+  sorts to the top, showing `Done: <the prompt that finished>`. It stays marked
+  until you attach — reading the result is the acknowledgement, no keypress
+  required.
+- A tool call waiting on an approval dialog shows as **trust** with the tool
+  named. Without this, a session blocked on a permission prompt looks exactly
+  like one that is working.
+- Provider failures and failed tools show as **error** with the reason.
+- On macOS, each of these also raises a desktop notification — but only while
+  the session is detached. If you are watching, it stays quiet. Notifications
+  use `osascript`; no dependency is added, and on other platforms they are
+  simply absent.
+
+Sessions are never deleted by the dashboard. A session whose process has ended
+shows as **exited**, and enter resumes its transcript in place, in its
+directory. `X` on an exited card removes the card alone; the transcript is Pi's
+and survives regardless.
+
 ## Limitations
 
 Stated plainly rather than discovered later:

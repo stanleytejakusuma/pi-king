@@ -93,8 +93,11 @@ is describing the duplicated part.
 
 Each session writes a versioned JSON snapshot to
 `$PI_CODING_AGENT_DIR/session-status/<id>.json` on every state transition. The
-supervisor polls, PID-checks, and unlinks dead entries. Schema and requirements
-are published in **`FORMAT.md`**.
+supervisor polls and PID-checks entries; a card whose process is gone is shown
+as `exited`, not deleted — it is the only pointer that knows how to resume its
+transcript, and enter on it does exactly that. Only an explicit dismiss (X on an
+exited card) removes a card. Schema and requirements are published in
+**`FORMAT.md`**.
 
 **Rejected: consuming `pi-intercom`'s IPC broker.** It is a *messaging*
 extension whose presence roster is a side effect, not a contract. Its
@@ -214,6 +217,20 @@ time. `/bg` prints a resume command that is correct only after the backgrounded
 session ends; running it while that session is alive is the realistic way to
 break this, so the extension checks on startup whether its own session id is
 already claimed by a live process and says so.
+
+**A card outlives its process.** Deleting a dead session's status file deletes
+the one record that knows how to resume its transcript. Death is displayed, not
+erased: the card renders as `exited` and enter resumes it in place. Removal is
+only ever an explicit human act. The identity check (pid plus process start
+time) still decides live versus dead, so a recycled pid cannot resurrect an
+exited card as a live one.
+
+**Supervision speaks only when nobody is listening.** Attention means "this
+finished while no client was attached" — the one condition the user cannot have
+observed. Settling while attached is a quiet idle. Desktop notifications fire
+under exactly the same condition, never when someone is watching, and the
+attention state clears the moment a client attaches; being seen is what it was
+for.
 
 **Identity is a process, not a label.** Correlation between a Pi session and a
 tmux session is by pane pid, matched against the pid recorded in the status file
