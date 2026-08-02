@@ -46,7 +46,14 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import type { Component, TUI, Theme } from "@earendil-works/pi-tui";
+import type { Component, TUI } from "@earendil-works/pi-tui";
+/** pi-tui does not export its theme type by name. Structural shape is all this
+ * file uses, and pinning it here keeps the typecheck honest instead of
+ * disabling it for the whole module. */
+type Theme = {
+  fg(colour: string, text: string): string;
+  bold(text: string): string;
+};
 import { Input, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
@@ -100,7 +107,10 @@ export type SessionStatusFile = {
  */
 export const SESSION_STATUS_DIR =
   process.env.PI_KING_STATUS_DIR?.trim() || join(homedir(), ".pi", "king", "session-status");
-import { clean,
+import {
+  clean,
+  compactNum,
+  tokenComparison,
   PI_ART,
   StatsCache,
   sparkline,
@@ -110,6 +120,7 @@ import { clean,
   type Inventory,
   type RecentProject,
   type UsageStats,
+  type DayTotal,
 } from "./data.ts";
 
 const REFRESH_MS = 1000;
@@ -124,12 +135,15 @@ const MESSAGE_LINGER_MS = 4000;
  * name so PATH lookup still gets a chance. */
 const TMUX = ((): string => {
   const which = spawnSync("/usr/bin/env", ["which", "tmux"], { encoding: "utf8", timeout: 3000 });
-  const found = which.status === 0 ? (which.stdout || "").trim().split("\n")[0].trim() : "";
+  const found = which.status === 0 ? String(which.stdout || "").trim().split("\n")[0].trim() : "";
   return found || "tmux";
 })();
 
 type DashboardEntry = {
   sessionId: string;
+  /** The pid that wrote this status file. Load-bearing: a tmux session is
+   * matched to this session by comparing its pane pid against this. */
+  pid: number;
   shortId: string;
   cwd: string;
   project: string;
@@ -239,6 +253,8 @@ function readSessions(): DashboardEntry[] {
     if (!raw.visible) continue;
     entries.push({
       sessionId: raw.id,
+      // Load-bearing: this is what a tmux session is matched against.
+      pid: raw.pid,
       shortId: raw.id.slice(0, 8),
       cwd: raw.cwd,
       project: raw.project,
@@ -333,7 +349,7 @@ function buildRows(): Row[] {
 
 function tmuxError(result: ReturnType<typeof spawnSync>): string {
   if (result.error) return result.error.message;
-  return (result.stderr || result.stdout || "tmux command failed").trim();
+  return String(result.stderr || result.stdout || "tmux command failed").trim();
 }
 
 // Sessions created through the dashboard always get the normal, full
@@ -410,7 +426,7 @@ function renameTmuxSession(oldName: string, newName: string, piIsIdle: boolean):
  * killing, for when you only want the terminal back. */
 function detachTmuxSession(name: string): { ok: boolean; message: string } {
   const attached = spawnSync(TMUX, ["display-message", "-p", "-t", name, "#{session_attached}"], { encoding: "utf8", timeout: 3000 });
-  const count = Number((attached.stdout || "").trim()) || 0;
+  const count = Number(String(attached.stdout || "").trim()) || 0;
   if (count === 0) {
     return { ok: true, message: `"${name}" has no attached client — it is already running unattended.` };
   }
@@ -509,8 +525,8 @@ end tell`;
     return { ok: false, message: `Could not run osascript: ${err instanceof Error ? err.message : String(err)}` };
   }
   if (result.error) return { ok: false, message: `osascript error: ${result.error.message}` };
-  if (result.status !== 0) return { ok: false, message: (result.stderr || "osascript exited non-zero").trim() };
-  return (result.stdout || "").trim() === "matched"
+  if (result.status !== 0) return { ok: false, message: String(result.stderr || "osascript exited non-zero").trim() };
+  return String(result.stdout || "").trim() === "matched"
     ? { ok: true, message: "Switched to that session's tab." }
     : { ok: false, message: "Tab not found \u2014 it may have been closed. Run /bg there to make it attachable." };
 }
@@ -641,8 +657,11 @@ class Composer {
   constructor(prefill: string, private onSubmit: (value: string) => void, private onCancel: () => void) {
     this.input = new Input();
     this.input.focused = true;
-    this.input.value = prefill;
-    this.input.cursor = prefill.length;
+    // pi-tui marks these private in its declarations but assigns them at
+    // runtime; there is no public setter for an initial value.
+    const editable = this.input as unknown as { value: string; cursor: number };
+    editable.value = prefill;
+    editable.cursor = prefill.length;
     this.input.onSubmit = (value: string) => this.onSubmit(value.trim());
     this.input.onEscape = () => this.onCancel();
   }
@@ -1179,7 +1198,7 @@ function tmuxSessionOwnsPid(name: string, expectedPid: number): boolean {
   if (!expectedPid) return false;
   const r = spawnSync(TMUX, ["display-message", "-p", "-t", name, "#{pane_pid}"], { encoding: "utf8", timeout: 3000 });
   if (r.status !== 0) return false;
-  return Number((r.stdout || "").trim()) === expectedPid;
+  return Number(String(r.stdout || "").trim()) === expectedPid;
 }
 
 function goToSession(action: HubAction): boolean {
@@ -1447,7 +1466,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       "-c", ctx.cwd, "--", "pi", "--session", sessionId, "--name", name,
     ], { encoding: "utf8", timeout: 8000 });
     if (created.status !== 0) {
-      ctx.ui.notify(`Could not hand off to tmux: ${(created.stderr || "unknown").trim()}`, "error");
+      ctx.ui.notify(`Could not hand off to tmux: ${String(created.stderr || "unknown").trim()}`, "error");
       return;
     }
     // Verify the replacement actually survived before destroying this copy.

@@ -40,8 +40,15 @@
     "pi-agents": "./bin/pi-king"
   },
   "scripts": {
-    "prepublishOnly": "node tools/check-exports.mjs",
-    "check": "node tools/check-exports.mjs",
-    "verify": "node tools/verify-metrics.mjs"
+    "prepublishOnly": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs",
+    "check": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs",
+    "verify": "node tools/verify-metrics.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@earendil-works/pi-tui": "^0.83.0",
+    "@types/node": "^26.1.2",
+    "typescript": "^5.9.3"
   }
 }
