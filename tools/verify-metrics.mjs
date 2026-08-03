@@ -60,9 +60,17 @@ const sumCalls = cold.reduce((a,x)=>a+x.calls,0);
 chk("lifetime in == sum(days)", life.tokensIn===sumIn, `${life.tokensIn} vs ${sumIn}`);
 chk("lifetime calls == sum(days)", life.calls===sumCalls, `${life.calls} vs ${sumCalls}`);
 
-// 3. today's row in the daily series must equal readUsageStats
+// 3. today's row in the daily series must equal readUsageStats.
+// Both are undefined on a day with no calls yet - which is every day for its
+// first few minutes. That is the fresh-morning state the BAND already handles;
+// this tool crashed on it instead (found by running at 00:09). All today-
+// dependent checks are skipped, loudly, rather than faked or crashed.
 const s = await d.readUsageStats();
 const todayRow = cold[cold.length-1];
+if (!s || !todayRow) {
+  console.log("  SKIP  today-dependent checks: no calls logged today yet (fresh-day state)");
+} else {
+await (async () => {
 chk("today's daily row == usage stats", todayRow.calls===s.calls && todayRow.tokensIn===s.tokensIn,
     `daily(${todayRow.calls},${todayRow.tokensIn}) vs usage(${s.calls},${s.tokensIn})`);
 
@@ -106,6 +114,8 @@ if (s.peakPeriod) chk("busiest share 0..100", s.peakPeriod.pct>=0 && s.peakPerio
 // 8. hourly buckets sum to calls
 const hourSum = s.hourly.reduce((a,x)=>a+x,0);
 chk("hourly buckets sum == calls", hourSum===s.calls, `${hourSum} vs ${s.calls}`);
+})();
+}
 
 // 9. comparison arithmetic, against DISTINCT tokens
 const distinct=Math.max(0,life.tokensIn-life.tokensCacheRead)+life.tokensOut;
