@@ -1485,6 +1485,12 @@ function installSessionTracker(pi: ExtensionAPI) {
 
   function persist(ctx: ExtensionContext): void {
     if (!isInteractive(ctx)) return;
+    // Once handed off, the card belongs to the successor. This process lives
+    // on for a moment while the TUI winds down, and any settle or message
+    // event in that window would otherwise stamp this dead-to-be pid over the
+    // new process's card — the dashboard then shows an exited session beside
+    // a live orphan tmux, which is what it did.
+    if (handedOff) return;
     try {
       // 0700/0600: these files carry session names, absolute working directories and
       // pids. Default permissions expose all of that to every other account on a
@@ -1808,6 +1814,19 @@ function installSessionTracker(pi: ExtensionAPI) {
     persist(ctx);
   });
 
+  /** Exact-name existence check. `has-session -t <name>` does NOT do this:
+   * tmux target resolution falls back to prefix and fnmatch matching, so
+   * asking for "proj" returns success when only "proj-a1b2c3d4" exists —
+   * verified against tmux 3.7b. On a machine running ten related session
+   * names that reports a duplicate that is not there, which is exactly the
+   * shape of an intermittent failure. Compare against the real list instead. */
+  function tmuxSessionExists(tmux: string, name: string): boolean {
+    const r = spawnSync(tmux, ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8", timeout: 3000 });
+    // A tmux server with no sessions exits non-zero; that is "no", not an error.
+    if (r.status !== 0) return false;
+    return String(r.stdout || "").split("\n").some((l) => l === name);
+  }
+
   function hasLiveSubagents(): number {
     return [...subagents.values()].filter((s) => s.status === "running" || s.status === "queued").length;
   }
@@ -1828,8 +1847,15 @@ function installSessionTracker(pi: ExtensionAPI) {
       return;
     }
     const sessionId = ctx.sessionManager.getSessionId();
-    const name = ctx.sessionManager.getSessionName() || `${basename(ctx.cwd) || "session"}-${sessionId.slice(0, 8)}`;
-    if (spawnSync(tmux, ["has-session", "-t", name], { encoding: "utf8", timeout: 3000 }).status === 0) {
+    const name = clean(ctx.sessionManager.getSessionName() || `${basename(ctx.cwd) || "session"}-${sessionId.slice(0, 8)}`)
+      // tmux's -t argument is a TARGET, not a name: '.' and ':' are its
+      // window and pane separators. A session legitimately created as
+      // "foo.bar" cannot then be found by `has-session -t foo.bar`, which
+      // reads as a handoff that failed while the copy is in fact alive — two
+      // processes on one transcript, the exact damage the collision guard
+      // exists to warn about. Replace them at the source.
+      .replace(/[.:]/g, "-").trim() || `session-${sessionId.slice(0, 8)}`;
+    if (tmuxSessionExists(tmux, name)) {
       ctx.ui.notify(`A tmux session named "${name}" already exists \u2014 not creating a duplicate. Attach to it from pi-king.`, "warning");
       return;
     }
@@ -1852,6 +1878,16 @@ function installSessionTracker(pi: ExtensionAPI) {
       ...(process.env.PI_KING_STATUS_DIR?.trim()
         ? ["-e", `PI_KING_STATUS_DIR=${process.env.PI_KING_STATUS_DIR.trim()}`]
         : []),
+      // The child reads its own usage figures from here. Unpinned, a session
+      // backgrounded from a shell that exports it lands in a tmux server that
+      // does not, and its metrics band goes blank for no visible reason.
+      ...(process.env.PI_KING_CALL_LOGS?.trim()
+        ? ["-e", `PI_KING_CALL_LOGS=${process.env.PI_KING_CALL_LOGS.trim()}`]
+        : []),
+      // HOME decides where Pi looks for everything. A server started under a
+      // different HOME resolves a different transcript root, which fails the
+      // same way the agent dir did.
+      ...(process.env.HOME ? ["-e", `HOME=${process.env.HOME}`] : []),
       "-c", ctx.cwd, "--", "pi", "--session", sessionId, "--name", name,
     ], { encoding: "utf8", timeout: 8000 });
     if (created.status !== 0) {
@@ -1860,8 +1896,13 @@ function installSessionTracker(pi: ExtensionAPI) {
     }
     // Verify the replacement actually survived before destroying this copy.
     await new Promise((r) => setTimeout(r, 2500));
-    if (spawnSync(tmux, ["has-session", "-t", name], { encoding: "utf8", timeout: 3000 }).status !== 0) {
-      ctx.ui.notify("Handoff failed \u2014 the tmux copy exited immediately, so this session was kept alive.", "error");
+    if (!tmuxSessionExists(tmux, name)) {
+      // Nothing to clean up in this branch — the session is gone, which is how
+      // we got here. But if it half-exists (created, then died leaving a shell)
+      // it would block every later attempt with a false "already exists", so
+      // clear the name unconditionally rather than reasoning about which.
+      spawnSync(tmux, ["kill-session", "-t", `=${name}`], { encoding: "utf8", timeout: 3000 });
+      ctx.ui.notify("Handoff failed \u2014 the tmux copy exited immediately, so this session was kept alive. Try /bg again.", "error");
       return;
     }
     // Ownership of this session id now belongs to the tmux-hosted process.
