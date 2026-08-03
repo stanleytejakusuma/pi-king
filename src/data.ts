@@ -195,9 +195,25 @@ export type UsageStats = {
 };
 
 function today(): string {
-  const d = new Date();
+  return localDateOf(new Date());
+}
+
+/** A record's LOCAL calendar date, computed from its own timestamp.
+ *
+ * Never trust a call-log directory's name for this. The router names
+ * directories by UTC calendar day, and a human's "day" is a LOCAL calendar
+ * day — the two boundaries disagree by the local UTC offset for anyone not on
+ * UTC. Verified at UTC+7: a call made 7 minutes before this fix was written
+ * sat in the PREVIOUS UTC day's directory while being unambiguously part of
+ * local "today" by any human definition. For that machine, every single day
+ * has a 7-hour window (local midnight to 7am) where "today's" UTC-named
+ * directory does not exist yet, and the band would report no activity
+ * despite calls having already happened. Accepts a Date or a parseable
+ * timestamp string; getFullYear/getMonth/getDate are LOCAL accessors. */
+function localDateOf(input: Date | string): string {
+  const t = typeof input === "string" ? new Date(input) : input;
   const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())}`;
 }
 
 /** Strips vendor/route prefixes so model names fit the one-line ticker. */
@@ -224,16 +240,39 @@ function shortModel(id: string): string {
  * week" into one number that describes neither. A sparkline shows the burst
  * instead of hiding it, and the eye does the comparison without arithmetic.
  *
- * Caching: a past day's logs never change, so its total is computed once and
- * kept. Today and yesterday are always rescanned, because a session running
- * across midnight writes into yesterday's directory after that day has ended,
- * and freezing it early would undercount it. Only the two most recent
- * directories are ever re-read.
+ * Caching: a closed UTC directory's logs never change, so its contribution is
+ * computed once and kept. The two most recent UTC directories are always
+ * rescanned, because the router can still write into either. "Day" here is
+ * always a LOCAL calendar date, never the UTC directory name — the router
+ * names directories by UTC calendar day, which disagrees with a human's day
+ * by the local UTC offset, so a single directory routinely splits across two
+ * local dates (verified: at UTC+7, every UTC directory's last 7 hours belong
+ * to the NEXT local date). Bucketing is per record, by that record's own
+ * timestamp, never by which directory it happens to sit in — see localDateOf.
  */
 /** When the caller has already scanned today's directory (readUsageStats
  * does, for the band), it passes the result here so today is not read twice
  * per refresh. Both scans count identically — same files, same summary
  * fields — so substituting one for the other cannot change a number. */
+type DayFields = Omit<DayTotal, "day">;
+/** Cached per UTC DIRECTORY, not per local day — the unit that is actually
+ * closed-and-immutable is the directory (the router will never write into it
+ * again once a newer one appears), and one directory's records can split
+ * across two local dates for anyone not on UTC. Usually a small map (one
+ * entry, or two when the directory straddles a local-day boundary). */
+type DirCacheEntry = Record<string, DayFields>;
+
+const ZERO_FIELDS = (): DayFields => ({ tokensIn: 0, tokensOut: 0, tokensCacheRead: 0, tokensCacheWrite: 0, tokensReasoning: 0, calls: 0 });
+const FIELD_NAMES = ["tokensIn", "tokensOut", "tokensCacheRead", "tokensCacheWrite", "tokensReasoning", "calls"] as const;
+const isComplete = (h: Record<string, unknown> | undefined): h is DayFields =>
+  !!h && FIELD_NAMES.every((f) => typeof h[f] === "number");
+function addFields(into: Map<string, DayFields>, localDay: string, e: DayFields): void {
+  const cur = into.get(localDay) ?? ZERO_FIELDS();
+  cur.tokensIn += e.tokensIn; cur.tokensOut += e.tokensOut; cur.tokensCacheRead += e.tokensCacheRead;
+  cur.tokensCacheWrite += e.tokensCacheWrite; cur.tokensReasoning += e.tokensReasoning; cur.calls += e.calls;
+  into.set(localDay, cur);
+}
+
 export async function readDailyTokens(todayOverride?: DayTotal): Promise<DayTotal[]> {
   if (!CALL_LOGS) return [];
   let dirs: string[];
@@ -242,88 +281,97 @@ export async function readDailyTokens(todayOverride?: DayTotal): Promise<DayTota
   } catch {
     return [];
   }
+  // Only the last two UTC-named directories can still receive new writes —
+  // the router starts a fresh one at UTC midnight and never revisits an old
+  // one — so "volatile" here means exactly "not yet closed", same test as
+  // before. It is NOT trying to guess which directories feed local-today;
+  // per-record bucketing below makes that unnecessary. A directory is safe to
+  // cache once it is closed, full stop, regardless of which local date(s) its
+  // records land in.
   const volatile = new Set(dirs.slice(-2));
 
-  let cache: Record<string, Omit<DayTotal, "day">> = {};
+  let cache: Record<string, DirCacheEntry> = {};
   try {
     cache = JSON.parse(readFileSync(DAILY_CACHE, "utf8")) as typeof cache;
   } catch { /* first run, or unreadable: rebuild */ }
 
-  // Lifetime means lifetime: the router rotates old log directories away, and
-  // deriving the series purely from surviving directories made every figure
-  // labelled "lifetime" quietly shrink as days rotated out. A cached day was
-  // measured while its logs existed, so it still counts after they are gone —
-  // but only if it carries every field, because a gone day can never be
-  // rescanned to fill one in. Incomplete orphans stay in the file (they are
-  // measurements; deleting them destroys data) and out of the series.
+  const merged = new Map<string, DayFields>();
   const scanned = new Set(dirs);
-  const complete = (h: Record<string, unknown>): boolean =>
-    ["tokensIn", "tokensOut", "tokensCacheRead", "tokensCacheWrite", "tokensReasoning", "calls"]
-      .every((f) => typeof h[f] === "number");
-  const archived = Object.keys(cache)
-    .filter((day) => /^\d{4}-\d{2}-\d{2}$/.test(day) && !scanned.has(day) && complete(cache[day]));
-  const allDays = [...dirs, ...archived].sort();
-
-  const out: DayTotal[] = [];
   let dirty = false;
-  for (const day of allDays) {
-    if (!scanned.has(day)) {
-      out.push({ day, ...cache[day] });
+
+  for (const dir of dirs) {
+    const cached = cache[dir];
+    if (!volatile.has(dir) && cached && Object.values(cached).every(isComplete)) {
+      for (const [localDay, fields] of Object.entries(cached)) addFields(merged, localDay, fields);
       continue;
     }
-    if (todayOverride && day === todayOverride.day) {
-      out.push(todayOverride);
-      continue;
-    }
-    const hit = cache[day];
-    // Require every field. Entries written before a field existed would
-    // otherwise be served with it silently missing, which reads as zero.
-    if (!volatile.has(day) && hit && typeof hit.tokensIn === "number" && typeof hit.tokensCacheRead === "number" &&
-        typeof hit.tokensCacheWrite === "number" && typeof hit.tokensReasoning === "number") {
-      out.push({ day, ...hit });
-      continue;
-    }
-    let tokensIn = 0;
-    let tokensOut = 0;
-    let tokensCacheRead = 0;
-    let tokensCacheWrite = 0;
-    let tokensReasoning = 0;
-    let calls = 0;
+    const byLocal: DirCacheEntry = {};
     try {
-      const files = (await readdir(join(CALL_LOGS, day))).filter((f) => f.endsWith(".json"));
+      const files = (await readdir(join(CALL_LOGS, dir))).filter((f) => f.endsWith(".json"));
       const BATCH = 64;
       for (let i = 0; i < files.length; i += BATCH) {
         const parsed = await Promise.all(files.slice(i, i + BATCH).map(async (f) => {
           try {
-            return JSON.parse(await readFile(join(CALL_LOGS, day, f), "utf8")) as { summary?: Record<string, unknown> };
+            return JSON.parse(await readFile(join(CALL_LOGS, dir, f), "utf8")) as { summary?: Record<string, unknown> };
           } catch {
             return undefined;
           }
         }));
         for (const r of parsed) {
           if (!r?.summary) continue;
-          calls++;
+          // The directory name is only a fallback for the rare record whose own
+          // timestamp cannot be parsed — never the primary source of its day.
+          const localDay = typeof r.summary.timestamp === "string" && r.summary.timestamp.length >= 10
+            ? localDateOf(r.summary.timestamp) : dir;
+          const e = byLocal[localDay] ?? ZERO_FIELDS();
+          e.calls++;
           const tk = r.summary.tokens as Record<string, unknown> | undefined;
           if (tk) {
-            tokensIn += Number(tk.in) || 0;
-            tokensOut += Number(tk.out) || 0;
-            tokensCacheRead += Number(tk.cacheRead) || 0;
-            tokensCacheWrite += Number(tk.cacheWrite) || 0;
-            tokensReasoning += Number(tk.reasoning) || 0;
+            e.tokensIn += Number(tk.in) || 0;
+            e.tokensOut += Number(tk.out) || 0;
+            e.tokensCacheRead += Number(tk.cacheRead) || 0;
+            e.tokensCacheWrite += Number(tk.cacheWrite) || 0;
+            e.tokensReasoning += Number(tk.reasoning) || 0;
           }
+          byLocal[localDay] = e;
         }
       }
     } catch { continue; }
-    out.push({ day, tokensIn, tokensOut, tokensCacheRead, tokensCacheWrite, tokensReasoning, calls });
-    if (!volatile.has(day)) { cache[day] = { tokensIn, tokensOut, tokensCacheRead, tokensCacheWrite, tokensReasoning, calls }; dirty = true; }
+    for (const [localDay, fields] of Object.entries(byLocal)) addFields(merged, localDay, fields);
+    if (!volatile.has(dir)) { cache[dir] = byLocal; dirty = true; }
   }
+
+  // Lifetime means lifetime: the router rotates old log directories away, and
+  // deriving the series purely from surviving directories made every figure
+  // labelled "lifetime" quietly shrink as days rotated out. A cached directory
+  // was measured while its logs existed, so it still contributes after they
+  // are gone — but only if every one of its local-date entries is complete,
+  // because a gone directory can never be rescanned to fill in a missing
+  // field. Incomplete orphans stay in the cache file (they are measurements;
+  // deleting them destroys data) and out of the series.
+  for (const [dirName, entry] of Object.entries(cache)) {
+    if (scanned.has(dirName)) continue; // already merged above
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dirName)) continue;
+    if (!Object.values(entry).every(isComplete)) continue;
+    for (const [localDay, fields] of Object.entries(entry)) addFields(merged, localDay, fields);
+  }
+
   if (dirty) {
     try {
       mkdirSync(dirname(DAILY_CACHE), { recursive: true, mode: 0o700 });
       writeFileSync(DAILY_CACHE, JSON.stringify(cache), { mode: 0o600 });
     } catch { /* cache is an optimisation; losing it costs a rescan */ }
   }
-  return out;
+
+  // readUsageStats already scanned the exact records that make up local
+  // today (same files, same fields), so its result replaces whatever this
+  // pass computed for that date rather than being counted twice.
+  if (todayOverride) {
+    const { day, ...fields } = todayOverride;
+    merged.set(day, fields);
+  }
+
+  return [...merged.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([day, fields]) => ({ day, ...fields }));
 }
 
 /** Lifetime figures for the stats screen, derived from every day of logs on
@@ -429,12 +477,30 @@ export async function readLifetimeStats(todayOverride?: DayTotal): Promise<Lifet
 
 export async function readUsageStats(): Promise<UsageStats | undefined> {
   if (!CALL_LOGS) return undefined;
-  const dir = join(CALL_LOGS, today());
-  let files: string[];
+  const targetLocalDay = today();
+  // The router names its directories by UTC calendar day; "today" is a LOCAL
+  // calendar day, and the two boundaries disagree by the local UTC offset for
+  // anyone not on UTC. Reading only the directory literally named today's
+  // local date misses every record written before UTC midnight (a 7-hour
+  // window at UTC+7, every single day) and, once that directory exists,
+  // eventually the reverse for its own tail. Local today can only ever be fed
+  // by the most recently created UTC directories, so the last two are read
+  // and every record is kept or dropped by comparing ITS OWN timestamp's
+  // local date against today — never by trusting either directory's name.
+  let dirs: string[];
   try {
-    files = (await readdir(dir)).filter((f) => f.endsWith(".json"));
+    dirs = (await readdir(CALL_LOGS)).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
   } catch {
     return undefined;
+  }
+  const candidates = dirs.slice(-2);
+  const files: { dir: string; name: string }[] = [];
+  for (const d of candidates) {
+    try {
+      for (const name of await readdir(join(CALL_LOGS, d))) {
+        if (name.endsWith(".json")) files.push({ dir: d, name });
+      }
+    } catch { /* directory not created yet, e.g. before UTC midnight — not an error */ }
   }
   if (files.length === 0) return undefined;
 
@@ -461,7 +527,7 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
     const batch = files.slice(i, i + BATCH);
     const results = await Promise.all(batch.map(async (f) => {
       try {
-        return JSON.parse(await readFile(join(dir, f), "utf8")) as { summary?: Record<string, unknown> };
+        return JSON.parse(await readFile(join(CALL_LOGS, f.dir, f.name), "utf8")) as { summary?: Record<string, unknown> };
       } catch {
         return undefined;
       }
@@ -472,6 +538,9 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
         partial = true;
         continue;
       }
+      // The whole point of reading two directories: keep only the records
+      // that actually belong to local today, wherever they happen to sit.
+      if (typeof s.timestamp !== "string" || s.timestamp.length < 10 || localDateOf(s.timestamp) !== targetLocalDay) continue;
       calls++;
       const status = typeof s.status === "number" ? s.status : 0;
       if (status >= 400) {

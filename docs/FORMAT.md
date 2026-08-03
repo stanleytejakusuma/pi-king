@@ -167,6 +167,16 @@ remains, because it is the only pointer that knows how to resume the transcript
 (`pi --session <id>`). Files are removed only by an explicit dismiss in the
 dashboard, or at clean shutdown of a session that never appeared on it.
 
+A day in the daily series and today's band figures are always LOCAL calendar
+days, computed from each call record's own timestamp — never from the name of
+the call-log directory it sits in. The router names directories by UTC
+calendar day, which disagrees with a human's day by the local UTC offset; for
+anyone not on UTC, a single directory's records routinely split across two
+local dates, and for part of every day the directory named after local
+"today" does not exist yet. Trusting the directory name produced a real bug:
+at UTC+7, the band reported no activity for the first seven hours of every
+day despite calls having already happened.
+
 The day cache is an archive, not just an accelerator. The router rotates old
 log directories away; a cached day that carries every field keeps counting
 toward lifetime figures after its logs are gone, because it was measured while
