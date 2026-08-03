@@ -44,7 +44,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 /** pi-tui does not export its theme type by name. Structural shape is all this
@@ -60,13 +60,13 @@ import { homedir } from "node:os";
 
 /* ---------------------------------------------------------------- state -- */
 /** Coarse session lifecycle. Owned here so pi-king depends on stock Pi only. */
-export type TitleState = "working" | "idle" | "attention" | "error" | "trust" | "exited";
+export type TitleState = "working" | "idle" | "attention" | "error" | "exited";
 
 // \u{...} with braces: a bare \u takes exactly four hex digits, so \u1f514
 // silently parsed as U+1F51 followed by a literal "4" and the attention icon
 // rendered as a Greek vowel with a digit stuck to it. Shipped that way.
 export const stateIcon: Record<TitleState, string> = {
-  working: "\u23f3", idle: "\u2713", attention: "\u{1f514}", error: "\u26a0", trust: "\u{1f510}", exited: "\u25cb",
+  working: "\u23f3", idle: "\u2713", attention: "\u{1f514}", error: "\u26a0", exited: "\u25cb",
 };
 
 export type SubagentStatus = {
@@ -133,7 +133,7 @@ import {
 } from "./data.ts";
 
 const REFRESH_MS = 1000;
-const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, trust: 0, working: 1, idle: 2, exited: 3 };
+const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, working: 1, idle: 2, exited: 3 };
 const MESSAGE_LINGER_MS = 4000;
 /** Resolved once at load rather than hardcoded. tmux lives in different places
  * depending on how it was installed: /opt/homebrew/bin on Apple Silicon,
@@ -313,13 +313,57 @@ function readSessions(): DashboardEntry[] {
       tmuxName: undefined,
     });
   }
-  // Group by directory first (contiguous runs so the renderer can emit a
-  // header when cwd changes), then by urgency within each directory.
-  entries.sort((a, b) =>
-    a.cwd.localeCompare(b.cwd) ||
-    STATE_PRIORITY[a.state] - STATE_PRIORITY[b.state] ||
-    b.updatedAt - a.updatedAt);
+  // Pinned sessions leave their directory group and form one section at the
+  // top, in the order the user put them in. Everything else groups by
+  // directory, then by urgency, then by recency.
+  const layout = readLayout();
+  const rank = (id: string) => {
+    const i = layout.order.indexOf(id);
+    return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+  };
+  entries.sort((a, b) => {
+    const ap = layout.pinned.includes(a.sessionId);
+    const bp = layout.pinned.includes(b.sessionId);
+    if (ap !== bp) return ap ? -1 : 1;
+    if (ap && bp) return layout.pinned.indexOf(a.sessionId) - layout.pinned.indexOf(b.sessionId);
+    return a.cwd.localeCompare(b.cwd) ||
+      // A manual position, when one has been set, outranks urgency: the user
+      // moving a row is a stronger statement about what matters than the
+      // state machine's opinion.
+      rank(a.sessionId) - rank(b.sessionId) ||
+      STATE_PRIORITY[a.state] - STATE_PRIORITY[b.state] ||
+      b.updatedAt - a.updatedAt;
+  });
   return entries;
+}
+
+/* -------------------------------------------------------------- layout -- */
+/** Pins and manual ordering. Deliberately NOT stored in the status files:
+ * those are written by each session's own process, and the dashboard writing
+ * into them would put two processes on one file. This is a dashboard concern,
+ * so the dashboard owns the file. */
+type Layout = { pinned: string[]; order: string[] };
+const LAYOUT_FILE = join(SESSION_STATUS_DIR, "..", "layout.json");
+
+function readLayout(): Layout {
+  try {
+    const raw = JSON.parse(readFileSync(LAYOUT_FILE, "utf8")) as Partial<Layout>;
+    const strs = (v: unknown) => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+    return { pinned: strs(raw.pinned), order: strs(raw.order) };
+  } catch {
+    return { pinned: [], order: [] };
+  }
+}
+
+function writeLayout(l: Layout): void {
+  try {
+    mkdirSync(dirname(LAYOUT_FILE), { recursive: true, mode: 0o700 });
+    const tmp = `${LAYOUT_FILE}.tmp-${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(l, null, 2), { mode: 0o600 });
+    renameSync(tmp, LAYOUT_FILE);
+  } catch {
+    // Ordering is a preference, not state. Losing it must never break a view.
+  }
 }
 
 /** Lists live tmux sessions. No server running is not an error — just zero sessions. */
@@ -844,6 +888,72 @@ class DashboardView implements Component {
     this.tui.requestRender();
   }
 
+  /** Moves the selected session one place within its own section, and keeps
+   * the cursor on it. Only sessions can be moved: an orphan tmux row has no
+   * session id to remember a position against. */
+  private moveSelected(delta: number): void {
+    const row = this.rows[this.selected];
+    if (!row || row.kind !== "session") {
+      this.showMessage("Only Pi sessions can be reordered.");
+      return;
+    }
+    const layout = readLayout();
+    const pinned = layout.pinned.includes(row.entry.sessionId);
+    // A row may only move among its peers: within the pinned section, or
+    // within its own directory group. Moving across a boundary would silently
+    // change what the row means — its directory, or its pinned-ness — and
+    // those are what the other two keys are for.
+    const peers = this.rows.filter((r): r is SessionRow =>
+      r.kind === "session" &&
+      layout.pinned.includes(r.entry.sessionId) === pinned &&
+      (pinned || r.entry.cwd === row.entry.cwd));
+    const at = peers.findIndex((r) => r.entry.sessionId === row.entry.sessionId);
+    const to = at + delta;
+    if (at === -1 || to < 0 || to >= peers.length) {
+      this.showMessage(pinned ? "Already at the edge of the pinned section." : "Already at the edge of this project.");
+      return;
+    }
+    const ids = peers.map((r) => r.entry.sessionId);
+    ids.splice(to, 0, ids.splice(at, 1)[0]);
+    if (pinned) {
+      // The pinned list IS the pinned order; rewrite that slice in place.
+      const rest = layout.pinned.filter((id) => !ids.includes(id));
+      writeLayout({ ...layout, pinned: [...ids, ...rest] });
+    } else {
+      // Explicit order for this group's ids; other groups keep theirs.
+      const rest = layout.order.filter((id) => !ids.includes(id));
+      writeLayout({ ...layout, order: [...rest, ...ids] });
+    }
+    this.refresh();
+    // Follow the row rather than the index: the sort has just changed under us.
+    const moved = this.rows.findIndex((r) => r.kind === "session" && r.entry.sessionId === row.entry.sessionId);
+    if (moved >= 0) this.selected = moved;
+    this.tui.requestRender();
+  }
+
+  /** Pins or unpins the selected session. Pinned sessions leave their
+   * directory group and sit in one section at the top, whatever their state. */
+  private togglePin(): void {
+    const row = this.rows[this.selected];
+    if (!row || row.kind !== "session") {
+      this.showMessage("Only Pi sessions can be pinned.");
+      return;
+    }
+    const id = row.entry.sessionId;
+    const layout = readLayout();
+    const now = layout.pinned.includes(id)
+      ? layout.pinned.filter((x) => x !== id)
+      : [...layout.pinned, id];
+    writeLayout({ ...layout, pinned: now });
+    this.showMessage(now.includes(id)
+      ? `Pinned "${this.rowLabel(row)}" to the top.`
+      : `Unpinned "${this.rowLabel(row)}".`);
+    this.refresh();
+    const moved = this.rows.findIndex((r) => r.kind === "session" && r.entry.sessionId === id);
+    if (moved >= 0) this.selected = moved;
+    this.tui.requestRender();
+  }
+
   private rowTmuxName(row: Row): string | undefined {
     return row.kind === "orphan" ? row.tmux.name : row.entry.tmuxName;
   }
@@ -911,6 +1021,16 @@ class DashboardView implements Component {
     // dashboard people rely on staying open, not a pager.
     if (matchesKey(data, "escape")) {
       this.done(undefined);
+      return;
+    }
+    // Reorder before plain movement: shift+arrow must not fall through to the
+    // arrow handler, or the row would move and the cursor would move again.
+    if (matchesKey(data, "shift+up") || matchesKey(data, "shift+down")) {
+      this.moveSelected(matchesKey(data, "shift+up") ? -1 : 1);
+      return;
+    }
+    if (matchesKey(data, "ctrl+t")) {
+      this.togglePin();
       return;
     }
     if (matchesKey(data, "down")) {
@@ -1210,7 +1330,7 @@ class DashboardView implements Component {
     const add = (n: number, label: string, hue: string) => { if (n > 0) vitals.push(th.fg(hue, String(n)) + th.fg("dim", ` ${label}`)); };
     add(byState("working"), "working", "accent");
     add(byState("idle"), "idle", "success");
-    add(byState("attention") + byState("trust"), "attention", "warning");
+    add(byState("attention"), "attention", "warning");
     add(byState("error"), "error", "error");
     add(running, "subagents running", "accent");
     if (this.rows.length > 0) {
@@ -1244,15 +1364,20 @@ class DashboardView implements Component {
       const nameW = Math.min(34, Math.max(18, Math.floor(MEASURE * 0.22)));
       const statusW = 22;
       let lastGroup: string | undefined;
+      const pinnedIds = readLayout().pinned;
       this.rows.forEach((r, i) => {
-        const group = r.kind === "orphan" ? "tmux (no Pi session)" : r.entry.cwd.replace(process.env.HOME ?? "~", "~");
+        const group = r.kind === "orphan" ? "tmux (no Pi session)"
+          : pinnedIds.includes(r.entry.sessionId) ? "pinned"
+          : r.entry.cwd.replace(process.env.HOME ?? "~", "~");
         if (group !== lastGroup) {
           if (lastGroup !== undefined) body.push("");
-          const drift = r.kind === "session" ? this.gitDrift.get(r.entry.cwd) : undefined;
+          // A pinned row keeps its own project visible on the row itself,
+          // since the section header no longer says where it lives.
+          const drift = r.kind === "session" && group !== "pinned" ? this.gitDrift.get(r.entry.cwd) : undefined;
           const driftBadge = drift && drift.n > 0
             ? th.fg("warning", `  \u25cf ${drift.n} uncommitted`)
             : "";
-          body.push("  " + th.fg("muted", group) + driftBadge);
+          body.push("  " + (group === "pinned" ? th.fg("accent", "pinned") : th.fg("muted", group)) + driftBadge);
           lastGroup = group;
         }
         const sel = i === this.selected;
@@ -1267,10 +1392,13 @@ class DashboardView implements Component {
         }
         const e = r.entry;
         const hue = e.state === "error" ? "error"
-          : e.state === "attention" || e.state === "trust" ? "warning"
+          : e.state === "attention" ? "warning"
           : e.state === "working" ? "accent"
           : e.state === "exited" ? "dim" : "success";
-        const label = e.tmuxName ?? e.name ?? e.project;
+        const isPinned = pinnedIds.includes(e.sessionId);
+        const label = (isPinned ? "\u2691 " : "") +
+          (e.tmuxName ?? e.name ?? e.project) +
+          (isPinned ? ` \u00b7 ${e.project}` : "");
         const nm = pad(truncateToWidth(label, nameW, "\u2026", true), nameW);
         const status = pad(`${stateIcon[e.state]} ${th.fg(hue, e.state)}`, statusW);
         const sub = subagentSummary(e.subagents);
@@ -1316,6 +1444,7 @@ class DashboardView implements Component {
         : !sel || this.rowTmuxName(sel) ? "attach" : "jump";
       foot.push("  " +
         `${k("\u2191\u2193")}${l(" select ")}${k("enter")}${l(` ${verb}`)}` + l("   \u2502   ") +
+        `${k("\u21e7\u2191\u2193")}${l(" move ")}${k("^t")}${l(" pin")}` + l("   \u2502   ") +
         `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${k("x")}${l(" detach ")}${th.fg("error", "X")}${l(" kill")}` + l("   \u2502   ") + `${k("s")}${l(" stats")}` + l("   \u2502   ") +
         `${k("r")}${l(" refresh ")}${k("esc")}${l(" close")}`);
     }
@@ -1564,14 +1693,6 @@ function installSessionTracker(pi: ExtensionAPI) {
   /** The prompt that started the current turn, kept so settling can say what
    * finished instead of erasing it with a generic "Waiting for input.". */
   let lastPrompt = "";
-  /** Approval detection. Pi has no "waiting for tool approval" event; the
-   * dialog sits exactly between tool_call and tool_execution_start, and an
-   * auto-approved tool crosses that gap in milliseconds. A per-call timer that
-   * outlives the gap therefore means a human is being asked. Keyed by call id
-   * because tools run in parallel: an auto-approved sibling must not clear the
-   * trust state that a still-blocked call earned. */
-  const approvalTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  const approvalPending = new Set<string>();
   let osascriptOk: boolean | undefined;
   let ctxRef: ExtensionContext | undefined;
 
@@ -1667,11 +1788,6 @@ function installSessionTracker(pi: ExtensionAPI) {
       ], { stdio: "ignore" });
       child.unref();
     } catch { /* notification is best-effort, never worth disturbing the session */ }
-  }
-  function clearApprovals(): void {
-    for (const t of approvalTimers.values()) clearTimeout(t);
-    approvalTimers.clear();
-    approvalPending.clear();
   }
 
   pi.on("session_start", (_e, ctx) => {
@@ -1789,33 +1905,23 @@ function installSessionTracker(pi: ExtensionAPI) {
       activity = lastPrompt;
     }
     // A new prompt means the user is here; whatever demanded attention got it.
-    clearApprovals();
   });
   pi.on("agent_start", (_e, ctx) => { if (isInteractive(ctx)) { hadRun = true; set("working", ctx); } });
-  pi.on("tool_call", (e, ctx) => {
-    if (!isInteractive(ctx)) return undefined;
-    const id = e.toolCallId;
-    const timer = setTimeout(() => {
-      approvalTimers.delete(id);
-      // Only a working session can be waiting on approval; if the turn ended
-      // or errored in the meantime, this timer is stale.
-      if (state !== "working") return;
-      approvalPending.add(id);
-      activity = `Approval needed: ${e.toolName}`;
-      set("trust", ctx);
-      notifyDetached(ctx, `Approval needed: ${e.toolName}`);
-    }, 2000);
-    approvalTimers.set(id, timer);
-    return undefined;
-  });
-  pi.on("tool_execution_start", (e, ctx) => {
-    if (!isInteractive(ctx)) return;
-    const id = e.toolCallId;
-    const t = approvalTimers.get(id);
-    if (t) { clearTimeout(t); approvalTimers.delete(id); }
-    approvalPending.delete(id);
-    if (state === "trust" && approvalPending.size === 0) set("working", ctx);
-  });
+  // No approval detection. Pi exposes no "waiting for approval" event, and the
+  // gap between tool_call and tool_execution_start looked like a usable proxy:
+  // an auto-approved tool crosses it in milliseconds, so a call still sitting
+  // there after two seconds ought to mean a human is being asked.
+  //
+  // It does not. Measured against a 25-second bash command that was never
+  // gated, the session reported "Approval needed: bash" for twenty-two of
+  // those seconds. Whatever clears that gap does not arrive in time to be
+  // relied on, so the inference gave a confident wrong answer about the most
+  // ordinary thing a session does: run a slow command.
+  //
+  // A dashboard that says "go approve something" when nothing is waiting is
+  // worse than one that stays quiet: it spends attention, and it hides the
+  // true state, which was simply "working". Missing data renders as nothing
+  // here. When Pi emits a real approval event this becomes three lines.
   pi.on("tool_execution_end", (e, ctx) => {
     if (!isInteractive(ctx) || !e.isError) return;
     activity = `${e.toolName} failed`;
@@ -1835,8 +1941,6 @@ function installSessionTracker(pi: ExtensionAPI) {
     // The assistant produced output, so no tool call is sitting at a dialog —
     // including a call the user just denied, which never executes and would
     // otherwise leave the trust state stuck.
-    clearApprovals();
-    if (state === "trust") set("working", ctx);
     const failure = m.stopReason === "error"
       ? (m.errorMessage || "Provider/agent request failed")
       : /^(length|max_tokens|max_output_tokens)$/i.test(String(m.stopReason ?? ""))
@@ -1853,7 +1957,6 @@ function installSessionTracker(pi: ExtensionAPI) {
   });
   pi.on("agent_settled", (_e, ctx) => {
     if (!isInteractive(ctx) || !hadRun) return;
-    clearApprovals();
     // Say what finished, not that nothing is happening. The returning user's
     // first question is "what did it just do", and the prompt is the best
     // one-line answer this file has without fabricating a summary.
@@ -1882,7 +1985,6 @@ function installSessionTracker(pi: ExtensionAPI) {
     // registries. Clear unconditionally, before any early return.
     for (const t of timers) clearInterval(t);
     timers.clear();
-    clearApprovals();
     if (!isInteractive(ctx)) return;
     // Do not touch the file if a handoff transferred this id to another
     // process; that file is now theirs, not ours.

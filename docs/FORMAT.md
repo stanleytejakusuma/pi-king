@@ -171,5 +171,10 @@ toward lifetime figures after its logs are gone, because it was measured while
 they existed. A cached day missing fields whose logs are gone can never be
 completed and is kept in the file but excluded from the series.
 
+Pins and manual ordering live in `~/.pi/king/layout.json` (`{ pinned: [id],
+order: [id] }`), NOT in the status files. A status file is written by that
+session's own process; the dashboard writing into one would put two processes
+on a single file. Ordering is a view preference and belongs to the viewer.
+
 Cost is deliberately not reported. The logs carry no price data, and a hardcoded
 price table would silently rot into wrong numbers.

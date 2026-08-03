@@ -252,6 +252,15 @@ usage** (`ctx 72%`, colour turning as compaction approaches) and each project
 header shows **uncommitted-change counts**, because a returning user's second
 question after "what did it do" is "did it leave work uncommitted".
 
+`Ctrl+T` pins the selected session: pinned sessions leave their directory group
+and sit in one section at the top, keeping their project name on the row.
+`Shift+Up` / `Shift+Down` moves a session within its own section — its project
+group, or the pinned section. A row will not cross a boundary, because doing so
+would silently change what it means; pinning is what moves a session between
+sections. Both are remembered in `~/.pi/king/layout.json` and survive restarts.
+The dashboard owns that file: pins are a view preference, and writing them into
+the session status files would put two processes on one file.
+
 Sessions are never deleted by the dashboard. A session whose process has ended
 shows as **exited**, and enter resumes its transcript in place, in its
 directory. `X` on an exited card removes the card alone; the transcript is Pi's
