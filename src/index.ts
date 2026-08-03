@@ -54,7 +54,7 @@ type Theme = {
   fg(colour: string, text: string): string;
   bold(text: string): string;
 };
-import { Input, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Input, isKeyRelease, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 
@@ -1747,6 +1747,12 @@ function installSessionTracker(pi: ExtensionAPI) {
    * alongside the freshly loaded instance. */
   const timers = new Set<ReturnType<typeof setInterval>>();
   const subagents = new Map<string, SubagentStatus>();
+  /** Unsubscribes the left-arrow → detach listener registered in session_start.
+   * Cleared in session_shutdown alongside timers, for the same reason: /reload
+   * rebuilds the ExtensionRunner but does not unwind hooks registered outside
+   * its own registries, so a stale listener would survive as a zombie
+   * alongside the freshly loaded instance and fire twice. */
+  let unsubscribeLeftArrow: (() => void) | undefined;
   /** The prompt that started the current turn, kept so settling can say what
    * finished instead of erasing it with a generic "Waiting for input.". */
   let lastPrompt = "";
@@ -1879,6 +1885,47 @@ function installSessionTracker(pi: ExtensionAPI) {
           );
         }
       } catch { /* no file, unreadable, or first run: nothing to warn about */ }
+
+    // Left-arrow at an empty prompt detaches this pane's tmux client — a
+    // second, gated route back to the dashboard alongside Cmd+Esc, replacing
+    // the tmux-level F12 binding this project used to ship (~/.tmux.conf).
+    //
+    // F12 worked because tmux's `-n` (no-prefix) binding fires unconditionally
+    // on every keypress in every pane, and function keys are never claimed by
+    // an interactive program, so nothing was ever lost by taking F12 away from
+    // the terminal. A bare arrow key has no such guarantee: it is the single
+    // most commonly used key in any text-editing context, including this very
+    // composer. Binding it at the tmux level, unconditionally, would swallow
+    // every left-arrow keystroke in the pane forever — cursor movement inside
+    // Pi's own prompt, inside vim, inside shell line-editing, everywhere.
+    //
+    // So this is NOT a tmux binding. It is registered here, inside the running
+    // Pi session, gated on `getEditorText() === ""` exactly like pi-subagents'
+    // own fleet-list activator (verified by reading its source) — the same
+    // pattern that already proves this is safe: outside an empty prompt the
+    // handler declines and the key reaches the editor untouched.
+    //
+    // Trade-off, stated rather than hidden: unlike F12, this only exists while
+    // a Pi session with this extension loaded is actually running and idle in
+    // the pane. Drop to a bare shell in that same pane (exit Pi, or a
+    // subprocess is running) and there is no quick detach left except tmux's
+    // own default `prefix d`. F12 covered that case; this does not.
+    if (unsubscribeLeftArrow) { unsubscribeLeftArrow(); unsubscribeLeftArrow = undefined; }
+    unsubscribeLeftArrow = ctx.ui.onTerminalInput((data) => {
+      // The kitty keyboard protocol reports both press and release for the
+      // same physical keystroke; matchesKey matches either, so acting on both
+      // would detach twice per press. Act on press only.
+      if (isKeyRelease(data)) return undefined;
+      if (!matchesKey(data, "left")) return undefined;
+      if (ctx.ui.getEditorText() !== "") return undefined;
+      if (!process.env.TMUX) return undefined;
+      // No explicit target: tmux resolves "the current client" from this
+      // process's own $TMUX context, exactly as running `tmux detach-client`
+      // by hand inside this same pane would — the identical effect F12 had,
+      // just reached through a gated key instead of an unconditional one.
+      spawnSync(TMUX, ["detach-client"], { encoding: "utf8", timeout: 3000 });
+      return { consume: true };
+    });
 
     // Retry briefly: on a resumed session the session file may not resolve on
     // the first tick, and an idle session produces no further events to
@@ -2042,6 +2089,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     // registries. Clear unconditionally, before any early return.
     for (const t of timers) clearInterval(t);
     timers.clear();
+    if (unsubscribeLeftArrow) { unsubscribeLeftArrow(); unsubscribeLeftArrow = undefined; }
     if (!isInteractive(ctx)) return;
     // Do not touch the file if a handoff transferred this id to another
     // process; that file is now theirs, not ours.
