@@ -1884,24 +1884,30 @@ function installSessionTracker(pi: ExtensionAPI) {
     state = "idle"; activity = "Session started."; startedAt = PROCESS_STARTED_AT;
     hadRun = false; bgQueued = false; subagents.clear();
     visible = process.env.PI_DASHBOARD_SPAWNED === "1";
-    // Collision guard — and it MUST run before the first persist(). It reads
-    // this session id's card to see whether another live process already
-    // claims it; persist() writes our own pid into that same card, so with
-    // the old order the guard read back its own just-written pid and
-    // concluded "no collision", every time, since the day it shipped. It was
-    // dead on arrival and the one incident it existed for (a dashboard resume
-    // duplicating a live session) sailed straight past it.
+    // One read of our own card serves two purposes, and it MUST happen before
+    // the first persist() — persist() stamps our own pid into that card, so
+    // reading afterwards can only ever see ourselves. (The collision guard
+    // shipped with the order reversed and was dead on arrival: the one
+    // incident it existed for sailed straight past it.)
     //
-    // pi-king is what makes this reachable: a session can be alive, headless,
-    // for days, and a resume against its id puts a second process on one
-    // transcript, both appending, the damage silent. The extension loads
-    // inside the duplicate too, so it can catch itself.
+    // Purpose one, collision: if another LIVE process claims this session id,
+    // a resume is about to put two processes on one transcript — say so.
+    //
+    // Purpose two, continuity: if the card is OURS — same pid, meaning this
+    // start is a /reload or a same-process session switch, not a fresh launch
+    // — the card is the durable state and this handler's defaults above are
+    // amnesia. Restoring visible closes a real hole: /bg sets visible=true at
+    // runtime, but the env var this handler consults reflects only how the
+    // process was LAUNCHED, so a reload used to silently drop a /bg'd session
+    // off the dashboard. State and activity are restored for the same reason
+    // at lower stakes: a session that was attention/'Done: fix the parser'
+    // should not greet a returning user as 'idle/Session started.'.
     try {
-      // Read our own status file directly rather than the dashboard listing,
-      // which filters to sessions marked visible and would miss a duplicate.
+      // Read the file directly rather than the dashboard listing, which
+      // filters to sessions marked visible and would miss a duplicate.
       const myId = ctx.sessionManager.getSessionId();
-      const claimed = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${myId}.json`), "utf8")) as SessionStatusFile;
-      const owner = Number(claimed.pid) || 0;
+      const card = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${myId}.json`), "utf8")) as SessionStatusFile;
+      const owner = Number(card.pid) || 0;
       if (owner && owner !== process.pid && livePiPids()?.has(owner)) {
         ctx.ui.notify(
           `Session ${myId.slice(0, 8)} is already running as pid ${owner}. ` +
@@ -1909,6 +1915,16 @@ function installSessionTracker(pi: ExtensionAPI) {
           `Attach to the existing one rather than continuing here.`,
           "error",
         );
+      } else if (owner === process.pid) {
+        visible = Boolean(card.visible);
+        // Skip death-flavoured activity text: a reload out of an OLD build
+        // arrives here with the card already stamped "Ended. Last: …" by that
+        // build's shutdown handler, and restoring it verbatim would caption a
+        // live session with its own obituary.
+        if (typeof card.activity === "string" && card.activity && !card.activity.startsWith("Ended.")) activity = card.activity;
+        // exited maps back to idle: we are demonstrably alive. Unknown or
+        // retired states fall back to idle rather than being trusted.
+        if (isKnownState(card.status) && card.status !== "exited") state = card.status;
       }
     } catch { /* no file, unreadable, or first run: nothing to warn about */ }
     persist(ctx);
@@ -2124,7 +2140,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     // Deferred /bg: run it now that nothing is in flight.
     if (bgQueued) { bgQueued = false; void runBackgroundHandoff(ctx); }
   });
-  pi.on("session_shutdown", (_e, ctx) => {
+  pi.on("session_shutdown", (e, ctx) => {
     // Fires for reason "reload" as well as a real exit — which is precisely
     // when orphaned timers would otherwise accumulate, since Pi builds a new
     // ExtensionRunner and never unwinds side effects made outside its own
@@ -2132,6 +2148,16 @@ function installSessionTracker(pi: ExtensionAPI) {
     for (const t of timers) clearInterval(t);
     timers.clear();
     if (unsubscribeLeftArrow) { unsubscribeLeftArrow(); unsubscribeLeftArrow = undefined; }
+    // A reload is not a death. The process survives, the session id stays
+    // served, and the new runner's session_start re-persists within the same
+    // second — but between the old runner's "exited" stamp and that rewrite
+    // there was a window in which the dashboard read a live session as a
+    // corpse. Tonight's duplicate-process incident walked in through exactly
+    // that window. On reload, leave the card precisely as it is: cleanup
+    // above, nothing else. Every other reason (quit, new, resume, fork) means
+    // this process genuinely stops serving the transcript, and the exited
+    // stamp below is the truth.
+    if (e.reason === "reload") return;
     if (!isInteractive(ctx)) return;
     // Do not touch the file if a handoff transferred this id to another
     // process; that file is now theirs, not ours.
