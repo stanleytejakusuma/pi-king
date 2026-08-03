@@ -787,6 +787,13 @@ class DashboardView implements Component {
     }, REFRESH_MS);
   }
 
+  /** Terminal rows, fed in by the overlay each render cycle. Zero means "not
+   * known yet", which renders everything unwindowed — the previous behaviour. */
+  private termHeight = 0;
+  setTermHeight(h: number): void {
+    if (Number.isFinite(h) && h > 0) this.termHeight = h;
+  }
+
   private refresh(): void {
     this.rows = buildRows();
     flushPendingRenames(this.rows);
@@ -1070,6 +1077,10 @@ class DashboardView implements Component {
     }
     lines.push("");
 
+    // Everything above this point is decoration. It is the first thing shed
+    // when the terminal is too short to hold the whole layout.
+    const artLines = lines.length;
+
     // ---- ticker + quote -------------------------------------------------
     // Budget: the row is "  " + ticker ... clock + "  ", so the ticker may use
     // everything except the clock, the two-space margins and a separating gap.
@@ -1201,15 +1212,23 @@ class DashboardView implements Component {
     }
 
     // ---- sessions, grouped by directory ---------------------------------
+    // From here to the inventory, lines go into `body`: this is the only zone
+    // allowed to scroll. Everything above is pinned context and everything
+    // below is the key map, which is useless if a long list pushes it off the
+    // screen — which it did, at 21 sessions.
+    const body: string[] = [];
+    /** Index in `body` of the currently selected row, so the window can be
+     * centred on it rather than on the top of the list. */
+    let selectedLine = 0;
     if (this.rows.length === 0) {
-      lines.push("  " + th.fg("dim", "No backgrounded sessions. Press ") + th.fg("muted", "n") +
+      body.push("  " + th.fg("dim", "No backgrounded sessions. Press ") + th.fg("muted", "n") +
         th.fg("dim", " to start one, or run ") + th.fg("muted", "/bg") + th.fg("dim", " inside a session to surface it here."));
       if (this.recent.length > 0) {
-        lines.push("");
-        lines.push("  " + th.fg("success", "recent projects"));
+        body.push("");
+        body.push("  " + th.fg("success", "recent projects"));
         for (const p of this.recent) {
           const parent = p.path.slice(0, Math.max(0, p.path.length - p.project.length)).replace(process.env.HOME ?? "~", "~");
-          lines.push(split("     " + th.fg("dim", parent) + th.fg("accent", p.project), th.fg("dim", `${elapsed(p.lastActive)} ago`) + "  "));
+          body.push(split("     " + th.fg("dim", parent) + th.fg("accent", p.project), th.fg("dim", `${elapsed(p.lastActive)} ago`) + "  "));
         }
       }
     } else {
@@ -1221,19 +1240,20 @@ class DashboardView implements Component {
       this.rows.forEach((r, i) => {
         const group = r.kind === "orphan" ? "tmux (no Pi session)" : r.entry.cwd.replace(process.env.HOME ?? "~", "~");
         if (group !== lastGroup) {
-          if (lastGroup !== undefined) lines.push("");
+          if (lastGroup !== undefined) body.push("");
           const drift = r.kind === "session" ? this.gitDrift.get(r.entry.cwd) : undefined;
           const driftBadge = drift && drift.n > 0
             ? th.fg("warning", `  \u25cf ${drift.n} uncommitted`)
             : "";
-          lines.push("  " + th.fg("muted", group) + driftBadge);
+          body.push("  " + th.fg("muted", group) + driftBadge);
           lastGroup = group;
         }
         const sel = i === this.selected;
+        if (sel) selectedLine = body.length;
         const marker = sel ? th.fg("accent", "\u276f") : " ";
         if (r.kind === "orphan") {
           const nm = pad(truncateToWidth(r.tmux.name, nameW, "\u2026", true), nameW);
-          lines.push(split(`  ${marker} ${th.fg("accent", "\u26fa")} ${sel ? th.bold(nm) : nm} ` +
+          body.push(split(`  ${marker} ${th.fg("accent", "\u26fa")} ${sel ? th.bold(nm) : nm} ` +
             pad(th.fg("dim", "external"), statusW) + th.fg("muted", "attach or delete only"),
             th.fg("dim", elapsed(r.tmux.createdAt)) + "  "));
           return;
@@ -1257,37 +1277,77 @@ class DashboardView implements Component {
         const left = `  ${marker} ${e.tmuxName ? th.fg("accent", "\u26fa") : th.fg("dim", "\u233f")} ` +
           (sel ? th.bold(nm) : nm) + " " + status +
           th.fg("muted", truncateToWidth(e.lastActivity, Math.max(10, MEASURE - nameW - statusW - visibleWidth(right) - 12), "\u2026", true));
-        lines.push(split(left, right));
+        body.push(split(left, right));
       });
     }
 
     // ---- inventory ------------------------------------------------------
+    // Foot zone, in two parts: the inventory is reference material and is
+    // droppable; the key map is not. A dashboard whose keys have scrolled off
+    // is a dashboard you cannot operate, which is what 21 sessions produced.
+    const inventory: string[] = [];
     if (this.inventory) {
-      lines.push("");
-      for (const l of this.renderInventoryCards(MEASURE - 4)) lines.push("  " + l);
+      inventory.push("");
+      for (const l of this.renderInventoryCards(MEASURE - 4)) inventory.push("  " + l);
     }
 
     // ---- composer / message / keys --------------------------------------
-    lines.push("");
+    const foot: string[] = [];
+    foot.push("");
     if (this.composer) {
       const label = this.composerStep?.kind === "new-name" ? "New session name:"
         : this.composerStep?.kind === "new-dir" ? "Directory:" : "Rename to:";
-      lines.push("  " + th.fg("accent", label) + " " + (this.composer.input.render(Math.max(10, MEASURE - visibleWidth(label) - 6))[0] ?? ""));
-      lines.push("  " + th.fg("dim", "Enter confirm \u00b7 Esc cancel"));
+      foot.push("  " + th.fg("accent", label) + " " + (this.composer.input.render(Math.max(10, MEASURE - visibleWidth(label) - 6))[0] ?? ""));
+      foot.push("  " + th.fg("dim", "Enter confirm \u00b7 Esc cancel"));
     } else if (this.message) {
-      lines.push("  " + th.fg("accent", this.message));
+      foot.push("  " + th.fg("accent", this.message));
     } else {
       const k = (s: string) => th.fg("muted", s);
       const l = (s: string) => th.fg("dim", s);
       const sel = this.rows[this.selected];
       const verb = sel?.kind === "session" && sel.entry.state === "exited" ? "resume"
         : !sel || this.rowTmuxName(sel) ? "attach" : "jump";
-      lines.push("  " +
+      foot.push("  " +
         `${k("\u2191\u2193")}${l(" select ")}${k("enter")}${l(` ${verb}`)}` + l("   \u2502   ") +
         `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${k("x")}${l(" detach ")}${th.fg("error", "X")}${l(" kill")}` + l("   \u2502   ") + `${k("s")}${l(" stats")}` + l("   \u2502   ") +
         `${k("r")}${l(" refresh ")}${k("esc")}${l(" close")}`);
     }
-    return lines;
+
+    // ---- assemble: pinned head, scrolling body, pinned foot -------------
+    // Without a known terminal height there is nothing to fit to, so render
+    // everything and let the terminal behave as it did before. Degrading to
+    // the old behaviour is correct; guessing a height would clip real rows.
+    const H = this.termHeight;
+    if (H <= 0) return [...lines, ...body, ...inventory, ...foot];
+
+    // Shed in priority order until the sessions have room to be useful. The
+    // key map is never shed; the sessions never drop below MIN_BODY, because a
+    // list showing one row is not a list.
+    const MIN_BODY = 3;
+    let head = lines;
+    let inv = inventory;
+    const fits = () => H - head.length - inv.length - foot.length >= MIN_BODY;
+    if (!fits()) inv = [];                       // reference material goes first
+    if (!fits()) head = lines.slice(artLines);   // then the wordmark art
+    const budget = Math.max(MIN_BODY, H - head.length - inv.length - foot.length);
+    if (body.length <= budget) return [...head, ...body, ...inv, ...foot];
+
+    // Two rows of the budget go to the more-above/more-below markers, so the
+    // list never continues past an edge without saying so.
+    const window = Math.max(MIN_BODY, budget - 2);
+    let start = Math.max(0, selectedLine - Math.floor(window / 2));
+    start = Math.min(start, body.length - window);
+    const above = start;
+    const below = body.length - (start + window);
+    const marker = (n: number, arrow: string) => "  " + th.fg("dim", `${arrow} ${n} more`);
+    return [
+      ...head,
+      above > 0 ? marker(above, "\u2191") : "",
+      ...body.slice(start, start + window),
+      below > 0 ? marker(below, "\u2193") : "",
+      ...inv,
+      ...foot,
+    ];
   }
 
   /** Lays inventory categories out as bordered, content-sized cards.
@@ -1378,11 +1438,26 @@ class BlankEditor extends CustomEditor {
 }
 
 async function showDashboardOnce(ctx: ExtensionContext): Promise<HubAction | undefined> {
+  // render(width) is given a width and no height, so the view cannot fit
+  // itself to the terminal on its own. `visible` is the one hook called every
+  // render cycle WITH both dimensions: capture the height there and always
+  // return true. Reading process.stdout.rows instead would miss resizes on a
+  // multiplexed or piped stdout, and this number is the one the layout engine
+  // is itself using.
+  let view: DashboardView | undefined;
   return ctx.ui.custom<HubAction | undefined>(
-    (tui, theme, _keybindings, done) => new DashboardView(tui, theme, done, ctx.sessionManager.getSessionId(), ctx.cwd),
+    (tui, theme, _keybindings, done) => {
+      view = new DashboardView(tui, theme, done, ctx.sessionManager.getSessionId(), ctx.cwd);
+      return view;
+    },
     {
       overlay: true,
-      overlayOptions: { anchor: "top-center", width: "100%", maxHeight: "100%" },
+      overlayOptions: {
+        anchor: "top-center",
+        width: "100%",
+        maxHeight: "100%",
+        visible: (_w, h) => { view?.setTermHeight(h); return true; },
+      },
     },
   );
 }
