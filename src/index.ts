@@ -545,7 +545,11 @@ function flushPendingRenames(rows: Row[]): void {
   for (const [tmuxName, desired] of [...pendingRenames]) {
     const row = rows.find((r) => r.kind === "session" && r.entry.tmuxName === tmuxName);
     if (!row || row.kind !== "session") continue;
-    if (row.entry.state !== "idle") continue;
+    // background counts as settled: the main agent is at its prompt, only
+    // subagents still run, and send-keys lands in an empty composer exactly as
+    // it would on idle. Excluding it left renames queued indefinitely on
+    // sessions that went background and then attention.
+    if (row.entry.state !== "idle" && row.entry.state !== "background") continue;
     spawnSync(TMUX, ["send-keys", "-t", tmuxName, `/name ${clean(desired)}`, "Enter"], { encoding: "utf8", timeout: 3000 });
     pendingRenames.delete(tmuxName);
   }
@@ -558,10 +562,12 @@ function renameTmuxSession(oldName: string, newName: string, piIsIdle: boolean):
   // Also rename the Pi session living inside it, via Pi's own /name command,
   // so both halves agree and the rename is not half-applied.
   //
-  // Only when that session is idle: send-keys types into the live pane, and
-  // injecting text mid-turn would land in an in-flight prompt. A tmux-only
-  // rename still displays correctly (the row prefers the tmux name), so
-  // skipping this is a cosmetic mismatch inside Pi, not a broken row.
+  // Only when that session is settled at its prompt: send-keys types into the
+  // live pane, and injecting text mid-turn would land in an in-flight prompt.
+  // If skipped, the queued rename applies once the session settles — and until
+  // then the row shows the STALE Pi name, because the label now prefers the
+  // session's own name over the tmux one (a /name typed inside a session must
+  // win). Queueing, not skipping, is what keeps the two halves converging.
   if (piIsIdle) {
     spawnSync(TMUX, ["send-keys", "-t", newName, `/name ${clean(newName)}`, "Enter"], { encoding: "utf8", timeout: 3000 });
     return { ok: true, message: `Renamed to "${newName}".` };
@@ -1055,7 +1061,7 @@ class DashboardView implements Component {
         this.showMessage("That session has no tmux name to rename.");
         return;
       }
-      const idle = step.row.kind === "session" && step.row.entry.state === "idle";
+      const idle = step.row.kind === "session" && (step.row.entry.state === "idle" || step.row.entry.state === "background");
       const result = renameTmuxSession(tmuxName, value, idle);
       this.showMessage(result.message);
       this.refresh();
@@ -1153,6 +1159,13 @@ class DashboardView implements Component {
           this.deleteArmedFor = undefined;
           try {
             unlinkSync(join(SESSION_STATUS_DIR, `${id}.json`));
+            // The card is the only thing a pin or manual position refers to;
+            // once it is gone, the layout entry is a dangling id that would
+            // otherwise accumulate forever.
+            const l = readLayout();
+            if (l.pinned.includes(id) || l.order.includes(id)) {
+              writeLayout({ pinned: l.pinned.filter((x) => x !== id), order: l.order.filter((x) => x !== id) });
+            }
             this.showMessage(`Card removed. The transcript is untouched: pi --session ${id}`);
           } catch {
             this.showMessage("Could not remove the card.");
@@ -1666,6 +1679,27 @@ class BlankEditor extends CustomEditor {
 }
 
 async function showDashboardOnce(ctx: ExtensionContext): Promise<HubAction | undefined> {
+  // The tracker's left-arrow-detach listener stands down while the overlay
+  // owns the keyboard (see dashboardOpen at module scope). try/finally rather
+  // than an event bus: both sides live in this module, a reload re-evaluates
+  // it with the flag correctly false, and there is no listener to leak.
+  dashboardOpen = true;
+  try {
+    return await showDashboardInner(ctx);
+  } finally {
+    dashboardOpen = false;
+  }
+}
+
+/** True while this process's own dashboard overlay is open. Raw input
+ * listeners run BEFORE overlay/focus routing in pi-tui, and the editor under
+ * an overlay is empty by construction — so without this gate, pressing
+ * left-arrow while browsing dashboard rows sailed through the empty-prompt
+ * check and silently detached the client out from under the dashboard the
+ * user was looking at. */
+let dashboardOpen = false;
+
+async function showDashboardInner(ctx: ExtensionContext): Promise<HubAction | undefined> {
   // render(width) is given a width and no height, so the view cannot fit
   // itself to the terminal on its own. `visible` is the one hook called every
   // render cycle WITH both dimensions: capture the height there and always
@@ -1928,9 +1962,11 @@ function installSessionTracker(pi: ExtensionAPI) {
         // build's shutdown handler, and restoring it verbatim would caption a
         // live session with its own obituary.
         if (typeof card.activity === "string" && card.activity && !card.activity.startsWith("Ended.")) activity = card.activity;
-        // exited maps back to idle: we are demonstrably alive. Unknown or
-        // retired states fall back to idle rather than being trusted.
-        if (isKnownState(card.status) && card.status !== "exited") state = card.status;
+        // exited maps back to idle: we are demonstrably alive. Retired states
+        // go through the same translation table the dashboard applies to every
+        // other card — restoring is just another read.
+        const restored = RETIRED_STATES[card.status] ?? card.status;
+        if (isKnownState(restored) && restored !== "exited") state = restored;
         // The subagent roster survives the reload too: the in-memory map is
         // fresh, but the card carries the same records this module wrote a
         // moment ago. Without this, a session reloaded mid-subagent showed
@@ -1987,6 +2023,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       // would detach twice per press. Act on press only.
       if (isKeyRelease(data)) return undefined;
       if (!matchesKey(data, "left")) return undefined;
+      if (dashboardOpen) return undefined;
       if (ctx.ui.getEditorText() !== "") return undefined;
       if (!process.env.TMUX) return undefined;
       // No explicit target: tmux resolves "the current client" from this

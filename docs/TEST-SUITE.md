@@ -63,7 +63,7 @@ Reply with exactly this and nothing else: ALPHA-MARKER-7391
 tmux `extended-keys-format` has regressed from `csi-u`.
 
 ### B3. Detach
-`Cmd+Esc` (or `F12`, or `Ctrl+B d`).
+`Cmd+Esc` (or left-arrow at an empty prompt, or `Ctrl+B d`).
 **PASS:** Dashboard returns. Row under the launch directory, name `t-alpha`,
 `⛺` icon, state `idle`.
 

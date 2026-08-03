@@ -248,6 +248,11 @@ happened while you were gone.
   use `osascript`; no dependency is added, and on other platforms they are
   simply absent.
 
+Inside a tmux-hosted session, **left-arrow at an empty prompt** detaches back
+to the dashboard — gated exactly like a fleet-list activator, so it never
+touches cursor movement while you are typing. `Ctrl+B d` still works
+everywhere, unconditionally.
+
 Idle rows show the session's **last reply** — the closing line of its most
 recent answer, read from the transcript itself, so it works even for sessions
 started before pi-king was installed. Each row also carries its **context
