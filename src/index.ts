@@ -575,34 +575,44 @@ function clockLine(): string {
 /** One-line usage ticker, colour-coded by meaning rather than decoration:
  * error rate takes its colour from a threshold (so a bad number is visible
  * without reading it), and the top three models get descending emphasis so
- * rank is legible at a glance. Renders nothing when no calls were logged
- * today — "0 calls" would falsely imply measured inactivity. */
+ * rank is legible at a glance. An empty today says so in words and still
+ * shows the history — a fresh morning used to blank the whole band, hiding a
+ * week of figures that exist regardless of whether today has started. "0
+ * calls" is still never printed: absence of logs is not a measurement. */
 function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[], loaded: boolean, budget = Infinity): string | undefined {
   if (!loaded) return th.fg("dim", "\u2026");
-  if (!stats) return undefined;
-  const rate = stats.calls > 0 ? (stats.errors / stats.calls) * 100 : 0;
-  // Thresholds: <2% routine, <5% worth noticing, above that is a problem.
-  const rateColor = rate < 2 ? "success" : rate < 5 ? "warning" : "error";
-  const spark = sparkline(stats.hourly);
+  if (!stats && daily.length < 3) return undefined;
   const modelColors = ["accent", "success", "muted"] as const;
-  const cacheShare = stats.tokensIn > 0 ? Math.round((stats.tokensCacheRead / stats.tokensIn) * 100) : 0;
-  const p95 = stats.durations.length > 0
-    ? stats.durations[Math.min(stats.durations.length - 1, Math.floor(stats.durations.length * 0.95))]
-    : 0;
 
-  const segs: string[] = [
-    th.fg("accent", th.bold(stats.calls.toLocaleString())) + th.fg("dim", " calls today"),
-    th.fg(rateColor, `${stats.errors} err`) + th.fg("dim", ` (${rate.toFixed(1)}%)`),
-  ];
-  // A sparkline over a handful of calls is noise shaped like a chart; below a
-  // floor it says less than the number it sits next to, so it is omitted.
-  if (spark && stats.calls >= 50 && stats.hourly.length >= 4) {
-    segs.push(th.fg("accent", spark) + th.fg("dim", ` peak ${stats.peakHour}/h`));
+  const segs: string[] = [];
+  if (!stats) segs.push(th.fg("dim", "no calls yet today"));
+  if (stats) {
+    const rate = stats.calls > 0 ? (stats.errors / stats.calls) * 100 : 0;
+    // Thresholds: <2% routine, <5% worth noticing, above that is a problem.
+    const rateColor = rate < 2 ? "success" : rate < 5 ? "warning" : "error";
+    const spark = sparkline(stats.hourly);
+    segs.push(
+      th.fg("accent", th.bold(stats.calls.toLocaleString())) + th.fg("dim", " calls today"),
+      th.fg(rateColor, `${stats.errors} err`) + th.fg("dim", ` (${rate.toFixed(1)}%)`),
+    );
+    // The rest of the band is day-cumulative, which reads the same at a busy
+    // noon and a dead midnight. The trailing hour is the "now" signal. A zero
+    // here is a measurement — the whole day's logs were scanned and none fell
+    // in the window — so quiet is stated, not hidden.
+    segs.push(stats.lastHour.calls > 0
+      ? th.fg("dim", "1h ") + th.fg("accent", String(stats.lastHour.calls)) +
+        th.fg("dim", " calls \u00b7 ") + th.fg("accent", compactNum(stats.lastHour.tokensIn)) + th.fg("dim", " in")
+      : th.fg("dim", "1h quiet"));
+    // A sparkline over a handful of calls is noise shaped like a chart; below a
+    // floor it says less than the number it sits next to, so it is omitted.
+    if (spark && stats.calls >= 50 && stats.hourly.length >= 4) {
+      segs.push(th.fg("accent", spark) + th.fg("dim", ` peak ${stats.peakHour}/h`));
+    }
   }
   // Order matters: shedding drops from the end, so these sit ahead of the model
   // mix. Token volume and cache share survive a narrow terminal; which model
   // served them is the first thing worth losing.
-  if (stats.tokensIn > 0 || stats.tokensOut > 0) {
+  if (stats && (stats.tokensIn > 0 || stats.tokensOut > 0)) {
     // out/in: rising share means the agents are generating more than they are
     // reading, which is the difference between writing code and combing through
     // a repository. Both numbers are already here; the ratio is what is read.
@@ -619,44 +629,49 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
       th.fg("dim", ` (${outShare < 1 ? outShare.toFixed(1) : Math.round(outShare)}% out)`),
     );
   }
-  if (stats.tokensCacheRead > 0) {
+  if (stats && stats.tokensCacheRead > 0) {
+    const cacheShare = stats.tokensIn > 0 ? Math.round((stats.tokensCacheRead / stats.tokensIn) * 100) : 0;
     // Cache share is why a large input count can still be cheap, so it gets the
     // same threshold colouring as the error rate: good reads green.
     const cacheColor = cacheShare >= 80 ? "success" : cacheShare >= 50 ? "warning" : "muted";
     segs.push(th.fg(cacheColor, `${cacheShare}%`) + th.fg("dim", " cached"));
   }
+  const p95 = stats && stats.durations.length > 0
+    ? stats.durations[Math.min(stats.durations.length - 1, Math.floor(stats.durations.length * 0.95))]
+    : 0;
   if (p95 > 0) {
     // The mean hides the tail, and the tail is what someone waiting on a session
     // actually experiences.
     segs.push(th.fg("dim", "p95 ") + th.fg(p95 > 30_000 ? "warning" : "accent", `${(p95 / 1000).toFixed(1)}s`));
   }
-  // Daily input-token history. Today is the last bar and is dimmed, because it
-  // is a partial day: comparing a half-finished day against completed ones is a
-  // false signal, so it is shown but visually set apart rather than ranked.
+  // Daily input-token history. When today has data it is the last bar and is
+  // dimmed — a partial day ranked against completed ones is a false signal.
+  // When today is empty it is absent from the series, so every bar is a
+  // completed day and none is set apart.
   if (daily.length >= 3) {
     const bars = sparkline(daily.map((d) => d.tokensIn));
     if (bars) {
-      segs.push(th.fg("dim", `${daily.length}d `) +
-        th.fg("accent", bars.slice(0, -1)) + th.fg("muted", bars.slice(-1)));
+      segs.push(th.fg("dim", `${daily.length}d `) + (stats
+        ? th.fg("accent", bars.slice(0, -1)) + th.fg("muted", bars.slice(-1))
+        : th.fg("accent", bars)));
     }
-    // Mean over COMPLETED days only. Including today drags the average down by
-    // however much of the day is left, which would make the number wrong rather
-    // than merely coarse.
-    const done = daily.slice(0, -1);
+    // Mean over COMPLETED days only. Including a partial today drags the
+    // average down by however much of the day is left.
+    const done = stats ? daily.slice(0, -1) : daily;
     if (done.length >= 2) {
       const mean = done.reduce((sum, d) => sum + d.tokensIn, 0) / done.length;
       segs.push(th.fg("dim", "avg ") + th.fg("accent", compactNum(Math.round(mean))) + th.fg("dim", "/day"));
     }
   }
-  if (stats.peakPeriod) {
+  if (stats?.peakPeriod) {
     segs.push(th.fg("dim", "busiest ") + th.fg("accent", stats.peakPeriod.label) +
       th.fg("dim", ` ${stats.peakPeriod.pct}%`));
   }
   // Only the leader. The runner-up's share does not change what anyone does
   // next, and it was the first thing shed on a narrow terminal anyway.
-  const lead = stats.topModels[0];
+  const lead = stats?.topModels[0];
   if (lead) segs.push(th.fg(modelColors[0], lead.model) + th.fg("dim", ` ${lead.pct}%`));
-  if (stats.partial) segs.push(th.fg("warning", "(partial)"));
+  if (stats?.partial) segs.push(th.fg("warning", "(partial)"));
   // The band shares its row with a right-flushed clock. If the segments overrun
   // the space left for it, the clock is pushed past the terminal edge and
   // silently truncated, so shed the least important segments (trailing models
@@ -1015,6 +1030,19 @@ class DashboardView implements Component {
           ["net tokens", compactNum(netTokens(life.tokensIn, life.tokensCacheRead))],
           ["cache reads", `${compactNum(life.tokensCacheRead)} (${life.tokensIn > 0 ? Math.round((life.tokensCacheRead / life.tokensIn) * 100) : 0}%)`],
         ];
+        // Biggest and median day, from the same per-day rows the heatmap uses.
+        // The mean is skipped deliberately: these days span a seventy-fold
+        // range, and a mean over that distribution describes no actual day.
+        const activeDays = life.days.filter((d) => d.calls > 0);
+        if (activeDays.length >= 2) {
+          const byVolume = [...activeDays].sort((a, b) => a.tokensIn - b.tokensIn);
+          const biggest = byVolume[byVolume.length - 1];
+          const median = byVolume[Math.floor(byVolume.length / 2)];
+          pairs.push(
+            ["biggest day", `${compactNum(biggest.tokensIn)} (${biggest.day})`],
+            ["median day", compactNum(median.tokensIn)],
+          );
+        }
         for (let i = 0; i < pairs.length; i += 2) {
           const a = cell(pairs[i][0], pairs[i][1]);
           const b = pairs[i + 1] ? cell(pairs[i + 1][0], pairs[i + 1][1]) : "";

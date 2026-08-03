@@ -171,6 +171,11 @@ export type UsageStats = {
   hourly: number[];
   peakHour: number;
   partial: boolean;
+  /** Activity in the trailing 60 minutes: the band's other numbers are
+   * day-cumulative, which reads the same at a busy noon and a dead midnight.
+   * Window is clipped to today's log directory, so just after midnight it may
+   * miss calls from late yesterday — clipped, never padded. */
+  lastHour: { calls: number; tokensIn: number };
 };
 
 function today(): string {
@@ -400,6 +405,8 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
   let tokensCacheRead = 0;
   const durations: number[] = [];
   let partial = false;
+  let lastHourCalls = 0;
+  let lastHourTokensIn = 0;
 
   // Bounded concurrency: unbounded Promise.all over thousands of files spikes
   // file descriptors for no throughput gain.
@@ -438,8 +445,13 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
       // and convert so the sparkline and the clock describe the same day.
       const ts = typeof s.timestamp === "string" ? s.timestamp : "";
       if (ts.length >= 13) {
-        const h = new Date(ts).getHours();
+        const t = new Date(ts);
+        const h = t.getHours();
         if (Number.isFinite(h)) byHour.set(h, (byHour.get(h) ?? 0) + 1);
+        if (Date.now() - t.getTime() <= 3_600_000) {
+          lastHourCalls++;
+          lastHourTokensIn += tk ? Number(tk.in) || 0 : 0;
+        }
       }
     }
   }
@@ -472,7 +484,7 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
   }
 
   durations.sort((a, b) => a - b);
-  return { calls, errors, tokensIn, tokensOut, tokensCacheRead, peakPeriod, durations, topModels, hourly, peakHour: Math.max(0, ...hourly), partial };
+  return { calls, errors, tokensIn, tokensOut, tokensCacheRead, peakPeriod, durations, topModels, hourly, peakHour: Math.max(0, ...hourly), partial, lastHour: { calls: lastHourCalls, tokensIn: lastHourTokensIn } };
 }
 
 /**

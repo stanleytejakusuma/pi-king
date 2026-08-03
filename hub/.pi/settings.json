@@ -1,3 +1,8 @@
 {
-  "quietStartup": true
+  "quietStartup": true,
+  "enabledModels": [
+    "anthropic/*"
+  ],
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-4-5"
 }

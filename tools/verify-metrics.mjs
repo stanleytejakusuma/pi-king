@@ -33,6 +33,10 @@ chk("today's cacheRead subset of in", s.tokensCacheRead <= s.tokensIn, `${s.toke
 chk("today's net = in - cacheRead", netToday === s.tokensIn - s.tokensCacheRead, `${netToday}`);
 chk("today's net <= in", netToday <= s.tokensIn);
 
+// 3c. last-hour window is a subset of today
+chk("last-hour calls subset of today's", s.lastHour.calls >= 0 && s.lastHour.calls <= s.calls, `${s.lastHour.calls} <= ${s.calls}`);
+chk("last-hour tokens subset of today's", s.lastHour.tokensIn >= 0 && s.lastHour.tokensIn <= s.tokensIn, `${s.lastHour.tokensIn} <= ${s.tokensIn}`);
+
 // 4. derived percentages
 const errPct = (s.errors/s.calls)*100;
 const cachePct = Math.round((s.tokensCacheRead/s.tokensIn)*100);
