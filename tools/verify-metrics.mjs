@@ -9,6 +9,29 @@ const d = await jiti.import("/Users/stanz/codebase/pi-king/src/data.ts");
 let bad = 0;
 const chk = (name, ok, detail="") => { if(!ok) bad++; console.log(`  ${ok?"PASS":"FAIL"}  ${name}${detail?"  "+detail:""}`); };
 
+// 0. ps lstart parsing. This regex decides whether a session is alive; a bug
+// in it reports every live session as exited. It broke on single-digit days
+// (ps pads the day to two columns: "Mon Aug  3"), which meant it was correct
+// for 22 days a month and wrong for 9.
+{
+  const rx = /^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/;
+  const samples = [
+    ["  94771 Mon Aug  3 11:34:46 2026 pi", "single-digit day (two spaces)"],
+    ["  18749 Fri Jul 31 12:06:14 2026 pi", "two-digit day (one space)"],
+    ["      1 Wed Jan  1 00:00:00 2026 pi", "new year, single digit"],
+  ];
+  for (const [line, label] of samples) {
+    const m = rx.exec(line);
+    chk(`ps lstart parses: ${label}`, !!m && Number.isFinite(Date.parse(m[2])), m ? m[2] : "NO MATCH");
+  }
+  // And against this machine's real ps, which must find this very process.
+  const { spawnSync } = await import("node:child_process");
+  const out = spawnSync("/bin/ps", ["-eo", "pid=,lstart=,command="], { encoding: "utf8" }).stdout || "";
+  const parsed = out.split("\n").filter((l) => rx.test(l)).length;
+  const total = out.split("\n").filter((l) => l.trim()).length;
+  chk("ps lstart parses every real line", parsed === total, `${parsed}/${total}`);
+}
+
 // 1. cache round-trip must not change any number
 const cold = await d.readDailyTokens();
 const warm = await d.readDailyTokens();

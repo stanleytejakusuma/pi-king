@@ -196,8 +196,15 @@ function livePiPids(): Map<number, number> | undefined {
   if (res.status !== 0 || !res.stdout) return undefined; // unknown — do not prune
   const pids = new Map<number, number>();
   for (const line of res.stdout.split("\n")) {
-    // pid, fixed-width lstart ("Fri Jul 31 12:06:14 2026"), then command.
-    const m = /^\s*(\d+)\s+(\w{3} \w{3} ?\d+ \d{2}:\d{2}:\d{2} \d{4})\s+(.*)$/.exec(line);
+    // pid, lstart, then command. lstart is FIXED-WIDTH, not single-spaced: ps
+    // pads the day to two columns, so the first nine days of any month print
+    // "Mon Aug  3" with TWO spaces. The original pattern allowed at most one,
+    // so on the 1st through the 9th every process started that day failed to
+    // parse and was reported as not running. The dashboard then showed live
+    // sessions as "exited" beside their own tmux sessions as orphans. It was
+    // correct on the 10th through the 31st, which is why it shipped. Accept a
+    // run of whitespace between every field.
+    const m = /^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/.exec(line);
     if (!m) continue;
     // Pi sets process.title, so ps reports the command as bare "pi" (or
     // "pi-rpc") — never the node/cli.js command line. Verified empirically:
