@@ -273,6 +273,13 @@ Stated plainly rather than discovered later:
   and degrades to a message pointing at `/bg`.
 - **The no-tmux path is untested.** It is written and it degrades deliberately,
   but that branch has never actually fired in anger.
+- **The first launch is noisier than later ones.** The launcher runs Pi from a
+  small directory of its own that carries `quietStartup` and a model list the
+  hub will never call. Pi applies a directory's settings only once that
+  directory is trusted, so on the very first run those are ignored: expect
+  normal startup output, and one warning per model pattern your global config
+  enables but the hub does not load. It settles by itself once the directory is
+  trusted. Nothing is broken and the dashboard behaves identically either way.
 - **Two dashboards at once is undefined.** Nothing coordinates two supervisors
   reading and pruning the same status directory. One at a time.
 - **A crash between spawning and verifying a handoff can strand a session.**

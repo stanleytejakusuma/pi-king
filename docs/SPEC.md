@@ -218,6 +218,16 @@ session ends; running it while that session is alive is the realistic way to
 break this, so the extension checks on startup whether its own session id is
 already claimed by a live process and says so.
 
+**Project settings need trust, so the hub cannot rely on them.** The launcher
+runs Pi from its own directory, whose `.pi/settings.json` asks for a quiet
+startup and pins a model list the hub will never call. Pi applies a directory's
+settings only after that directory is trusted, so on a fresh install they are
+ignored and the first launch is noisier than intended. This is deliberately NOT
+worked around: the obvious fix is for the launcher to write its own path into
+Pi's trust store, and a tool that grants itself trust without asking is the
+exact pattern this project refuses everywhere else. A noisy first run is the
+cheaper mistake.
+
 **A card outlives its process.** Deleting a dead session's status file deletes
 the one record that knows how to resume its transcript. Death is displayed, not
 erased: the card renders as `exited` and enter resumes it in place. Removal is
