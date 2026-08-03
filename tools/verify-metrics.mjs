@@ -39,11 +39,11 @@ const chk = (name, ok, detail="") => { if(!ok) bad++; console.log(`  ${ok?"PASS"
 // priority made the comparator return NaN.
 {
   const idx = await jiti.import("/Users/stanz/codebase/pi-king/src/index.ts");
-  for (const s of ["working", "idle", "attention", "error", "exited", "trust", "not-a-state", ""]) {
+  for (const s of ["working", "idle", "background", "attention", "error", "exited", "trust", "not-a-state", ""]) {
     const icon = idx.iconFor(s);
     chk(`iconFor(${JSON.stringify(s)}) is a real glyph`, typeof icon === "string" && icon.length > 0, icon);
   }
-  chk("known states are recognised", ["working","idle","attention","error","exited"].every((s) => idx.isKnownState(s)));
+  chk("known states are recognised", ["working","idle","background","attention","error","exited"].every((s) => idx.isKnownState(s)));
   chk("retired/unknown states are not", !idx.isKnownState("trust") && !idx.isKnownState("nope"));
 }
 

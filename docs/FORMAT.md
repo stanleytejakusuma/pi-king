@@ -49,7 +49,7 @@ it for **every** participant.
   "pid": 58504,                                   // OS pid of the session
   "startedAt": 1785400000000,                     // epoch ms
   "lastActivity": 1785400123456,                  // epoch ms of last state change
-  "status": "working",                            // working|idle|attention|error|trust|exited
+  "status": "working",                            // working|idle|background|attention|error|exited
   "activity": "Investigate the failing test",     // human-readable, what it's doing
   "title": "⏳ π · example-project · codebase #019fb27c",
   "sessionFile": "/Users/you/.pi/agent/sessions/.../<id>.jsonl",
@@ -158,6 +158,8 @@ new text by an order of magnitude. Net is the figure that tracks how much fresh
 ground was covered; input is the figure that tracks what was billed.
 
 Status values are additive over time; readers must tolerate unknown strings.
+`background` means the main agent has settled but subagents are still running
+on the session's behalf — neither working nor idle.
 `attention` means the session finished a turn while no tmux client was attached.
 `trust` means a tool call has sat unexecuted long enough that a human is being
 asked to approve it. `exited` means the writing process is gone; the file

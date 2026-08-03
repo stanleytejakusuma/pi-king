@@ -60,13 +60,18 @@ import { homedir } from "node:os";
 
 /* ---------------------------------------------------------------- state -- */
 /** Coarse session lifecycle. Owned here so pi-king depends on stock Pi only. */
-export type TitleState = "working" | "idle" | "attention" | "error" | "exited";
+export type TitleState = "working" | "idle" | "background" | "attention" | "error" | "exited";
 
 // \u{...} with braces: a bare \u takes exactly four hex digits, so \u1f514
 // silently parsed as U+1F51 followed by a literal "4" and the attention icon
 // rendered as a Greek vowel with a digit stuck to it. Shipped that way.
 export const stateIcon: Record<TitleState, string> = {
-  working: "\u23f3", idle: "\u2713", attention: "\u{1f514}", error: "\u26a0", exited: "\u25cb",
+  // background: the main agent has settled but subagents are still running —
+  // the session is neither working (nothing to wait on at the prompt) nor idle
+  // (work is genuinely still happening on its behalf). pi-alerts has drawn
+  // this distinction in its own state model since before this file existed;
+  // the dashboard calling the same moment "idle" was simply less true.
+  working: "\u23f3", idle: "\u2713", background: "\u25d0", attention: "\u{1f514}", error: "\u26a0", exited: "\u25cb",
 };
 
 /** FORMAT.md promises readers tolerate unknown status strings, because the
@@ -75,7 +80,7 @@ export const stateIcon: Record<TitleState, string> = {
  * "trust" state rendered as the literal text "undefined trust", and its
  * missing sort priority made the comparator return NaN, quietly scrambling
  * row order. Every lookup keyed by a status now goes through here. */
-const KNOWN_STATES = new Set<string>(["working", "idle", "attention", "error", "exited"]);
+const KNOWN_STATES = new Set<string>(["working", "idle", "background", "attention", "error", "exited"]);
 
 /** States this project used to emit, mapped to what they actually meant.
  *
@@ -164,7 +169,7 @@ import {
 } from "./data.ts";
 
 const REFRESH_MS = 1000;
-const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, working: 1, idle: 2, exited: 3 };
+const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, working: 1, background: 1, idle: 2, exited: 3 };
 /** Unknown states sort with the working set rather than at an edge: they are
  * live sessions saying something this dashboard has not learned yet, not
  * emergencies and not corpses. */
@@ -1393,6 +1398,7 @@ class DashboardView implements Component {
     const vitals: string[] = [th.bold(String(this.rows.length)) + th.fg("dim", ` session${this.rows.length === 1 ? "" : "s"}`)];
     const add = (n: number, label: string, hue: string) => { if (n > 0) vitals.push(th.fg(hue, String(n)) + th.fg("dim", ` ${label}`)); };
     add(byState("working"), "working", "accent");
+    add(byState("background"), "background", "accent");
     add(byState("idle"), "idle", "success");
     add(byState("attention"), "attention", "warning");
     add(byState("error"), "error", "error");
@@ -1457,7 +1463,7 @@ class DashboardView implements Component {
         const e = r.entry;
         const hue = e.state === "error" ? "error"
           : e.state === "attention" ? "warning"
-          : e.state === "working" ? "accent"
+          : e.state === "working" || e.state === "background" ? "accent"
           : e.state === "exited" ? "dim"
           : e.state === "idle" ? "success"
           : "muted"; // unknown: visible, unstyled, not dressed as anything
@@ -1925,6 +1931,15 @@ function installSessionTracker(pi: ExtensionAPI) {
         // exited maps back to idle: we are demonstrably alive. Unknown or
         // retired states fall back to idle rather than being trusted.
         if (isKnownState(card.status) && card.status !== "exited") state = card.status;
+        // The subagent roster survives the reload too: the in-memory map is
+        // fresh, but the card carries the same records this module wrote a
+        // moment ago. Without this, a session reloaded mid-subagent showed
+        // idle with its running-agents badge gone, and the completion event
+        // later updated an entry that no longer existed.
+        for (const s of card.subagents ?? []) {
+          if (s && typeof s.id === "string") subagents.set(s.id, s);
+        }
+        if ((state === "idle") && hasLiveSubagents() > 0) state = "background";
       }
     } catch { /* no file, unreadable, or first run: nothing to warn about */ }
     persist(ctx);
@@ -2124,11 +2139,18 @@ function installSessionTracker(pi: ExtensionAPI) {
     // one-line answer this file has without fabricating a summary.
     activity = lastPrompt ? `Done: ${lastPrompt}` : "Waiting for input.";
     if (state !== "error" && state !== "attention") {
-      // Finishing while nobody is attached is the event this tool exists for.
-      // Attended settling stays a quiet idle; unattended settling must survive
-      // until the user actually comes back (see the heartbeat, which demotes
-      // it once a client attaches).
-      if (detachedInTmux()) {
+      if (hasLiveSubagents() > 0) {
+        // Settled at the prompt, but subagents are still running on this
+        // session's behalf: neither working nor idle. No notification either
+        // way — nothing needs the user yet, and the subagent-completion
+        // handler below raises attention (and notifies, if detached) the
+        // moment one actually finishes.
+        set("background", ctx);
+      } else if (detachedInTmux()) {
+        // Finishing while nobody is attached is the event this tool exists
+        // for. Attended settling stays a quiet idle; unattended settling must
+        // survive until the user actually comes back (see the heartbeat,
+        // which demotes it once a client attaches).
         set("attention", ctx);
         notifyDetached(ctx, activity);
       } else {
