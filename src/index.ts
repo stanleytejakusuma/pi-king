@@ -1337,7 +1337,14 @@ class DashboardView implements Component {
     if (!fits()) inv = [];                       // reference material goes first
     if (!fits()) head = lines.slice(artLines);   // then the wordmark art
     const budget = Math.max(MIN_BODY, H - head.length - inv.length - foot.length);
-    if (body.length <= budget) return [...head, ...body, ...inv, ...foot];
+    if (body.length <= budget) {
+      // Pad so the footer sits on the bottom edge rather than floating
+      // directly under the last session. Without this the key map moves up
+      // and down the screen as sessions come and go, which is the opposite of
+      // pinned: the whole point is that the keys are always in the same place.
+      const pad = Math.max(0, H - head.length - body.length - inv.length - foot.length);
+      return [...head, ...body, ...Array<string>(pad).fill(""), ...inv, ...foot];
+    }
 
     // Two rows of the budget go to the more-above/more-below markers, so the
     // list never continues past an edge without saying so.
