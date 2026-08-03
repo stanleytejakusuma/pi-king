@@ -1331,12 +1331,19 @@ class DashboardView implements Component {
     // key map is never shed; the sessions never drop below MIN_BODY, because a
     // list showing one row is not a list.
     const MIN_BODY = 3;
+    // The two marker rows live INSIDE the body zone, so the zone needs room for
+    // them as well. Budgeting only for the rows themselves overshot the
+    // terminal by exactly two lines, and since the footer is last, the two
+    // lines pushed off the bottom were the key map — the one thing that must
+    // never be shed. Observed at 20 rows.
+    const MIN_ZONE = MIN_BODY + 2;
     let head = lines;
     let inv = inventory;
-    const fits = () => H - head.length - inv.length - foot.length >= MIN_BODY;
-    if (!fits()) inv = [];                       // reference material goes first
-    if (!fits()) head = lines.slice(artLines);   // then the wordmark art
-    const budget = Math.max(MIN_BODY, H - head.length - inv.length - foot.length);
+    const avail = () => H - head.length - inv.length - foot.length;
+    if (avail() < MIN_ZONE) inv = [];                     // reference material first
+    if (avail() < MIN_ZONE) head = lines.slice(artLines); // then the wordmark art
+    if (avail() < MIN_ZONE) head = [];                    // then the band itself
+    const budget = Math.max(1, avail());
     if (body.length <= budget) {
       // Pad so the footer sits on the bottom edge rather than floating
       // directly under the last session. Without this the key map moves up
@@ -1347,8 +1354,9 @@ class DashboardView implements Component {
     }
 
     // Two rows of the budget go to the more-above/more-below markers, so the
-    // list never continues past an edge without saying so.
-    const window = Math.max(MIN_BODY, budget - 2);
+    // list never continues past an edge without saying so. The subtraction is
+    // what keeps the total at exactly H: head + 2 + window + inv + foot.
+    const window = Math.max(1, budget - 2);
     let start = Math.max(0, selectedLine - Math.floor(window / 2));
     start = Math.min(start, body.length - window);
     const above = start;
