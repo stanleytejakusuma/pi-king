@@ -69,6 +69,23 @@ export const stateIcon: Record<TitleState, string> = {
   working: "\u23f3", idle: "\u2713", attention: "\u{1f514}", error: "\u26a0", exited: "\u25cb",
 };
 
+/** FORMAT.md promises readers tolerate unknown status strings, because the
+ * set is additive and a session may be running an older or newer writer than
+ * the dashboard. This reader did not: a session still writing the retired
+ * "trust" state rendered as the literal text "undefined trust", and its
+ * missing sort priority made the comparator return NaN, quietly scrambling
+ * row order. Every lookup keyed by a status now goes through here. */
+const KNOWN_STATES = new Set<string>(["working", "idle", "attention", "error", "exited"]);
+export function isKnownState(s: string): s is TitleState {
+  return KNOWN_STATES.has(s);
+}
+/** Icon for any status, known or not. An unknown state keeps its own name on
+ * screen — inventing a familiar one would be a worse lie than admitting the
+ * dashboard does not recognise it. */
+export function iconFor(s: string): string {
+  return isKnownState(s) ? stateIcon[s] : "\u25cc";
+}
+
 export type SubagentStatus = {
   id: string;
   agentType?: string;
@@ -134,6 +151,12 @@ import {
 
 const REFRESH_MS = 1000;
 const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, working: 1, idle: 2, exited: 3 };
+/** Unknown states sort with the working set rather than at an edge: they are
+ * live sessions saying something this dashboard has not learned yet, not
+ * emergencies and not corpses. */
+function priorityOf(s: string): number {
+  return isKnownState(s) ? STATE_PRIORITY[s] : 1;
+}
 const MESSAGE_LINGER_MS = 4000;
 /** Resolved once at load rather than hardcoded. tmux lives in different places
  * depending on how it was installed: /opt/homebrew/bin on Apple Silicon,
@@ -331,7 +354,7 @@ function readSessions(): DashboardEntry[] {
       // moving a row is a stronger statement about what matters than the
       // state machine's opinion.
       rank(a.sessionId) - rank(b.sessionId) ||
-      STATE_PRIORITY[a.state] - STATE_PRIORITY[b.state] ||
+      priorityOf(a.state) - priorityOf(b.state) ||
       b.updatedAt - a.updatedAt;
   });
   return entries;
@@ -1394,7 +1417,9 @@ class DashboardView implements Component {
         const hue = e.state === "error" ? "error"
           : e.state === "attention" ? "warning"
           : e.state === "working" ? "accent"
-          : e.state === "exited" ? "dim" : "success";
+          : e.state === "exited" ? "dim"
+          : e.state === "idle" ? "success"
+          : "muted"; // unknown: visible, unstyled, not dressed as anything
         const isPinned = pinnedIds.includes(e.sessionId);
         // The Pi session's own name wins over its tmux container's. Renaming
         // from inside a session (/name) is the deliberate act; the tmux name is
@@ -1405,7 +1430,7 @@ class DashboardView implements Component {
           (e.name ?? e.tmuxName ?? e.project) +
           (isPinned ? ` \u00b7 ${e.project}` : "");
         const nm = pad(truncateToWidth(label, nameW, "\u2026", true), nameW);
-        const status = pad(`${stateIcon[e.state]} ${th.fg(hue, e.state)}`, statusW);
+        const status = pad(`${iconFor(e.state)} ${th.fg(hue, e.state)}`, statusW);
         const sub = subagentSummary(e.subagents);
         // Context climbs toward compaction, and compaction discards memory the
         // user may be counting on. Colour turns before it happens, not after.
@@ -1738,7 +1763,7 @@ function installSessionTracker(pi: ExtensionAPI) {
         lastActivity: Date.now(),
         status: state,
         activity,
-        title: `${stateIcon[state]} ${ctx.sessionManager.getSessionName() ?? basename(ctx.cwd)}`,
+        title: `${iconFor(state)} ${ctx.sessionManager.getSessionName() ?? basename(ctx.cwd)}`,
         sessionFile: ctx.sessionManager.getSessionFile(),
         subagents: [...subagents.values()],
         visible,

@@ -32,6 +32,21 @@ const chk = (name, ok, detail="") => { if(!ok) bad++; console.log(`  ${ok?"PASS"
   chk("ps lstart parses every real line", parsed === total, `${parsed}/${total}`);
 }
 
+// 0b. Unknown status strings must never break a reader. FORMAT.md says the
+// status set is additive and readers tolerate unknown values; a session
+// running an older writer sent "trust" after that state was retired, and the
+// dashboard rendered the literal text "undefined trust" while its missing sort
+// priority made the comparator return NaN.
+{
+  const idx = await jiti.import("/Users/stanz/codebase/pi-king/src/index.ts");
+  for (const s of ["working", "idle", "attention", "error", "exited", "trust", "not-a-state", ""]) {
+    const icon = idx.iconFor(s);
+    chk(`iconFor(${JSON.stringify(s)}) is a real glyph`, typeof icon === "string" && icon.length > 0, icon);
+  }
+  chk("known states are recognised", ["working","idle","attention","error","exited"].every((s) => idx.isKnownState(s)));
+  chk("retired/unknown states are not", !idx.isKnownState("trust") && !idx.isKnownState("nope"));
+}
+
 // 1. cache round-trip must not change any number
 const cold = await d.readDailyTokens();
 const warm = await d.readDailyTokens();
