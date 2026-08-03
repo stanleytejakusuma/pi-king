@@ -36,8 +36,8 @@
     "@earendil-works/pi-tui": ">=0.80.0"
   },
   "bin": {
-    "pi-king": "./bin/pi-king",
-    "pi-agents": "./bin/pi-king"
+    "pi-king": "bin/pi-king",
+    "pi-agents": "bin/pi-king"
   },
   "scripts": {
     "prepublishOnly": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs",
