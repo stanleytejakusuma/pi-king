@@ -43,7 +43,7 @@
  * `#<shortId>` suffix pi-alerts.ts embeds in every title.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import type { Component, TUI } from "@earendil-works/pi-tui";
@@ -1184,6 +1184,20 @@ class DashboardView implements Component {
       // the same transcript in the same directory, then attach as usual.
       if (row.kind === "session" && row.entry.state === "exited") {
         const e = row.entry;
+        // Re-check liveness AT PRESS TIME, not at render time. "Exited" here
+        // is a verdict computed up to a refresh-cycle ago from a card that any
+        // bug upstream can mis-stamp — and one did: /reload used to reset the
+        // card's startedAt, failing the identity check, so a session could sit
+        // here marked exited while its process ran fine. Resuming that spawns
+        // a second process on the same transcript, which is the one disaster
+        // this tool must never cause. A resurrect is not latency-sensitive;
+        // one ps call is cheap insurance against it.
+        if (e.pid && spawnSync("/bin/ps", ["-p", String(e.pid)], { encoding: "utf8", timeout: 2000 }).status === 0) {
+          this.showMessage(`Card says exited, but pid ${e.pid} is alive right now — not resuming onto a live transcript. Refresh (r) and re-check.`);
+          this.refresh();
+          this.tui.requestRender();
+          return;
+        }
         if (!existsSync(e.cwd)) {
           this.showMessage(`Directory is gone: ${e.cwd}. Resume by hand: pi --session ${e.sessionId}`);
           return;
@@ -1731,7 +1745,18 @@ function installSessionTracker(pi: ExtensionAPI) {
   let state: TitleState = "idle";
   let activity = "Session started.";
   let visible = process.env.PI_DASHBOARD_SPAWNED === "1";
-  let startedAt = Date.now();
+  // The card's startedAt participates in the dashboard's IDENTITY check: pid
+  // plus process start time, 60s tolerance, so a recycled pid cannot wear a
+  // dead session's card. That means startedAt must be the PROCESS's birth,
+  // never "when this extension instance initialised": /reload rebuilds the
+  // ExtensionRunner and re-fires session_start hours into a process's life,
+  // and stamping Date.now() there made every reloaded session fail its own
+  // identity check — alive, working, and rendered as exited beside its own
+  // tmux session as an orphan (observed live: a reloaded session 12.5h old
+  // carried a card 44,888s newer than its ps lstart). Derived from uptime,
+  // the value is identical no matter how many times this module re-evaluates.
+  const PROCESS_STARTED_AT = Date.now() - process.uptime() * 1000;
+  let startedAt = PROCESS_STARTED_AT;
   let hadRun = false;
   /** Set when /bg is requested mid-turn; fires the moment the session settles. */
   let bgQueued = false;
@@ -1856,35 +1881,37 @@ function installSessionTracker(pi: ExtensionAPI) {
   pi.on("session_start", (_e, ctx) => {
     if (!isInteractive(ctx)) return;
     ctxRef = ctx;
-    state = "idle"; activity = "Session started."; startedAt = Date.now();
+    state = "idle"; activity = "Session started."; startedAt = PROCESS_STARTED_AT;
     hadRun = false; bgQueued = false; subagents.clear();
     visible = process.env.PI_DASHBOARD_SPAWNED === "1";
+    // Collision guard — and it MUST run before the first persist(). It reads
+    // this session id's card to see whether another live process already
+    // claims it; persist() writes our own pid into that same card, so with
+    // the old order the guard read back its own just-written pid and
+    // concluded "no collision", every time, since the day it shipped. It was
+    // dead on arrival and the one incident it existed for (a dashboard resume
+    // duplicating a live session) sailed straight past it.
+    //
+    // pi-king is what makes this reachable: a session can be alive, headless,
+    // for days, and a resume against its id puts a second process on one
+    // transcript, both appending, the damage silent. The extension loads
+    // inside the duplicate too, so it can catch itself.
+    try {
+      // Read our own status file directly rather than the dashboard listing,
+      // which filters to sessions marked visible and would miss a duplicate.
+      const myId = ctx.sessionManager.getSessionId();
+      const claimed = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${myId}.json`), "utf8")) as SessionStatusFile;
+      const owner = Number(claimed.pid) || 0;
+      if (owner && owner !== process.pid && livePiPids()?.has(owner)) {
+        ctx.ui.notify(
+          `Session ${myId.slice(0, 8)} is already running as pid ${owner}. ` +
+          `Two processes appending to one transcript will corrupt its history. ` +
+          `Attach to the existing one rather than continuing here.`,
+          "error",
+        );
+      }
+    } catch { /* no file, unreadable, or first run: nothing to warn about */ }
     persist(ctx);
-      // Collision guard. pi-king is what makes this reachable: before it, a
-      // session's liveness was visible because it sat in an open terminal. Now a
-      // session can be alive, headless, for days, and /bg prints a resume
-      // command that is correct only after that session ends. Running it while
-      // the session still lives puts a second process on one transcript, both
-      // appending, and the damage is silent.
-      //
-      // The extension loads inside the duplicate too, so it can catch itself:
-      // if this session id is already claimed by a process that is verifiably
-      // alive and is not us, say so immediately.
-      try {
-        // Read our own status file directly rather than the dashboard listing,
-        // which filters to sessions marked visible and would miss a duplicate.
-        const myId = ctx.sessionManager.getSessionId();
-        const claimed = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${myId}.json`), "utf8")) as SessionStatusFile;
-        const owner = Number(claimed.pid) || 0;
-        if (owner && owner !== process.pid && livePiPids()?.has(owner)) {
-          ctx.ui.notify(
-            `Session ${myId.slice(0, 8)} is already running as pid ${owner}. ` +
-            `Two processes appending to one transcript will corrupt its history. ` +
-            `Attach to the existing one rather than continuing here.`,
-            "error",
-          );
-        }
-      } catch { /* no file, unreadable, or first run: nothing to warn about */ }
 
     // Left-arrow at an empty prompt detaches this pane's tmux client — a
     // second, gated route back to the dashboard alongside Cmd+Esc, replacing
@@ -1912,6 +1939,18 @@ function installSessionTracker(pi: ExtensionAPI) {
     // own default `prefix d`. F12 covered that case; this does not.
     if (unsubscribeLeftArrow) { unsubscribeLeftArrow(); unsubscribeLeftArrow = undefined; }
     unsubscribeLeftArrow = ctx.ui.onTerminalInput((data) => {
+      // TEMPORARY DIAGNOSTIC — left-arrow was reported not to work live;
+      // logs the raw bytes and every gate's value for every keystroke so the
+      // failure is a fact instead of a guess. Remove before the next release.
+      if (process.env.PI_KING_DEBUG_KEYS) {
+        try {
+          const release = isKeyRelease(data);
+          const isLeft = matchesKey(data, "left");
+          const editorText = ctx.ui.getEditorText();
+          const line = `${new Date().toISOString()} raw=${JSON.stringify(data)} release=${release} isLeft=${isLeft} editorText=${JSON.stringify(editorText)} TMUX=${Boolean(process.env.TMUX)}\n`;
+          appendFileSync("/tmp/pi-king-left-debug.log", line);
+        } catch { /* diagnostic only, must never disturb the session */ }
+      }
       // The kitty keyboard protocol reports both press and release for the
       // same physical keystroke; matchesKey matches either, so acting on both
       // would detach twice per press. Act on press only.
@@ -1923,7 +1962,10 @@ function installSessionTracker(pi: ExtensionAPI) {
       // process's own $TMUX context, exactly as running `tmux detach-client`
       // by hand inside this same pane would — the identical effect F12 had,
       // just reached through a gated key instead of an unconditional one.
-      spawnSync(TMUX, ["detach-client"], { encoding: "utf8", timeout: 3000 });
+      const result = spawnSync(TMUX, ["detach-client"], { encoding: "utf8", timeout: 3000 });
+      if (process.env.PI_KING_DEBUG_KEYS) {
+        try { appendFileSync("/tmp/pi-king-left-debug.log", `  -> FIRED: status=${result.status} stderr=${JSON.stringify(result.stderr)}\n`); } catch { /* diagnostic only */ }
+      }
       return { consume: true };
     });
 
