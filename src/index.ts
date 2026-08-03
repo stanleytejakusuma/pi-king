@@ -597,7 +597,6 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
     const rate = stats.calls > 0 ? (stats.errors / stats.calls) * 100 : 0;
     // Thresholds: <2% routine, <5% worth noticing, above that is a problem.
     const rateColor = rate < 2 ? "success" : rate < 5 ? "warning" : "error";
-    const spark = sparkline(stats.hourly);
     segs.push(
       th.fg("accent", th.bold(stats.calls.toLocaleString())) + th.fg("dim", " calls today"),
       th.fg(rateColor, `${stats.errors} err`) + th.fg("dim", ` (${rate.toFixed(1)}%)`),
@@ -612,8 +611,18 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
       : th.fg("dim", "1h quiet"));
     // A sparkline over a handful of calls is noise shaped like a chart; below a
     // floor it says less than the number it sits next to, so it is omitted.
-    if (spark && stats.calls >= 50 && stats.hourly.length >= 4) {
-      segs.push(th.fg("accent", spark) + th.fg("dim", ` peak ${stats.peakHour}/h`));
+    // Leading zero-hours are trimmed and replaced by a start label: zeros
+    // render as spaces (a measured zero is not a bar), and a morning of them
+    // put nine columns of blank ahead of the first bar, which read as a
+    // rendering bug rather than as a quiet night.
+    if (stats.calls >= 50 && stats.hourly.length >= 4) {
+      const first = stats.hourly.findIndex((n) => n > 0);
+      const trimmed = first > 0 ? stats.hourly.slice(first) : stats.hourly;
+      const tspark = sparkline(trimmed);
+      if (tspark) {
+        const from = first > 0 ? th.fg("dim", `${first}h `) : "";
+        segs.push(from + th.fg("accent", tspark) + th.fg("dim", ` peak ${stats.peakHour}/h`));
+      }
     }
   }
   // Order matters: shedding drops from the end, so these sit ahead of the model
@@ -797,11 +806,15 @@ class DashboardView implements Component {
       const r = spawnSync(TMUX, ["capture-pane", "-p", "-t", clean(tmuxName)], { encoding: "utf8", timeout: 1500 });
       if (r.status !== 0) return;
       // clean() at the boundary: pane content is arbitrary program output and
-      // is about to be rendered into this terminal.
-      const all = String(r.stdout || "").split("\n").map((l) => clean(l));
-      let end = all.length;
-      while (end > 0 && all[end - 1].trim() === "") end--;
-      this.peek = all.slice(Math.max(0, end - 6), end);
+      // is about to be rendered into this terminal. Lines that are nothing but
+      // box-drawing are dropped too: an idle TUI's pane bottom is mostly its
+      // input-box borders, and a peek of three rules and a blank gap shows
+      // furniture, not the session.
+      const furniture = /^[\s\u2500-\u257f\u2580-\u259f|_=~-]*$/;
+      const all = String(r.stdout || "").split("\n")
+        .map((l) => clean(l))
+        .filter((l) => !furniture.test(l));
+      this.peek = all.slice(Math.max(0, all.length - 6));
     } catch { /* no peek is fine; an empty preview is not an error */ }
   }
 
