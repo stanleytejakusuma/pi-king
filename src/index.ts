@@ -94,6 +94,10 @@ export type SessionStatusFile = {
   sessionFile: string | undefined;
   subagents: SubagentStatus[];
   visible: boolean;
+  /** Context window usage, 0-100, when Pi can report it. A session near the
+   * top is about to compact away part of its memory, which is worth knowing
+   * before attaching, not after. Absent when unknown — never zero-filled. */
+  contextPct?: number;
 };
 
 /**
@@ -148,6 +152,7 @@ type DashboardEntry = {
   /** The pid that wrote this status file. Load-bearing: a tmux session is
    * matched to this session by comparing its pane pid against this. */
   pid: number;
+  contextPct: number | undefined;
   shortId: string;
   cwd: string;
   project: string;
@@ -264,6 +269,8 @@ function readSessions(): DashboardEntry[] {
       project: raw.project,
       name: raw.name,
       state: raw.status,
+      contextPct: typeof raw.contextPct === "number" && Number.isFinite(raw.contextPct)
+        ? Math.max(0, Math.min(999, Math.round(raw.contextPct))) : undefined,
       lastActivity: raw.activity,
       updatedAt: raw.lastActivity || Date.now(),
       subagents: raw.subagents ?? [],
@@ -746,6 +753,56 @@ class DashboardView implements Component {
     this.rows = buildRows();
     flushPendingRenames(this.rows);
     if (this.selected >= this.rows.length) this.selected = Math.max(0, this.rows.length - 1);
+    this.refreshGitDrift();
+    this.capturePeek();
+  }
+
+  /** Uncommitted-change counts per project directory, refreshed lazily. A
+   * returning user's second question after "what did it do" is "did it leave
+   * work uncommitted", and the directory header is where that belongs. */
+  private gitDrift = new Map<string, { n: number; at: number }>();
+  private refreshGitDrift(): void {
+    const dirs = new Set<string>();
+    for (const r of this.rows) if (r.kind === "session") dirs.add(r.entry.cwd);
+    for (const dir of dirs) {
+      const hit = this.gitDrift.get(dir);
+      if (hit && Date.now() - hit.at < 10_000) continue;
+      try {
+        const r = spawnSync("git", ["-C", dir, "status", "--porcelain"], { encoding: "utf8", timeout: 1500 });
+        if (r.status === 0) {
+          const n = String(r.stdout || "").split("\n").filter((l) => l.trim().length > 0).length;
+          this.gitDrift.set(dir, { n, at: Date.now() });
+        } else {
+          // Not a repo, or git unhappy: record the miss so it is not retried
+          // every second, and render nothing rather than a guessed zero.
+          this.gitDrift.set(dir, { n: -1, at: Date.now() });
+        }
+      } catch {
+        this.gitDrift.set(dir, { n: -1, at: Date.now() });
+      }
+    }
+  }
+
+  /** The last lines of the selected session's tmux pane. What claude-squad
+   * calls preview: the difference between a supervisor and a list is being
+   * able to SEE a session without the commitment of attaching to it. */
+  private peek: string[] = [];
+  private capturePeek(): void {
+    this.peek = [];
+    const row = this.rows[this.selected];
+    if (!row) return;
+    const tmuxName = this.rowTmuxName(row);
+    if (!tmuxName) return;
+    try {
+      const r = spawnSync(TMUX, ["capture-pane", "-p", "-t", clean(tmuxName)], { encoding: "utf8", timeout: 1500 });
+      if (r.status !== 0) return;
+      // clean() at the boundary: pane content is arbitrary program output and
+      // is about to be rendered into this terminal.
+      const all = String(r.stdout || "").split("\n").map((l) => clean(l));
+      let end = all.length;
+      while (end > 0 && all[end - 1].trim() === "") end--;
+      this.peek = all.slice(Math.max(0, end - 6), end);
+    } catch { /* no peek is fine; an empty preview is not an error */ }
   }
 
   private showMessage(msg: string): void {
@@ -830,12 +887,14 @@ class DashboardView implements Component {
     if (matchesKey(data, "down")) {
       this.deleteArmedFor = undefined;
       this.selected = Math.min(this.rows.length - 1, this.selected + 1);
+      this.capturePeek();
       this.tui.requestRender();
       return;
     }
     if (matchesKey(data, "up")) {
       this.deleteArmedFor = undefined;
       this.selected = Math.max(0, this.selected - 1);
+      this.capturePeek();
       this.tui.requestRender();
       return;
     }
@@ -1150,7 +1209,11 @@ class DashboardView implements Component {
         const group = r.kind === "orphan" ? "tmux (no Pi session)" : r.entry.cwd.replace(process.env.HOME ?? "~", "~");
         if (group !== lastGroup) {
           if (lastGroup !== undefined) lines.push("");
-          lines.push("  " + th.fg("muted", group));
+          const drift = r.kind === "session" ? this.gitDrift.get(r.entry.cwd) : undefined;
+          const driftBadge = drift && drift.n > 0
+            ? th.fg("warning", `  \u25cf ${drift.n} uncommitted`)
+            : "";
+          lines.push("  " + th.fg("muted", group) + driftBadge);
           lastGroup = group;
         }
         const sel = i === this.selected;
@@ -1171,12 +1234,34 @@ class DashboardView implements Component {
         const nm = pad(truncateToWidth(label, nameW, "\u2026", true), nameW);
         const status = pad(`${stateIcon[e.state]} ${th.fg(hue, e.state)}`, statusW);
         const sub = subagentSummary(e.subagents);
-        const right = th.fg("dim", [sub, elapsed(e.updatedAt)].filter(Boolean).join(" \u00b7 ")) + "  ";
+        // Context climbs toward compaction, and compaction discards memory the
+        // user may be counting on. Colour turns before it happens, not after.
+        const ctxBadge = e.contextPct !== undefined && e.state !== "exited"
+          ? th.fg(e.contextPct >= 85 ? "error" : e.contextPct >= 65 ? "warning" : "dim", `ctx ${e.contextPct}%`)
+          : "";
+        const right = [sub ? th.fg("dim", sub) : "", ctxBadge, th.fg("dim", elapsed(e.updatedAt))]
+          .filter(Boolean).join(th.fg("dim", " \u00b7 ")) + "  ";
         const left = `  ${marker} ${e.tmuxName ? th.fg("accent", "\u26fa") : th.fg("dim", "\u233f")} ` +
           (sel ? th.bold(nm) : nm) + " " + status +
           th.fg("muted", truncateToWidth(e.lastActivity, Math.max(10, MEASURE - nameW - statusW - visibleWidth(right) - 12), "\u2026", true));
         lines.push(split(left, right));
       });
+    }
+
+    // ---- peek -----------------------------------------------------------
+    // The last few lines of the selected session's pane, read-only. Seeing
+    // what a session is doing without attaching is most of what supervising
+    // means; before this, the only way to check on one was to enter it.
+    if (this.peek.length > 0) {
+      const sel = this.rows[this.selected];
+      const peekName = sel ? this.rowTmuxName(sel) : undefined;
+      if (peekName) {
+        lines.push("");
+        lines.push("  " + th.fg("dim", `\u2500\u2500 peek \u00b7 ${peekName} \u2500\u2500`));
+        for (const l of this.peek) {
+          lines.push("  " + th.fg("muted", truncateToWidth(l, Math.max(10, MEASURE - 4), "\u2026", true)));
+        }
+      }
     }
 
     // ---- inventory ------------------------------------------------------
@@ -1410,6 +1495,11 @@ function installSessionTracker(pi: ExtensionAPI) {
       mkdirSync(SESSION_STATUS_DIR, { recursive: true, mode: 0o700 });
       const cutoff = Date.now() - 5 * 60_000;
       for (const [id, s] of subagents) if (s.completedAt && s.completedAt < cutoff) subagents.delete(id);
+      let contextPct: number | undefined;
+      try {
+        const u = ctx.getContextUsage();
+        if (u && typeof u.percent === "number" && Number.isFinite(u.percent)) contextPct = Math.round(u.percent);
+      } catch { /* absent is honest; zero would be a lie */ }
       const snap: SessionStatusFile = {
         formatVersion: 1,
         id: ctx.sessionManager.getSessionId(),
@@ -1426,6 +1516,7 @@ function installSessionTracker(pi: ExtensionAPI) {
         sessionFile: ctx.sessionManager.getSessionFile(),
         subagents: [...subagents.values()],
         visible,
+        contextPct,
       };
       const target = statusPath(ctx);
       const tmp = `${target}.tmp-${process.pid}`;
