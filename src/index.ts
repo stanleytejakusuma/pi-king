@@ -1396,8 +1396,13 @@ class DashboardView implements Component {
           : e.state === "working" ? "accent"
           : e.state === "exited" ? "dim" : "success";
         const isPinned = pinnedIds.includes(e.sessionId);
+        // The Pi session's own name wins over its tmux container's. Renaming
+        // from inside a session (/name) is the deliberate act; the tmux name is
+        // just what the session happened to be created as, and only the
+        // dashboard's own rename keeps the two in step. Preferring tmux meant a
+        // rename typed inside a session never appeared here at all.
         const label = (isPinned ? "\u2691 " : "") +
-          (e.tmuxName ?? e.name ?? e.project) +
+          (e.name ?? e.tmuxName ?? e.project) +
           (isPinned ? ` \u00b7 ${e.project}` : "");
         const nm = pad(truncateToWidth(label, nameW, "\u2026", true), nameW);
         const status = pad(`${stateIcon[e.state]} ${th.fg(hue, e.state)}`, statusW);
