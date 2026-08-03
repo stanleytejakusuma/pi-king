@@ -1525,6 +1525,16 @@ function installSessionTracker(pi: ExtensionAPI) {
   }
 
   const set = (next: TitleState, ctx: ExtensionContext) => { state = next; persist(ctx); };
+  /** True when the card on disk is ours to write: absent counts as not ours,
+   * because the fix for both cases is the same write. */
+  function ownsStatusFile(ctx: ExtensionContext): boolean {
+    try {
+      const raw = JSON.parse(readFileSync(statusPath(ctx), "utf8")) as { pid?: number };
+      return raw.pid === process.pid;
+    } catch {
+      return false;
+    }
+  }
   /** True only when this session lives in tmux AND no client is attached —
    * the one situation where the user cannot be watching this terminal.
    * undefined = not in tmux, or tmux did not answer; treated as attended,
@@ -1616,7 +1626,17 @@ function installSessionTracker(pi: ExtensionAPI) {
     const heartbeat = setInterval(() => {
       try {
         if (handedOff || !isInteractive(ctx)) return;
-        if (!existsSync(statusPath(ctx))) persist(ctx);
+        // Reclaim the card if it is missing OR if it is not ours. "Missing"
+        // alone was sufficient only while the supervisor pruned dead cards:
+        // it deleted a stale one, the file vanished, and this rewrote it.
+        // Cards are never deleted now, so a stale card from this session's
+        // PREVIOUS process (a /bg handoff resumes the same id, so the same
+        // path) would otherwise sit there reading "exited" with a dead pid
+        // while this very process runs — which is precisely what the
+        // dashboard then shows: an exited card beside an orphan tmux session.
+        // Same path means same session id, so a foreign pid here is always a
+        // predecessor of ours, never a rival.
+        if (!ownsStatusFile(ctx)) persist(ctx);
         // Attention means "finished while nobody was attached". The moment a
         // client attaches, the user has seen it — typing is not required to
         // acknowledge a result you read with your eyes.
@@ -1764,6 +1784,13 @@ function installSessionTracker(pi: ExtensionAPI) {
     // Do not touch the file if a handoff transferred this id to another
     // process; that file is now theirs, not ours.
     if (handedOff) return;
+    // Never clobber a card another process already owns. A handoff resumes
+    // the same session id, so the successor writes the SAME path: if it has
+    // already claimed the card, this exiting process writing "exited" over it
+    // would kill a session that is running fine — the mirror image of the
+    // stale-card bug, and the reason the ordering of these two exits cannot be
+    // relied on.
+    if (!ownsStatusFile(ctx)) return;
     // A session that never appeared on the dashboard leaves nothing behind:
     // its card was invisible, so an exited card would be unreachable — a file
     // that accumulates forever with no way to see or dismiss it. The
