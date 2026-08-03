@@ -763,8 +763,13 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
     // day the two differ by an order of magnitude, and net is the one that
     // tracks how much new ground was covered.
     const net = netTokens(stats.tokensIn, stats.tokensCacheRead);
+    // Every neighbouring segment names its own window ("calls today", "7d"):
+    // this was the one silent one, sitting between them, and read as
+    // ambiguous — all-time or today? It is today only, same as the rest of
+    // the band; readUsageStats() scans exactly one day's directory and never
+    // touches the others. Made explicit rather than inferred from position.
     segs.push(
-      th.fg("dim", "tok in ") + th.fg("accent", compactNum(stats.tokensIn)) +
+      th.fg("dim", "tok today: in ") + th.fg("accent", compactNum(stats.tokensIn)) +
       th.fg("dim", " \u00b7 out ") + th.fg("accent", compactNum(stats.tokensOut)) +
       th.fg("dim", " \u00b7 net ") + th.fg("accent", compactNum(net)) +
       th.fg("dim", ` (${outShare < 1 ? outShare.toFixed(1) : Math.round(outShare)}% out)`),

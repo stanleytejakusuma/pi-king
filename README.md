@@ -13,7 +13,10 @@
 
 **Background a Pi session and come back to it later.**
 
-A local control plane for long-running [Pi](https://pi.dev) sessions.
+A tmux-backed session manager and supervisor for the
+[Pi coding agent](https://pi.dev) — a local control plane for long-running
+sessions. Hand a session to tmux with `/bg`, see every session on the machine
+in one dashboard, and reattach to any of them with a keypress.
 
 [![npm](https://img.shields.io/npm/v/pi-king?style=flat-square)](https://www.npmjs.com/package/pi-king)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)

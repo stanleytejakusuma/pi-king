@@ -176,5 +176,12 @@ order: [id] }`), NOT in the status files. A status file is written by that
 session's own process; the dashboard writing into one would put two processes
 on a single file. Ordering is a view preference and belongs to the viewer.
 
+The band's token segment scans today's call-log directory only, same as
+every other figure in the band except the 7d sparkline and the average, which
+are explicitly labelled with their own window. It read as ambiguous sitting
+unlabelled between two segments that both name theirs, so it now reads
+"tok today: in ... out ... net ..." rather than leaving the window to be
+inferred from position.
+
 Cost is deliberately not reported. The logs carry no price data, and a hardcoded
 price table would silently rot into wrong numbers.

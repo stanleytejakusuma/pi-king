@@ -1,16 +1,20 @@
 {
   "name": "pi-king",
   "version": "0.1.4",
-  "description": "Background a Pi session into tmux and come back to it later. A local control plane for long-running Pi sessions. Requires tmux.",
+  "description": "tmux-backed session manager and supervisor for the Pi coding agent \u2014 background a session and come back to it later",
   "keywords": [
-    "pi-package",
     "pi",
+    "pi-coding-agent",
     "pi-extension",
+    "session-manager",
+    "supervisor",
     "tmux",
-    "session",
+    "tui",
     "dashboard",
-    "persistence",
-    "session-manager"
+    "cli",
+    "terminal",
+    "ai-agent",
+    "background-sessions"
   ],
   "license": "MIT",
   "type": "module",
