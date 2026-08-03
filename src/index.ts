@@ -1030,6 +1030,18 @@ class DashboardView implements Component {
           ["net tokens", compactNum(netTokens(life.tokensIn, life.tokensCacheRead))],
           ["cache reads", `${compactNum(life.tokensCacheRead)} (${life.tokensIn > 0 ? Math.round((life.tokensCacheRead / life.tokensIn) * 100) : 0}%)`],
         ];
+        // Cache leverage: how many times each token written into the cache was
+        // served back out. This is the number that justifies (or indicts) the
+        // whole caching story — read share alone cannot say whether writes paid.
+        if (life.tokensCacheWrite > 0) {
+          pairs.push(["cache leverage", `${(life.tokensCacheRead / life.tokensCacheWrite).toFixed(1)}x re-read`]);
+        }
+        // Reasoning beside output, never as a share derived from it: measured
+        // not to be a strict subset of out (7 of 9,058 sampled records exceed
+        // it), so a percentage would occasionally read above 100.
+        if (life.tokensReasoning > 0) {
+          pairs.push(["reasoning", `${compactNum(life.tokensReasoning)} vs ${compactNum(life.tokensOut)} out`]);
+        }
         // Biggest and median day, from the same per-day rows the heatmap uses.
         // The mean is skipped deliberately: these days span a seventy-fold
         // range, and a mean over that distribution describes no actual day.
@@ -1065,6 +1077,33 @@ class DashboardView implements Component {
         if (cmp) {
           lines.push("");
           lines.push("  " + th.fg("muted", `You have pushed ${cmp} through this machine.`));
+        }
+      }
+      // ---- today, in detail ----------------------------------------------
+      // The band answers "how much"; this answers "which model, what kind of
+      // errors, and what made you wait". Only rendered when today has calls —
+      // an empty section would just be furniture.
+      const { stats: todayStats } = this.statsCache.get();
+      if (todayStats) {
+        lines.push("");
+        lines.push("  " + th.fg("dim", "── today ──"));
+        for (const m of todayStats.perModel.slice(0, 4)) {
+          const bits = [
+            `${m.calls} call${m.calls === 1 ? "" : "s"}`,
+            `${compactNum(m.tokensIn)} in`,
+            m.p95 > 0 ? `p95 ${(m.p95 / 1000).toFixed(1)}s` : "",
+            m.errors > 0 ? `${m.errors} err` : "",
+          ].filter(Boolean).join(" · ");
+          lines.push("  " + th.fg("accent", m.model.padEnd(22)) + th.fg("muted", bits));
+        }
+        if (todayStats.errorsByStatus.length > 0) {
+          const kinds = todayStats.errorsByStatus.map(([code, n]) => `${code} \u00d7${n}`).join("  ");
+          lines.push("  " + th.fg("dim", "errors".padEnd(22)) + th.fg("error", kinds));
+        }
+        if (todayStats.slowest) {
+          lines.push("  " + th.fg("dim", "slowest call".padEnd(22)) +
+            th.fg("warning", `${(todayStats.slowest.duration / 1000).toFixed(1)}s`) +
+            th.fg("muted", ` (${todayStats.slowest.model})`));
         }
       }
       lines.push("");

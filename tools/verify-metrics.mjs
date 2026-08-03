@@ -14,6 +14,7 @@ const cold = await d.readDailyTokens();
 const warm = await d.readDailyTokens();
 chk("cache round-trip identical", JSON.stringify(cold)===JSON.stringify(warm));
 
+chk("every served day is complete", cold.every(x => ["tokensIn","tokensOut","tokensCacheRead","tokensCacheWrite","tokensReasoning","calls"].every(f => typeof x[f] === "number")));
 // 2. lifetime totals equal the sum of the per-day rows
 const life = await d.readLifetimeStats();
 const sumIn = cold.reduce((a,x)=>a+x.tokensIn,0);
@@ -36,6 +37,12 @@ chk("today's net <= in", netToday <= s.tokensIn);
 // 3c. last-hour window is a subset of today
 chk("last-hour calls subset of today's", s.lastHour.calls >= 0 && s.lastHour.calls <= s.calls, `${s.lastHour.calls} <= ${s.calls}`);
 chk("last-hour tokens subset of today's", s.lastHour.tokensIn >= 0 && s.lastHour.tokensIn <= s.tokensIn, `${s.lastHour.tokensIn} <= ${s.tokensIn}`);
+
+// 3d. per-model and error-taxonomy partitions must sum to their totals
+chk("per-model calls partition today", s.perModel.reduce((n,m)=>n+m.calls,0) === s.calls, `${s.perModel.reduce((n,m)=>n+m.calls,0)} === ${s.calls}`);
+chk("per-model tokens partition today", s.perModel.reduce((n,m)=>n+m.tokensIn,0) === s.tokensIn);
+chk("status-code counts partition errors", s.errorsByStatus.reduce((n,[,c])=>n+c,0) === s.errors, `${s.errorsByStatus.reduce((n,[,c])=>n+c,0)} === ${s.errors}`);
+chk("slowest >= p95 sample", !s.slowest || s.durations.length === 0 || s.slowest.duration >= s.durations[s.durations.length-1] || s.slowest.duration === Math.max(...s.durations), `${s.slowest?.duration}`);
 
 // 4. derived percentages
 const errPct = (s.errors/s.calls)*100;
@@ -69,6 +76,8 @@ chk("cache reads are a subset of input", life.tokensCacheRead<=life.tokensIn,
     `${life.tokensCacheRead} <= ${life.tokensIn}`);
 chk("distinct excludes cache reads", distinct<total || life.tokensCacheRead===0,
     `distinct ${d.compactNum(distinct)} < total ${d.compactNum(total)}`);
+chk("lifetime cacheWrite == sum(days)", life.tokensCacheWrite===cold.reduce((a,x)=>a+x.tokensCacheWrite,0));
+chk("lifetime reasoning == sum(days)", life.tokensReasoning===cold.reduce((a,x)=>a+x.tokensReasoning,0));
 chk("lifetime cacheRead == sum(days)", life.tokensCacheRead===cold.reduce((a,x)=>a+x.tokensCacheRead,0));
 const cmp=d.tokenComparison(distinct);
 const m=cmp.match(/~([\d,]+)x the text of (.+)/);

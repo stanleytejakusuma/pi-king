@@ -166,6 +166,22 @@ export type UsageStats = {
   calls: number;
   errors: number;
   topModels: Array<{ model: string; pct: number }>;
+  /** Per-model figures for the stats screen, sorted by call count. p95 is per
+   * model because a slow tail usually belongs to one model, and the aggregate
+   * p95 hides which. */
+  perModel: Array<{ model: string; calls: number; tokensIn: number; errors: number; p95: number }>;
+  /** HTTP status codes >= 400 with their counts, most frequent first. The
+   * band's error rate says how much is failing; this says what kind. */
+  errorsByStatus: Array<[number, number]>;
+  /** The single longest call. p95 hides the outlier that made someone wait. */
+  slowest: { duration: number; model: string } | undefined;
+  /** Tokens written into the provider cache. Read over write is the leverage
+   * of caching: how many times each cached token was served back. */
+  tokensCacheWrite: number;
+  /** Reasoning tokens. Measured NOT to be a strict subset of `out` (7 of
+   * 9,058 sampled records exceed it), so it is reported beside output, never
+   * derived from it. */
+  tokensReasoning: number;
   /** Calls per hour, midnight through the current hour. Real data from each
    * call's own timestamp — not smoothed, not synthesised. */
   hourly: number[];
@@ -228,14 +244,33 @@ export async function readDailyTokens(todayOverride?: DayTotal): Promise<DayTota
   }
   const volatile = new Set(dirs.slice(-2));
 
-  let cache: Record<string, { tokensIn: number; tokensOut: number; tokensCacheRead: number; calls: number }> = {};
+  let cache: Record<string, Omit<DayTotal, "day">> = {};
   try {
     cache = JSON.parse(readFileSync(DAILY_CACHE, "utf8")) as typeof cache;
   } catch { /* first run, or unreadable: rebuild */ }
 
+  // Lifetime means lifetime: the router rotates old log directories away, and
+  // deriving the series purely from surviving directories made every figure
+  // labelled "lifetime" quietly shrink as days rotated out. A cached day was
+  // measured while its logs existed, so it still counts after they are gone —
+  // but only if it carries every field, because a gone day can never be
+  // rescanned to fill one in. Incomplete orphans stay in the file (they are
+  // measurements; deleting them destroys data) and out of the series.
+  const scanned = new Set(dirs);
+  const complete = (h: Record<string, unknown>): boolean =>
+    ["tokensIn", "tokensOut", "tokensCacheRead", "tokensCacheWrite", "tokensReasoning", "calls"]
+      .every((f) => typeof h[f] === "number");
+  const archived = Object.keys(cache)
+    .filter((day) => /^\d{4}-\d{2}-\d{2}$/.test(day) && !scanned.has(day) && complete(cache[day]));
+  const allDays = [...dirs, ...archived].sort();
+
   const out: DayTotal[] = [];
   let dirty = false;
-  for (const day of dirs) {
+  for (const day of allDays) {
+    if (!scanned.has(day)) {
+      out.push({ day, ...cache[day] });
+      continue;
+    }
     if (todayOverride && day === todayOverride.day) {
       out.push(todayOverride);
       continue;
@@ -243,13 +278,16 @@ export async function readDailyTokens(todayOverride?: DayTotal): Promise<DayTota
     const hit = cache[day];
     // Require every field. Entries written before a field existed would
     // otherwise be served with it silently missing, which reads as zero.
-    if (!volatile.has(day) && hit && typeof hit.tokensIn === "number" && typeof hit.tokensCacheRead === "number") {
+    if (!volatile.has(day) && hit && typeof hit.tokensIn === "number" && typeof hit.tokensCacheRead === "number" &&
+        typeof hit.tokensCacheWrite === "number" && typeof hit.tokensReasoning === "number") {
       out.push({ day, ...hit });
       continue;
     }
     let tokensIn = 0;
     let tokensOut = 0;
     let tokensCacheRead = 0;
+    let tokensCacheWrite = 0;
+    let tokensReasoning = 0;
     let calls = 0;
     try {
       const files = (await readdir(join(CALL_LOGS, day))).filter((f) => f.endsWith(".json"));
@@ -270,12 +308,14 @@ export async function readDailyTokens(todayOverride?: DayTotal): Promise<DayTota
             tokensIn += Number(tk.in) || 0;
             tokensOut += Number(tk.out) || 0;
             tokensCacheRead += Number(tk.cacheRead) || 0;
+            tokensCacheWrite += Number(tk.cacheWrite) || 0;
+            tokensReasoning += Number(tk.reasoning) || 0;
           }
         }
       }
     } catch { continue; }
-    out.push({ day, tokensIn, tokensOut, tokensCacheRead, calls });
-    if (!volatile.has(day)) { cache[day] = { tokensIn, tokensOut, tokensCacheRead, calls }; dirty = true; }
+    out.push({ day, tokensIn, tokensOut, tokensCacheRead, tokensCacheWrite, tokensReasoning, calls });
+    if (!volatile.has(day)) { cache[day] = { tokensIn, tokensOut, tokensCacheRead, tokensCacheWrite, tokensReasoning, calls }; dirty = true; }
   }
   if (dirty) {
     try {
@@ -356,6 +396,8 @@ export async function readLifetimeStats(todayOverride?: DayTotal): Promise<Lifet
   const tokensIn = active.reduce((n, d) => n + d.tokensIn, 0);
   const tokensOut = active.reduce((n, d) => n + d.tokensOut, 0);
   const tokensCacheRead = active.reduce((n, d) => n + d.tokensCacheRead, 0);
+  const tokensCacheWrite = active.reduce((n, d) => n + d.tokensCacheWrite, 0);
+  const tokensReasoning = active.reduce((n, d) => n + d.tokensReasoning, 0);
   const calls = active.reduce((n, d) => n + d.calls, 0);
 
   const dayMs = 86_400_000;
@@ -382,7 +424,7 @@ export async function readLifetimeStats(todayOverride?: DayTotal): Promise<Lifet
   const gapDays = Math.round((asDate(todayKey) - asDate(last)) / dayMs);
   if (gapDays > 1) current = 0;
 
-  return { tokensIn, tokensOut, tokensCacheRead, calls, activeDays: active.length, currentStreak: current, longestStreak: longest, days };
+  return { tokensIn, tokensOut, tokensCacheRead, tokensCacheWrite, tokensReasoning, calls, activeDays: active.length, currentStreak: current, longestStreak: longest, days };
 }
 
 export async function readUsageStats(): Promise<UsageStats | undefined> {
@@ -396,17 +438,21 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
   }
   if (files.length === 0) return undefined;
 
-  const counts = new Map<string, number>();
+  const byModel = new Map<string, { calls: number; tokensIn: number; errors: number; durations: number[] }>();
+  const byStatus = new Map<number, number>();
   const byHour = new Map<number, number>();
   let calls = 0;
   let errors = 0;
   let tokensIn = 0;
   let tokensOut = 0;
   let tokensCacheRead = 0;
+  let tokensCacheWrite = 0;
+  let tokensReasoning = 0;
   const durations: number[] = [];
   let partial = false;
   let lastHourCalls = 0;
   let lastHourTokensIn = 0;
+  let slowest: { duration: number; model: string } | undefined;
 
   // Bounded concurrency: unbounded Promise.all over thousands of files spikes
   // file descriptors for no throughput gain.
@@ -428,17 +474,31 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
       }
       calls++;
       const status = typeof s.status === "number" ? s.status : 0;
-      if (status >= 400) errors++;
+      if (status >= 400) {
+        errors++;
+        byStatus.set(status, (byStatus.get(status) ?? 0) + 1);
+      }
       const tk = s.tokens as Record<string, unknown> | undefined;
+      const callIn = tk ? Number(tk.in) || 0 : 0;
       if (tk) {
-        tokensIn += Number(tk.in) || 0;
+        tokensIn += callIn;
         tokensOut += Number(tk.out) || 0;
         tokensCacheRead += Number(tk.cacheRead) || 0;
+        tokensCacheWrite += Number(tk.cacheWrite) || 0;
+        tokensReasoning += Number(tk.reasoning) || 0;
       }
       const dur = Number(s.duration);
-      if (Number.isFinite(dur) && dur > 0) durations.push(dur);
       const model = shortModel(String(s.model ?? "unknown"));
-      counts.set(model, (counts.get(model) ?? 0) + 1);
+      if (Number.isFinite(dur) && dur > 0) {
+        durations.push(dur);
+        if (!slowest || dur > slowest.duration) slowest = { duration: dur, model };
+      }
+      const m = byModel.get(model) ?? { calls: 0, tokensIn: 0, errors: 0, durations: [] };
+      m.calls++;
+      m.tokensIn += callIn;
+      if (status >= 400) m.errors++;
+      if (Number.isFinite(dur) && dur > 0) m.durations.push(dur);
+      byModel.set(model, m);
       // Timestamps are ISO-8601 UTC. Slicing the hour out of the string buckets
       // by UTC, which put the busiest hour seven columns from where it happened
       // for anyone not on UTC, in a row that sits beside a local clock. Parse
@@ -450,17 +510,26 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
         if (Number.isFinite(h)) byHour.set(h, (byHour.get(h) ?? 0) + 1);
         if (Date.now() - t.getTime() <= 3_600_000) {
           lastHourCalls++;
-          lastHourTokensIn += tk ? Number(tk.in) || 0 : 0;
+          lastHourTokensIn += callIn;
         }
       }
     }
   }
   if (calls === 0) return undefined;
 
-  const topModels = [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
+  const perModel = [...byModel.entries()]
+    .sort((a, b) => b[1].calls - a[1].calls)
+    .map(([model, m]) => {
+      m.durations.sort((x, y) => x - y);
+      const p95 = m.durations.length > 0
+        ? m.durations[Math.min(m.durations.length - 1, Math.floor(m.durations.length * 0.95))]
+        : 0;
+      return { model, calls: m.calls, tokensIn: m.tokensIn, errors: m.errors, p95 };
+    });
+  const topModels = perModel
     .slice(0, 3)
-    .map(([model, n]) => ({ model, pct: Math.round((n / calls) * 100) }));
+    .map((m) => ({ model: m.model, pct: Math.round((m.calls / calls) * 100) }));
+  const errorsByStatus = [...byStatus.entries()].sort((a, b) => b[1] - a[1]);
 
   const lastHour = byHour.size > 0 ? Math.max(...byHour.keys()) : 0;
   const hourly: number[] = [];
@@ -484,7 +553,7 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
   }
 
   durations.sort((a, b) => a - b);
-  return { calls, errors, tokensIn, tokensOut, tokensCacheRead, peakPeriod, durations, topModels, hourly, peakHour: Math.max(0, ...hourly), partial, lastHour: { calls: lastHourCalls, tokensIn: lastHourTokensIn } };
+  return { calls, errors, tokensIn, tokensOut, tokensCacheRead, tokensCacheWrite, tokensReasoning, peakPeriod, durations, topModels, perModel, errorsByStatus, slowest, hourly, peakHour: Math.max(0, ...hourly), partial, lastHour: { calls: lastHourCalls, tokensIn: lastHourTokensIn } };
 }
 
 /**
@@ -525,7 +594,7 @@ export class StatsCache {
       readUsageStats()
         .then(async (s) => {
           const override: DayTotal | undefined = s
-            ? { day: today(), tokensIn: s.tokensIn, tokensOut: s.tokensOut, tokensCacheRead: s.tokensCacheRead, calls: s.calls }
+            ? { day: today(), tokensIn: s.tokensIn, tokensOut: s.tokensOut, tokensCacheRead: s.tokensCacheRead, tokensCacheWrite: s.tokensCacheWrite, tokensReasoning: s.tokensReasoning, calls: s.calls }
             : undefined;
           const l = await readLifetimeStats(override);
           this.value = s; this.life = l; this.daily = l ? l.days.slice(-DAILY_WINDOW) : [];
@@ -550,6 +619,12 @@ export type LifetimeStats = {
   /** Cache reads, so callers can subtract them. Input alone counts the same
    * history re-sent each turn as though it were new text. */
   tokensCacheRead: number;
+  /** Cache writes. Read over write is the leverage of caching: how many times
+   * each token written into the cache was served back out of it. */
+  tokensCacheWrite: number;
+  /** Reasoning tokens, reported beside output and never derived from it —
+   * measured not to be a strict subset of `out`. */
+  tokensReasoning: number;
   calls: number;
   activeDays: number;
   currentStreak: number;
@@ -557,7 +632,14 @@ export type LifetimeStats = {
   days: DayTotal[];
 };
 
-export type DayTotal = { day: string; tokensIn: number; tokensOut: number; tokensCacheRead: number; calls: number };
+export type DayTotal = {
+  day: string; tokensIn: number; tokensOut: number; tokensCacheRead: number;
+  // Added after the cache first shipped. The cache requires every field to be
+  // present before it trusts an entry, so entries written before these existed
+  // are recomputed on the next scan rather than read back as zero.
+  tokensCacheWrite: number; tokensReasoning: number;
+  calls: number;
+};
 
 export type RecentProject = { project: string; path: string; lastActive: number };
 

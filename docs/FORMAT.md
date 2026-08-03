@@ -165,5 +165,11 @@ remains, because it is the only pointer that knows how to resume the transcript
 (`pi --session <id>`). Files are removed only by an explicit dismiss in the
 dashboard, or at clean shutdown of a session that never appeared on it.
 
+The day cache is an archive, not just an accelerator. The router rotates old
+log directories away; a cached day that carries every field keeps counting
+toward lifetime figures after its logs are gone, because it was measured while
+they existed. A cached day missing fields whose logs are gone can never be
+completed and is kept in the file but excluded from the series.
+
 Cost is deliberately not reported. The logs carry no price data, and a hardcoded
 price table would silently rot into wrong numbers.
