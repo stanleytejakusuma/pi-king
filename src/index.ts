@@ -76,6 +76,20 @@ export const stateIcon: Record<TitleState, string> = {
  * missing sort priority made the comparator return NaN, quietly scrambling
  * row order. Every lookup keyed by a status now goes through here. */
 const KNOWN_STATES = new Set<string>(["working", "idle", "attention", "error", "exited"]);
+
+/** States this project used to emit, mapped to what they actually meant.
+ *
+ * A long-lived session keeps running the extension build it started with, so
+ * after a state is retired its cards keep arriving for hours. Translating one
+ * of OUR OWN former states is not the same as guessing at a stranger's: the
+ * old writer's code is in this repo's history and its meaning is known.
+ *
+ * `trust` was only ever set from inside a working turn — the old code refused
+ * to set it unless the state was already "working" — so every card still
+ * carrying it is, by construction, a session mid-turn. It is shown as such.
+ * The alternative was a row reading "unknown state: trust", which is honest
+ * about the format and useless about the session. */
+const RETIRED_STATES: Record<string, TitleState> = { trust: "working" };
 export function isKnownState(s: string): s is TitleState {
   return KNOWN_STATES.has(s);
 }
@@ -268,6 +282,13 @@ function lastReplyFor(sessionFile: string | undefined): string | undefined {
  * not. */
 const PLACEHOLDER_ACTIVITY = new Set(["Session started.", "Waiting for input.", "Session ended."]);
 
+/** Activity text produced by the retired approval heuristic. It is not merely
+ * stale, it was measured wrong — a 25-second ungated bash reported this for 22
+ * of those seconds — so a card still carrying it is repeating a claim this
+ * project has already withdrawn. Treated as a placeholder, which means the
+ * row falls back to the session's last reply. */
+const RETIRED_ACTIVITY = /^Approval needed: /;
+
 /** Reads every session-status file. A card whose writer process is gone is
  * not deleted: the transcript it points at survives, and the card is the only
  * thing that remembers how to resume it. It renders as "exited" instead. */
@@ -312,6 +333,7 @@ function readSessions(): DashboardEntry[] {
     // would delete the one pointer that knows how to resume the transcript.
     const dead = live !== undefined && (procStart === undefined || identityMismatch);
     if (dead) raw.status = "exited";
+    else if (RETIRED_STATES[raw.status]) raw.status = RETIRED_STATES[raw.status];
     // Only sessions that explicitly opted in — spawned through the dashboard
     // or backgrounded via /bg — appear here. Being alive with a status file
     // is not enough; every interactive session has one for pi-alerts' own
@@ -328,7 +350,7 @@ function readSessions(): DashboardEntry[] {
       state: raw.status,
       contextPct: typeof raw.contextPct === "number" && Number.isFinite(raw.contextPct)
         ? Math.max(0, Math.min(999, Math.round(raw.contextPct))) : undefined,
-      lastActivity: PLACEHOLDER_ACTIVITY.has(raw.activity)
+      lastActivity: PLACEHOLDER_ACTIVITY.has(raw.activity) || RETIRED_ACTIVITY.test(raw.activity)
         ? (() => { const r = lastReplyFor(typeof raw.sessionFile === "string" ? raw.sessionFile : undefined); return r ? `\u203a ${r}` : raw.activity; })()
         : raw.activity,
       updatedAt: raw.lastActivity || Date.now(),
