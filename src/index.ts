@@ -123,6 +123,7 @@ import {
   StatsCache,
   sparkline,
   readInventory,
+  readLastReply,
   readRecentProjects,
   quoteOfTheDay,
   type Inventory,
@@ -211,6 +212,32 @@ function livePiPids(): Map<number, number> | undefined {
   return pids;
 }
 
+/** Cache for last-reply lookups, keyed by transcript path. Reading a tail is
+ * cheap but not free, and refresh runs every second; size+mtime make a exact
+ * staleness key, so an idle fleet costs one stat per session per tick. */
+const lastReplyCache = new Map<string, { size: number; mtimeMs: number; reply: string | undefined }>();
+function lastReplyFor(sessionFile: string | undefined): string | undefined {
+  if (!sessionFile) return undefined;
+  try {
+    const st = statSync(sessionFile);
+    const hit = lastReplyCache.get(sessionFile);
+    if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.reply;
+    const reply = readLastReply(sessionFile);
+    lastReplyCache.set(sessionFile, { size: st.size, mtimeMs: st.mtimeMs, reply });
+    return reply;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Activity strings that say nothing. When one of these is all the tracker
+ * has, the transcript's last assistant reply is strictly better — it is what
+ * Claude Code's agent list shows, and it answers "what did this session last
+ * say" instead of "a session exists". Meaningful activities (a prompt, an
+ * error, Done:, Approval needed:) are kept; they carry intent the reply may
+ * not. */
+const PLACEHOLDER_ACTIVITY = new Set(["Session started.", "Waiting for input.", "Session ended."]);
+
 /** Reads every session-status file. A card whose writer process is gone is
  * not deleted: the transcript it points at survives, and the card is the only
  * thing that remembers how to resume it. It renders as "exited" instead. */
@@ -271,7 +298,9 @@ function readSessions(): DashboardEntry[] {
       state: raw.status,
       contextPct: typeof raw.contextPct === "number" && Number.isFinite(raw.contextPct)
         ? Math.max(0, Math.min(999, Math.round(raw.contextPct))) : undefined,
-      lastActivity: raw.activity,
+      lastActivity: PLACEHOLDER_ACTIVITY.has(raw.activity)
+        ? (() => { const r = lastReplyFor(typeof raw.sessionFile === "string" ? raw.sessionFile : undefined); return r ? `\u203a ${r}` : raw.activity; })()
+        : raw.activity,
       updatedAt: raw.lastActivity || Date.now(),
       subagents: raw.subagents ?? [],
       tmuxName: undefined,
@@ -763,7 +792,6 @@ class DashboardView implements Component {
     flushPendingRenames(this.rows);
     if (this.selected >= this.rows.length) this.selected = Math.max(0, this.rows.length - 1);
     this.refreshGitDrift();
-    this.capturePeek();
   }
 
   /** Uncommitted-change counts per project directory, refreshed lazily. A
@@ -790,32 +818,6 @@ class DashboardView implements Component {
         this.gitDrift.set(dir, { n: -1, at: Date.now() });
       }
     }
-  }
-
-  /** The last lines of the selected session's tmux pane. What claude-squad
-   * calls preview: the difference between a supervisor and a list is being
-   * able to SEE a session without the commitment of attaching to it. */
-  private peek: string[] = [];
-  private capturePeek(): void {
-    this.peek = [];
-    const row = this.rows[this.selected];
-    if (!row) return;
-    const tmuxName = this.rowTmuxName(row);
-    if (!tmuxName) return;
-    try {
-      const r = spawnSync(TMUX, ["capture-pane", "-p", "-t", clean(tmuxName)], { encoding: "utf8", timeout: 1500 });
-      if (r.status !== 0) return;
-      // clean() at the boundary: pane content is arbitrary program output and
-      // is about to be rendered into this terminal. Lines that are nothing but
-      // box-drawing are dropped too: an idle TUI's pane bottom is mostly its
-      // input-box borders, and a peek of three rules and a blank gap shows
-      // furniture, not the session.
-      const furniture = /^[\s\u2500-\u257f\u2580-\u259f|_=~-]*$/;
-      const all = String(r.stdout || "").split("\n")
-        .map((l) => clean(l))
-        .filter((l) => !furniture.test(l));
-      this.peek = all.slice(Math.max(0, all.length - 6));
-    } catch { /* no peek is fine; an empty preview is not an error */ }
   }
 
   private showMessage(msg: string): void {
@@ -900,14 +902,12 @@ class DashboardView implements Component {
     if (matchesKey(data, "down")) {
       this.deleteArmedFor = undefined;
       this.selected = Math.min(this.rows.length - 1, this.selected + 1);
-      this.capturePeek();
       this.tui.requestRender();
       return;
     }
     if (matchesKey(data, "up")) {
       this.deleteArmedFor = undefined;
       this.selected = Math.max(0, this.selected - 1);
-      this.capturePeek();
       this.tui.requestRender();
       return;
     }
@@ -1259,22 +1259,6 @@ class DashboardView implements Component {
           th.fg("muted", truncateToWidth(e.lastActivity, Math.max(10, MEASURE - nameW - statusW - visibleWidth(right) - 12), "\u2026", true));
         lines.push(split(left, right));
       });
-    }
-
-    // ---- peek -----------------------------------------------------------
-    // The last few lines of the selected session's pane, read-only. Seeing
-    // what a session is doing without attaching is most of what supervising
-    // means; before this, the only way to check on one was to enter it.
-    if (this.peek.length > 0) {
-      const sel = this.rows[this.selected];
-      const peekName = sel ? this.rowTmuxName(sel) : undefined;
-      if (peekName) {
-        lines.push("");
-        lines.push("  " + th.fg("dim", `\u2500\u2500 peek \u00b7 ${peekName} \u2500\u2500`));
-        for (const l of this.peek) {
-          lines.push("  " + th.fg("muted", truncateToWidth(l, Math.max(10, MEASURE - 4), "\u2026", true)));
-        }
-      }
     }
 
     // ---- inventory ------------------------------------------------------

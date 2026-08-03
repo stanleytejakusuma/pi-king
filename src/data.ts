@@ -18,7 +18,7 @@
  *    silently. A fabricated authoritative-looking number is worse than none.
  */
 
-import { openSync, readSync, closeSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { openSync, readSync, closeSync, fstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join, basename, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -642,6 +642,47 @@ export type DayTotal = {
 };
 
 export type RecentProject = { project: string; path: string; lastActive: number };
+
+/** The last assistant text from a session transcript, read from the tail
+ * without slurping the file (transcripts reach multi-MB). This is what Claude
+ * Code's agent list shows per agent, and it is the best answer to "what did
+ * this session last say" that exists on disk — it works for sessions running
+ * older extension code and for exited cards, because the transcript is the
+ * source, not the tracker. Assistant entries whose content is only thinking
+ * blocks are skipped; the reply is the thing said out loud. */
+export function readLastReply(sessionFile: string, tailBytes = 262_144): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(sessionFile, "r");
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - tailBytes);
+    const buf = Buffer.alloc(Math.min(tailBytes, size));
+    readSync(fd, buf, 0, buf.length, start);
+    const lines = buf.toString("utf8").split("\n");
+    // First line may be a partial JSON record when the window starts mid-line;
+    // JSON.parse simply rejects it, which is the correct outcome.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let entry: { type?: string; message?: { role?: string; content?: unknown } };
+      try { entry = JSON.parse(lines[i]); } catch { continue; }
+      if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
+      const content = Array.isArray(entry.message.content) ? entry.message.content : [];
+      for (const c of content) {
+        const block = c as { type?: string; text?: string };
+        if (block?.type === "text" && typeof block.text === "string") {
+          // Markdown emphasis markers are noise at one line of display width;
+          // stripping them is display formatting, not content editing.
+          const text = clean(block.text.replace(/[*`_#]/g, "").replace(/\s+/g, " ").trim());
+          if (text) return text.length > 200 ? `${text.slice(0, 199)}\u2026` : text;
+        }
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* already closed */ }
+  }
+}
 
 /** Reads just the first line of a file without slurping it. Session
  * transcripts reach multi-MB; only the opening `session` entry is needed. */

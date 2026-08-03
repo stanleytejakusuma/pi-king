@@ -245,11 +245,12 @@ happened while you were gone.
   use `osascript`; no dependency is added, and on other platforms they are
   simply absent.
 
-The selected session shows a live **peek**: the last few lines of its pane,
-read-only, under the list. Each row also carries its **context usage** (`ctx
-72%`, colour turning as compaction approaches) and each project header shows
-**uncommitted-change counts**, because a returning user's second question after
-"what did it do" is "did it leave work uncommitted".
+Idle rows show the session's **last reply** — the closing line of its most
+recent answer, read from the transcript itself, so it works even for sessions
+started before pi-king was installed. Each row also carries its **context
+usage** (`ctx 72%`, colour turning as compaction approaches) and each project
+header shows **uncommitted-change counts**, because a returning user's second
+question after "what did it do" is "did it leave work uncommitted".
 
 Sessions are never deleted by the dashboard. A session whose process has ended
 shows as **exited**, and enter resumes its transcript in place, in its
