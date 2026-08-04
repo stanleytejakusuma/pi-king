@@ -253,8 +253,17 @@ type HubAction =
  * simply left out of the query and therefore absent from the result, which is
  * the correct answer anyway: no real process has a pid shaped like that.
  */
-function livePiPids(pids: number[]): Map<number, number> | undefined {
-  const safe = [...new Set(pids)].filter((p) => Number.isInteger(p) && p > 0 && p <= 99_999_999);
+export function livePiPids(pids: number[]): Map<number, number> | undefined {
+  // 99999 is the real ceiling, not a round guess: binary-searched against this
+  // machine's own ps -p, which accepts pid 99999 but rejects 100000 outright
+  // ("process id too large", killing the whole query, not just that pid) --
+  // the traditional BSD/macOS PID_MAX. An earlier version of this filter used
+  // 99,999,999 on the theory that any generously-large number was safely
+  // "obviously not a real pid"; that bound was 1000x too permissive and the
+  // exact failure it was meant to prevent still reproduced live during
+  // verification, from nothing more exotic than "a real pid plus a few
+  // million" — a value a corrupted status file could plausibly contain.
+  const safe = [...new Set(pids)].filter((p) => Number.isInteger(p) && p > 0 && p <= 99_999);
   if (safe.length === 0) return new Map();
   const res = spawnSync("/bin/ps", ["-p", safe.join(","), "-o", "pid=,lstart=,command="], { encoding: "utf8", timeout: 3000 });
   if (res.error || typeof res.stdout !== "string") return undefined; // ps itself did not run — unknown, do not prune

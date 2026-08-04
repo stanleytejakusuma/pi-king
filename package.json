@@ -54,8 +54,9 @@
   "scripts": {
     "prepublishOnly": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs",
     "check": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs",
-    "verify": "node tools/verify-metrics.mjs && node tools/verify-reboot-recovery.mjs",
+    "verify": "node tools/verify-metrics.mjs && node tools/verify-reboot-recovery.mjs && node tools/verify-live-pids.mjs",
     "verify:reboot": "node tools/verify-reboot-recovery.mjs",
+    "verify:pids": "node tools/verify-live-pids.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
