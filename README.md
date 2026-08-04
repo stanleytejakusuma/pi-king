@@ -170,7 +170,7 @@ pi-king          # open the dashboard (installed as a bin by the package)
 | Key | Action |
 |---|---|
 | `↑` `↓` | select |
-| `enter` | attach (tmux-backed) or jump to its terminal tab |
+| `enter` / `→` | attach (tmux-backed) or jump to its terminal tab |
 | `n` | new session |
 | `e` | rename |
 | `x` `x` | delete (two presses) |

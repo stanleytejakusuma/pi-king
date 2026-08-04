@@ -392,7 +392,12 @@ function readSessions(): DashboardEntry[] {
  * those are written by each session's own process, and the dashboard writing
  * into them would put two processes on one file. This is a dashboard concern,
  * so the dashboard owns the file. */
-type Layout = { pinned: string[]; order: string[] };
+/** lastSelected is the session id the cursor sat on when the dashboard was
+ * last closed — restored on the next open so leaving a session and coming
+ * back does not reset you to the top of the list. Not a strong preference
+ * like pin/order: a stale id (its card was since dismissed) just fails the
+ * lookup and falls back to row 0, same as never having one. */
+type Layout = { pinned: string[]; order: string[]; lastSelected?: string };
 const LAYOUT_FILE = join(SESSION_STATUS_DIR, "..", "layout.json");
 /** Records which boot generation reboot recovery has already run for, so a
  * second dashboard opened moments after the first does not race it into
@@ -403,7 +408,7 @@ function readLayout(): Layout {
   try {
     const raw = JSON.parse(readFileSync(LAYOUT_FILE, "utf8")) as Partial<Layout>;
     const strs = (v: unknown) => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
-    return { pinned: strs(raw.pinned), order: strs(raw.order) };
+    return { pinned: strs(raw.pinned), order: strs(raw.order), lastSelected: typeof raw.lastSelected === "string" ? raw.lastSelected : undefined };
   } catch {
     return { pinned: [], order: [] };
   }
@@ -983,6 +988,17 @@ class DashboardView implements Component {
     initialMessage?: string,
   ) {
     this.refresh();
+    // Restores the cursor to wherever it was left last time, rather than
+    // always opening on row 0 — leaving "Homelab Setup" and coming straight
+    // back should put the cursor back on Homelab Setup, not reset to the top
+    // of the pinned section. A dismissed or since-vanished card's id simply
+    // fails this lookup and falls back to row 0, which is exactly the old
+    // behaviour, so there is no failure mode here worse than doing nothing.
+    const lastId = readLayout().lastSelected;
+    if (lastId) {
+      const idx = this.rows.findIndex((r) => r.kind === "session" && r.entry.sessionId === lastId);
+      if (idx >= 0) this.selected = idx;
+    }
     if (initialMessage) this.showMessage(initialMessage);
     // Both are cheap and static for the lifetime of the overlay: an inventory
     // snapshot (readdir + stat) and a recent-projects scan that reads only the
@@ -1033,6 +1049,20 @@ class DashboardView implements Component {
         this.gitDrift.set(dir, { n: -1, at: Date.now() });
       }
     }
+  }
+
+  /** The only exit from this view, on every path — attach, resume, cancel.
+   * Persists which row the cursor was on before handing control back, so the
+   * next open can restore it. A no-op write when the row hasn't changed since
+   * the last save, and silently skipped for an orphan row (no session id to
+   * remember against). */
+  private closeDashboard(result: HubAction | undefined): void {
+    const row = this.rows[this.selected];
+    if (row?.kind === "session") {
+      const l = readLayout();
+      if (l.lastSelected !== row.entry.sessionId) writeLayout({ ...l, lastSelected: row.entry.sessionId });
+    }
+    this.done(result);
   }
 
   private showMessage(msg: string): void {
@@ -1148,7 +1178,7 @@ class DashboardView implements Component {
       return;
     }
     if (step.kind === "new-dir") {
-      this.done({ type: "create", name: step.name, dir: value });
+      this.closeDashboard({ type: "create", name: step.name, dir: value });
       return;
     }
     if (step.kind === "rename") {
@@ -1177,7 +1207,7 @@ class DashboardView implements Component {
     // accident while navigating (e.g. inside a session name), and this is a
     // dashboard people rely on staying open, not a pager.
     if (matchesKey(data, "escape")) {
-      this.done(undefined);
+      this.closeDashboard(undefined);
       return;
     }
     // Reorder before plain movement: shift+arrow must not fall through to the
@@ -1259,8 +1289,13 @@ class DashboardView implements Component {
             // once it is gone, the layout entry is a dangling id that would
             // otherwise accumulate forever.
             const l = readLayout();
-            if (l.pinned.includes(id) || l.order.includes(id)) {
-              writeLayout({ pinned: l.pinned.filter((x) => x !== id), order: l.order.filter((x) => x !== id) });
+            if (l.pinned.includes(id) || l.order.includes(id) || l.lastSelected === id) {
+              writeLayout({
+                ...l,
+                pinned: l.pinned.filter((x) => x !== id),
+                order: l.order.filter((x) => x !== id),
+                lastSelected: l.lastSelected === id ? undefined : l.lastSelected,
+              });
             }
             this.showMessage(`Card removed. The transcript is untouched: pi --session ${id}`);
           } catch {
@@ -1292,7 +1327,12 @@ class DashboardView implements Component {
       return;
     }
     if (this.deleteArmedFor) this.deleteArmedFor = undefined;
-    if (matchesKey(data, "enter")) {
+    // right is an alternative to enter, not a distinct gesture: it goes
+    // through the exact same branch below (resurrect-if-exited, then
+    // attach), so a row behaves identically no matter which key opens it.
+    // Not bound on orphan-tmux rows specially — it falls through to the same
+    // rowTmuxName/attach path enter already uses for those.
+    if (matchesKey(data, "enter") || matchesKey(data, "right")) {
       if (!row) return;
       // Enter on an exited card resurrects it: a fresh tmux session resuming
       // the same transcript in the same directory, then attach as usual.
@@ -1328,7 +1368,7 @@ class DashboardView implements Component {
           this.showMessage(result.message);
           return;
         }
-        this.done({ type: "attach", tmuxName: target, expectedPid: undefined });
+        this.closeDashboard({ type: "attach", tmuxName: target, expectedPid: undefined });
         return;
       }
       const tmuxName = this.rowTmuxName(row);
@@ -1337,7 +1377,7 @@ class DashboardView implements Component {
         // re-confirm with tmux directly instead of trusting the bulk listing it
         // was built from. Orphan rows have no Pi process to verify against.
         const expectedPid = row.kind === "session" ? row.entry.pid : undefined;
-        this.done({ type: "attach", tmuxName, expectedPid });
+        this.closeDashboard({ type: "attach", tmuxName, expectedPid });
         return;
       }
       if (row.kind === "session") {
