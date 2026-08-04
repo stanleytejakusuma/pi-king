@@ -668,7 +668,17 @@ export class StatsCache {
           const l = await readLifetimeStats(override);
           this.value = s; this.life = l; this.daily = l ? l.days.slice(-DAILY_WINDOW) : [];
         })
-        .catch(() => { this.value = undefined; this.daily = []; this.life = undefined; })
+        // A refresh that throws leaves the previous reading in place rather
+        // than blanking it. "Missing data renders as nothing" governs data
+        // that was never measured; a transient hiccup on a read that
+        // succeeded 60s ago is a different case; discarding a real number
+        // because the NEXT attempt to refresh it failed is not honesty, it is
+        // a display bug that reads as one at the worst moment — disk still
+        // settling or the log writer still coming back up right after a
+        // reboot, exactly when a stale-but-real number is more useful than
+        // no number. Self-heals on the next successful refresh; no error is
+        // swallowed silently, since normal operation never reaches here.
+        .catch(() => { /* keep this.value / this.daily / this.life as they were */ })
         .finally(() => {
           this.loaded = true;
           this.fetchedAt = Date.now();

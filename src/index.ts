@@ -394,6 +394,10 @@ function readSessions(): DashboardEntry[] {
  * so the dashboard owns the file. */
 type Layout = { pinned: string[]; order: string[] };
 const LAYOUT_FILE = join(SESSION_STATUS_DIR, "..", "layout.json");
+/** Records which boot generation reboot recovery has already run for, so a
+ * second dashboard opened moments after the first does not race it into
+ * resuming the same transcript twice — see restoreRebootOrphans. */
+const REBOOT_RECOVERY_FILE = join(SESSION_STATUS_DIR, "..", "reboot-recovery.json");
 
 function readLayout(): Layout {
   try {
@@ -510,7 +514,7 @@ function tmuxError(result: ReturnType<typeof spawnSync>): string {
  * a configuration they had not chosen. */
 const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.env.HOME ?? ""}/.pi/agent`;
 
-function createTmuxSession(name: string, dir: string, resumeSessionId?: string): { ok: boolean; message: string } {
+export function createTmuxSession(name: string, dir: string, resumeSessionId?: string): { ok: boolean; message: string } {
   const result = spawnSync(TMUX, [
     "new-session", "-d", "-s", name,
     "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
@@ -533,6 +537,96 @@ function createTmuxSession(name: string, dir: string, resumeSessionId?: string):
   ], { encoding: "utf8", timeout: 5000 });
   if (result.status !== 0) return { ok: false, message: `Failed to create session: ${tmuxError(result)}` };
   return { ok: true, message: resumeSessionId ? `Resumed "${name}" in ${dir}.` : `Created "${name}" in ${dir}.` };
+}
+
+/** Seconds since the epoch this machine last booted, or undefined when it
+ * cannot be determined — macOS only; anything else degrades to "reboot
+ * recovery does not engage" rather than guessing. `sysctl -n kern.boottime`
+ * prints `{ sec = 1785800818, usec = 776947 } Tue Aug  4 06:46:58 2026`. */
+function bootTimeSec(): number | undefined {
+  const r = spawnSync("sysctl", ["-n", "kern.boottime"], { encoding: "utf8", timeout: 2000 });
+  if (r.status !== 0 || !r.stdout) return undefined;
+  const m = /sec\s*=\s*(\d+)/.exec(r.stdout);
+  return m ? Number(m[1]) : undefined;
+}
+
+/** How long after boot a card's last write can still count as "killed by this
+ * reboot" rather than "already exited for an unrelated reason, long before
+ * today". Generous margin for a slow shutdown sequence; measured on a real
+ * restart the actual gap was 33s. */
+const REBOOT_WINDOW_SEC = 600;
+
+/**
+ * Recreates every card that stopped existing at the same moment the machine
+ * did, so opening the dashboard after a restart looks like nothing happened
+ * rather than presenting thirteen cards to individually resume.
+ *
+ * The signal is proximity to boot, not the on-disk status field. A plain
+ * Restart from the Apple menu gives running processes a SIGTERM before the new
+ * boot completes, and this project's own shutdown hook catches that and
+ * writes status:"exited" cleanly — verified live: every card here was
+ * exited exactly 33s before this machine's own boot time. A hard power-cut
+ * or `kill -9` skips that hook entirely, leaving whatever status was current
+ * (idle, working) on disk. Both are "the machine ended this", and both look
+ * identical under one test: the pid is confirmably dead AND the card's last
+ * write falls in a short window immediately before boot. A card that has
+ * simply been sitting exited for hours or days, unrelated to today's reboot,
+ * fails that proximity test regardless of what its status field says, and is
+ * left exactly as the user left it — this function only ever restores what
+ * the reboot itself took.
+ *
+ * Guarded by a marker file, not just an in-memory flag: two dashboards opened
+ * within the same boot (this hub, plus any tracked session with the overlay
+ * bound to a key) would otherwise both see the same pre-restore state and
+ * could both resume the same session id onto two live processes — the one
+ * outcome this project must never cause. The marker is written before the
+ * restore work runs, not after, to keep that window as small as possible.
+ * ponytail: not a true lock (two processes could still both pass the read in
+ * the same instant); acceptable because it requires two hub-opening
+ * processes launched within milliseconds of each other, which does not
+ * happen from a human clicking around a terminal. A real flock would close
+ * it fully if this ever becomes a real collision.
+ */
+export function restoreRebootOrphans(): { restored: number; failed: number } {
+  const boot = bootTimeSec();
+  if (boot === undefined) return { restored: 0, failed: 0 };
+
+  try {
+    const marker = JSON.parse(readFileSync(REBOOT_RECOVERY_FILE, "utf8")) as { bootSec?: number };
+    if (marker.bootSec === boot) return { restored: 0, failed: 0 }; // this boot already handled
+  } catch { /* no marker yet, or unreadable: proceed */ }
+  try {
+    mkdirSync(dirname(REBOOT_RECOVERY_FILE), { recursive: true, mode: 0o700 });
+    writeFileSync(REBOOT_RECOVERY_FILE, JSON.stringify({ bootSec: boot }), { mode: 0o600 });
+  } catch { return { restored: 0, failed: 0 }; } // cannot claim the marker: do not risk a double-resume
+
+  let files: string[];
+  try { files = readdirSync(SESSION_STATUS_DIR).filter((f) => f.endsWith(".json")); }
+  catch { return { restored: 0, failed: 0 }; }
+  const live = livePiPids();
+  if (live === undefined) return { restored: 0, failed: 0 }; // ps unavailable: do not guess at liveness
+
+  let restored = 0;
+  let failed = 0;
+  for (const file of files) {
+    let raw: SessionStatusFile;
+    try { raw = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, file), "utf8")) as SessionStatusFile; }
+    catch { continue; }
+    if (!raw.visible || !raw.lastActivity) continue;
+    const ageBeforeBoot = boot - raw.lastActivity / 1000;
+    if (ageBeforeBoot < 0 || ageBeforeBoot > REBOOT_WINDOW_SEC) continue; // not this reboot's doing
+    // Same identity check as everywhere else in this file: a recycled pid must
+    // never be mistaken for the original process still running.
+    const procStart = live.get(raw.pid);
+    const identityMismatch = procStart !== undefined && raw.startedAt > 0 && Math.abs(procStart - raw.startedAt) > 60_000;
+    if (procStart !== undefined && !identityMismatch) continue; // genuinely still alive: leave it alone
+    if (!existsSync(raw.cwd)) { failed++; continue; }
+    const base = (raw.name ?? raw.project ?? "").trim() || raw.id.slice(0, 8);
+    let result = createTmuxSession(base, raw.cwd, raw.id);
+    if (!result.ok) result = createTmuxSession(`${base}-${raw.id.slice(0, 8)}`, raw.cwd, raw.id);
+    if (result.ok) restored++; else failed++;
+  }
+  return { restored, failed };
 }
 
 /** tmux name -> desired Pi session name, applied once that session goes idle.
@@ -886,8 +980,10 @@ class DashboardView implements Component {
     private done: (result: HubAction | undefined) => void,
     private selfSessionId: string,
     private invocationCwd: string,
+    initialMessage?: string,
   ) {
     this.refresh();
+    if (initialMessage) this.showMessage(initialMessage);
     // Both are cheap and static for the lifetime of the overlay: an inventory
     // snapshot (readdir + stat) and a recent-projects scan that reads only the
     // first 512 bytes of one transcript per project.
@@ -1706,10 +1802,18 @@ async function showDashboardInner(ctx: ExtensionContext): Promise<HubAction | un
   // return true. Reading process.stdout.rows instead would miss resizes on a
   // multiplexed or piped stdout, and this number is the one the layout engine
   // is itself using.
+  // Runs once per boot generation (guarded on disk, see REBOOT_RECOVERY_FILE),
+  // synchronously, before the first frame paints — so a restart-orphaned
+  // fleet is already back by the time the dashboard is visible, not restored
+  // out from under a rendered "exited" row a moment later.
+  const recovery = restoreRebootOrphans();
+  const initialMessage = recovery.restored > 0
+    ? `Restored ${recovery.restored} session${recovery.restored === 1 ? "" : "s"} after a restart.${recovery.failed > 0 ? ` ${recovery.failed} could not be restored.` : ""}`
+    : undefined;
   let view: DashboardView | undefined;
   return ctx.ui.custom<HubAction | undefined>(
     (tui, theme, _keybindings, done) => {
-      view = new DashboardView(tui, theme, done, ctx.sessionManager.getSessionId(), ctx.cwd);
+      view = new DashboardView(tui, theme, done, ctx.sessionManager.getSessionId(), ctx.cwd, initialMessage);
       return view;
     },
     {
