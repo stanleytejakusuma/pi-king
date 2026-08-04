@@ -1,8 +1,9 @@
 # Work Order: Package/Skill Reload Propagation Across pi-king Sessions
 
-**Status:** Open — proposal only, not yet built
+**Status:** Built and shipped — 2026-08-05
 **Filed:** 2026-08-04
 **Filed by:** Pi (handoff from session `019fcc02-4ce1-7512-b87e-9d51d028fdb1`)
+**Reviewed:** two red-thinker rounds (design + design-fork follow-up), see "What actually shipped" below
 **Scope:** pi-king (~/codebase/pi-king, v0.2.0)
 
 ## Problem
@@ -93,26 +94,83 @@ accurate across a few real installs. Defer C until B is trusted — bulk actions
 built on an unproven single-session primitive are how the "never mid-turn" rule
 gets violated by accident.
 
-## Open decisions for Stanley
+## Open decisions for Stanley — resolved
 
-1. Does the staleness badge belong on the main dashboard card, or only in an
-   expanded/detail view? (Affects how much dashboard-real-estate this costs for
-   something that's rare — one event per `pi install`.)
-2. Should Option B's reload action require a confirmation click, or fire
-   immediately when the settled-check passes? (Precedent: `/name` fires
-   immediately once settled, no confirmation.)
-3. Timeframe — is this worth building now, or does the Option A badge alone
-   (giving visibility without automation) close the gap well enough for how
-   infrequently packages get installed?
+1. **Main dashboard card**, same row as the existing subagent-count/ctx%/
+   elapsed-time badge cluster. No detail view exists anywhere in this
+   dashboard today; building one for a single badge would be inventing
+   structure nothing else uses.
+2. **No confirmation** — fires immediately once the settled-check passes,
+   same trust model as `/name`. A confirmation dialog adds friction with no
+   safety benefit the settled-check does not already provide.
+3. **Build now, as a real bulk action, not just a badge.** Stanley's own
+   framing settled this: "the problem with only relying on /reload is that
+   the UX sucks" — a per-session badge plus a lone Option B click-through
+   still means babysitting N sessions by hand. Shipped as one keypress (`r`)
+   that fires into everything settled right now and queues everything else,
+   converging automatically as sessions finish their turns — press once,
+   walk away.
 
-## Acceptance criteria (once built)
+## What actually shipped (differs from the original proposal in two ways)
 
-- [ ] Installing any package while N sessions are running results in a visible
-      staleness indicator on all N stale session cards within one dashboard
-      refresh cycle.
-- [ ] The indicator clears correctly once a session is reloaded or restarted.
-- [ ] No `/reload` or `send-keys` ever fires into a session mid-turn — verified
-      by the same settled-at-prompt guard already proven for `/name`.
-- [ ] False-positive rate on staleness detection is zero across a manual
-      cross-check against `ps -o lstart=` (the method used to produce today's
-      evidence).
+1. **Staleness signal is a content hash of settings.json's `packages` field,
+   not a process-start timestamp.** The original proposal (compare session
+   start time vs. settings.json mtime) fails its own AC#2 and AC#4 below as
+   originally written: `startedAt` is deliberately frozen across `/reload`
+   (a real, separate bug fix already in this codebase, for orphan-detection
+   false positives — reloading a session was never meant to change when the
+   OS process was born), so a timestamp-based badge could never clear after
+   a successful reload, and cross-checking against `ps -o lstart=` would be
+   validating against exactly the signal that cannot move. Separately, mtime
+   alone is a bad proxy regardless of the reload issue: any write to
+   settings.json (a model switch, a theme change, a Syncthing touch with no
+   content change) would false-flag every running session. A hash of just
+   the `packages` field, stamped by each session at `session_start` (which
+   fires at process launch AND on every `/reload` — exactly the two moments
+   this process's own loaded package set can change) and compared against
+   the dashboard's own fresh read of the same field, has neither problem.
+2. **Option C shipped as a converging queue, not a one-shot sweep.** Pressing
+   `r` fires `/reload` immediately into every stale session that is settled
+   right now, and queues the rest (`pendingReloads`, mirroring the existing
+   `pendingRenames` pattern used for dashboard-driven `/name`) — a shared
+   `flushPendingReloads()` on every refresh cycle re-checks staleness (not
+   just settledness) before firing, so a session reloaded some other way in
+   the meantime is a no-op instead of a redundant reload, and a session that
+   exits while queued is pruned rather than leaking forever. The identical
+   leak (queued rename, session exits before settling, entry never removed)
+   was found and fixed in the pre-existing rename queue in the same pass.
+
+## Acceptance criteria
+
+- [x] Installing any package while N sessions are running results in a
+      visible staleness indicator on all N stale session cards within one
+      dashboard refresh cycle. Verified live (sandboxed session + sandboxed
+      dashboard, cleaned up after): a real hash mismatch produces the ⟳
+      stale badge on the very next refresh.
+- [x] The indicator clears correctly once a session is reloaded or
+      restarted. Verified live: badge clears the moment the target
+      session's own `session_start` re-stamps a matching hash after
+      `/reload` completes.
+- [x] No `/reload` or `send-keys` ever fires into a session mid-turn.
+      Verified live: corrupting a busy session's hash and pressing `r`
+      queues it (⟳ queued badge, no text sent to the pane) rather than
+      firing; the queued reload only fires once flushPendingReloads next
+      observes that session as idle or background.
+- [x] Bulk action converges without further manual action. Verified live:
+      a queued reload on a busy session fired automatically, with zero
+      further keypresses, the moment that session's own turn completed —
+      confirmed via the /reload confirmation text appearing in that
+      session's pane and its packagesHash matching the real current value
+      afterward.
+- [x] A session that exits while a reload is queued does not leak the
+      pending entry or error the dashboard. Verified live: killed a probed
+      session mid-turn with a reload queued; next dashboard action
+      completed cleanly with no stale/queued badge left on the now-exited
+      card.
+- [x] False-positive rate on staleness detection is zero for a session that
+      has not actually gone stale. Verified live: a freshly started session
+      (matching the real, unmodified settings.json at the time) showed no
+      badge; only an artificially introduced hash mismatch produced one.
+      (The original `ps -o lstart=` cross-check was dropped from this
+      criterion — see "What actually shipped" above for why that signal
+      cannot validate a reload-clearing badge in the first place.)

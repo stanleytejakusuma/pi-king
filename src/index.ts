@@ -46,6 +46,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 /** pi-tui does not export its theme type by name. Structural shape is all this
  * file uses, and pinning it here keeps the typecheck honest instead of
@@ -134,6 +135,16 @@ export type SessionStatusFile = {
    * top is about to compact away part of its memory, which is worth knowing
    * before attaching, not after. Absent when unknown — never zero-filled. */
   contextPct?: number;
+  /** Short fingerprint of ~/.pi/agent/settings.json's `packages` field,
+   * stamped once at session_start (which fires on process launch AND on
+   * every /reload). Compared against the dashboard's own fresh read of the
+   * same field to flag a session as needing a reload. Absent on a session
+   * that predates this field being written at all (an older pi-king build,
+   * or one that has not been through session_start since) — the dashboard
+   * treats that the same as a real mismatch, not as "unknown, assume fine":
+   * every session running right now falls into exactly that bucket until
+   * its first reload after this ships. */
+  packagesHash?: string;
 };
 
 /**
@@ -219,6 +230,13 @@ type DashboardEntry = {
   updatedAt: number;
   subagents: SubagentStatus[];
   tmuxName: string | undefined; // resolved live tmux session name, if correlated
+  /** True when this session's stamped packagesHash disagrees with the
+   * dashboard's own current read of settings.json's packages field — or
+   * when it has no stamped hash at all, which is the same fact (needs a
+   * reload to catch up) for a different reason. Already false for an exited
+   * session: nothing to reload. Computed once per readSessions() call, not
+   * per render — settings.json is read at refresh cadence, not every tick. */
+  stale: boolean;
 };
 
 type TmuxSession = { name: string; attached: boolean; windows: number; createdAt: number; panePid: number };
@@ -377,6 +395,9 @@ function readSessions(): DashboardEntry[] {
   // for the pin/order sort) so the same read also backs the name override
   // below — one readLayout() call per refresh either way.
   const layout = readLayout();
+  // One settings.json read per readSessions() call, not per entry — every
+  // row compares against this same value.
+  const currentPackagesHash = computePackagesHash();
   const entries: DashboardEntry[] = [];
   for (const raw of parsed) {
     // Identity, not just existence. A pid alone is not proof: you have many Pi
@@ -427,6 +448,15 @@ function readSessions(): DashboardEntry[] {
       updatedAt: raw.lastActivity || Date.now(),
       subagents: raw.subagents ?? [],
       tmuxName: undefined,
+      // Exited already excludes it: nothing to reload. currentPackagesHash
+      // undefined means the dashboard could not read settings.json this
+      // cycle -- fail closed to "not stale" rather than flag a fleet on a
+      // read that did not happen. raw.packagesHash undefined (no stamp yet,
+      // an older build or a session that has not been through session_start
+      // since) counts the same as a real mismatch, not as "unknown, assume
+      // fine" -- see the packagesHash field comment.
+      stale: raw.status !== "exited" && currentPackagesHash !== undefined &&
+        (raw.packagesHash === undefined || raw.packagesHash !== currentPackagesHash),
     });
   }
   // Pinned sessions leave their directory group and form one section at the
@@ -605,6 +635,24 @@ function tmuxError(result: ReturnType<typeof spawnSync>): string {
  * a configuration they had not chosen. */
 const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.env.HOME ?? ""}/.pi/agent`;
 
+/** Short, stable fingerprint of the package set `pi install`/`pi uninstall`
+ * change. Only the `packages` field is hashed, not the whole settings.json:
+ * a model switch or a theme change touches that same file, and must not
+ * flag every running session as needing a reload it does not need.
+ * undefined means "could not read/parse settings.json right now", not "no
+ * packages" — callers must treat that as "cannot judge staleness", never as
+ * a mismatch against every session. Used identically on both sides of the
+ * comparison: stamped by each session's own process at session_start
+ * (below), and read fresh by the dashboard on every readSessions() call. */
+function computePackagesHash(): string | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(join(NORMAL_AGENT_DIR, "settings.json"), "utf8")) as { packages?: unknown };
+    return createHash("sha256").update(JSON.stringify(raw.packages ?? [])).digest("hex").slice(0, 12);
+  } catch {
+    return undefined;
+  }
+}
+
 export function createTmuxSession(name: string, dir: string, resumeSessionId?: string): { ok: boolean; message: string } {
   const result = spawnSync(TMUX, [
     "new-session", "-d", "-s", name,
@@ -733,7 +781,13 @@ function flushPendingRenames(rows: Row[]): void {
   if (pendingRenames.size === 0) return;
   for (const [tmuxName, desired] of [...pendingRenames]) {
     const row = rows.find((r) => r.kind === "session" && r.entry.tmuxName === tmuxName);
-    if (!row || row.kind !== "session") continue;
+    // Gone, not just unsettled — the session exited (or its tmux pane did)
+    // before ever going idle. Nothing will ever match this tmuxName again, so
+    // leaving it queued was a permanent leak: found live, still growing
+    // slowly for the life of this dashboard process, one entry per rename
+    // that happened to land on a session that then exited before settling.
+    // Caught reviewing the analogous reload queue below, same bug, same fix.
+    if (!row || row.kind !== "session") { pendingRenames.delete(tmuxName); continue; }
     // background counts as settled: the main agent is at its prompt, only
     // subagents still run, and send-keys lands in an empty composer exactly as
     // it would on idle. Excluding it left renames queued indefinitely on
@@ -741,6 +795,38 @@ function flushPendingRenames(rows: Row[]): void {
     if (row.entry.state !== "idle" && row.entry.state !== "background") continue;
     spawnSync(TMUX, ["send-keys", "-t", tmuxName, `/name ${clean(desired)}`, "Enter"], { encoding: "utf8", timeout: 3000 });
     pendingRenames.delete(tmuxName);
+  }
+}
+
+/** sessionId -> queued for /reload once settled. Keyed by session id, not
+ * tmux name: unlike a rename, there is no user-typed value to remember, and
+ * session id survives a rename that might happen to the same session while
+ * a reload is still queued behind it. send-keys types into the live pane,
+ * so this must never fire mid-turn — same invariant as pendingRenames. */
+const pendingReloads = new Set<string>();
+
+/** Applies any queued reload whose session has since settled. Called on
+ * refresh, same as flushPendingRenames, and shares its three failure modes
+ * by construction rather than by parallel maintenance:
+ *   - gone: pruned, not left to leak (the bug just fixed above in the
+ *     rename queue).
+ *   - already fresh: re-checks entry.stale at FIRE time, not queue time —
+ *     rows is rebuilt fresh every refresh(), so a session reloaded some
+ *     other way (typed /reload by hand, or picked up by an earlier flush
+ *     this same cycle) already shows stale:false here, and the queued fire
+ *     is skipped as a no-op rather than sent redundantly.
+ *   - still busy: left queued, tried again next cycle. */
+function flushPendingReloads(rows: Row[]): void {
+  if (pendingReloads.size === 0) return;
+  for (const id of [...pendingReloads]) {
+    const row = rows.find((r) => r.kind === "session" && r.entry.sessionId === id);
+    if (!row || row.kind !== "session") { pendingReloads.delete(id); continue; }
+    if (!row.entry.stale) { pendingReloads.delete(id); continue; }
+    if (row.entry.state !== "idle" && row.entry.state !== "background") continue;
+    const tmuxName = row.entry.tmuxName;
+    if (!tmuxName) { pendingReloads.delete(id); continue; }
+    spawnSync(TMUX, ["send-keys", "-t", tmuxName, "/reload", "Enter"], { encoding: "utf8", timeout: 3000 });
+    pendingReloads.delete(id);
   }
 }
 
@@ -1129,8 +1215,49 @@ class DashboardView implements Component {
   private refresh(): void {
     this.rows = buildRows();
     flushPendingRenames(this.rows);
+    flushPendingReloads(this.rows);
     if (this.selected >= this.rows.length) this.selected = Math.max(0, this.rows.length - 1);
     this.refreshGitDrift();
+  }
+
+  /** `r`: reload every stale session in one keypress, without ever typing
+   * into a pane mid-turn. Settled sessions (idle/background) get /reload
+   * sent immediately; busy ones are queued and picked up automatically by
+   * flushPendingReloads on a later refresh, the moment they settle — one
+   * press converges the whole fleet instead of firing once and leaving
+   * whatever was busy to be caught manually later. */
+  private reloadStaleSessions(): void {
+    // Refresh BEFORE deciding, not just after: this.rows otherwise reflects
+    // whatever the last periodic tick happened to see, which on an idle
+    // fleet can be up to IDLE_REFRESH_TICKS old. A press landing in that
+    // window would judge staleness and settledness against stale data and
+    // could act on nothing even though the badge on screen already shows
+    // stale (the render loop reads live off this.rows too, so the two would
+    // visibly disagree for a moment) -- caught exactly this way live,
+    // pressing r right after making a session stale and finding it fired on
+    // nothing.
+    this.refresh();
+    let firedNow = 0;
+    let queued = 0;
+    for (const row of this.rows) {
+      if (row.kind !== "session" || !row.entry.stale) continue;
+      const tmuxName = row.entry.tmuxName;
+      if (!tmuxName) continue; // no live pane to reload
+      const settled = row.entry.state === "idle" || row.entry.state === "background";
+      if (settled) {
+        spawnSync(TMUX, ["send-keys", "-t", tmuxName, "/reload", "Enter"], { encoding: "utf8", timeout: 3000 });
+        firedNow++;
+      } else {
+        pendingReloads.add(row.entry.sessionId);
+        queued++;
+      }
+    }
+    if (firedNow === 0 && queued === 0) this.showMessage("No sessions need reloading.");
+    else this.showMessage(
+      `Reloaded ${firedNow} session${firedNow === 1 ? "" : "s"}` +
+      (queued > 0 ? `, ${queued} queued — will reload once settled.` : "."),
+    );
+    this.tui.requestRender();
   }
 
   /** Uncommitted-change counts per project directory, refreshed lazily. A
@@ -1347,8 +1474,7 @@ class DashboardView implements Component {
       return;
     }
     if (data === "r" || data === "R") {
-      this.refresh();
-      this.showMessage("Refreshed.");
+      this.reloadStaleSessions();
       return;
     }
     if (data === "n" || data === "N") {
@@ -1764,7 +1890,14 @@ class DashboardView implements Component {
         const ctxBadge = e.contextPct !== undefined && e.state !== "exited"
           ? th.fg(e.contextPct >= 85 ? "error" : e.contextPct >= 65 ? "warning" : "dim", `ctx ${e.contextPct}%`)
           : "";
-        const right = [sub ? th.fg("dim", sub) : "", ctxBadge, th.fg("dim", elapsed(e.updatedAt))]
+        // e.stale already excludes exited (see the DashboardEntry.stale
+        // comment) -- queued reads differently from stale-and-untouched so
+        // pressing `r` visibly does something even for the sessions it could
+        // not fire into immediately, instead of looking like nothing happened.
+        const staleBadge = e.stale
+          ? (pendingReloads.has(e.sessionId) ? th.fg("warning", "⟳ queued") : th.fg("warning", "⟳ stale"))
+          : "";
+        const right = [sub ? th.fg("dim", sub) : "", ctxBadge, staleBadge, th.fg("dim", elapsed(e.updatedAt))]
           .filter(Boolean).join(th.fg("dim", " \u00b7 ")) + "  ";
         const left = `  ${marker} ${e.tmuxName ? th.fg("accent", "\u26fa") : th.fg("dim", "\u233f")} ` +
           (sel ? th.bold(nm) : nm) + " " + status +
@@ -1803,7 +1936,7 @@ class DashboardView implements Component {
         `${k("\u2191\u2193")}${l(" select ")}${k("enter")}${l(` ${verb}`)}` + l("   \u2502   ") +
         `${k("\u21e7\u2191\u2193")}${l(" move ")}${k("^t")}${l(" pin")}` + l("   \u2502   ") +
         `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${k("x")}${l(" detach ")}${th.fg("error", "X")}${l(" kill")}` + l("   \u2502   ") + `${k("s")}${l(" stats")}` + l("   \u2502   ") +
-        `${k("r")}${l(" refresh ")}${k("esc")}${l(" close")}`);
+        `${k("r")}${l(" reload stale ")}${k("esc")}${l(" close")}`);
     }
 
     // ---- assemble: pinned head, scrolling body, pinned foot -------------
@@ -2072,6 +2205,12 @@ function installSessionTracker(pi: ExtensionAPI) {
   // the value is identical no matter how many times this module re-evaluates.
   const PROCESS_STARTED_AT = Date.now() - process.uptime() * 1000;
   let startedAt = PROCESS_STARTED_AT;
+  // Stamped fresh in session_start below, which fires at process launch AND
+  // on every /reload -- exactly the two moments this process's own loaded
+  // package set can change. Persisted with every snapshot so the dashboard
+  // can compare it against a fresh read of its own, without this session
+  // doing anything beyond what it already does on every status write.
+  let packagesHash: string | undefined;
   let hadRun = false;
   /** Set when /bg is requested mid-turn; fires the moment the session settles. */
   let bgQueued = false;
@@ -2141,6 +2280,7 @@ function installSessionTracker(pi: ExtensionAPI) {
         subagents: [...subagents.values()],
         visible,
         contextPct,
+        packagesHash,
       };
       const target = statusPath(ctx);
       const tmp = `${target}.tmp-${process.pid}`;
@@ -2253,6 +2393,11 @@ function installSessionTracker(pi: ExtensionAPI) {
         if ((state === "idle") && hasLiveSubagents() > 0) state = "background";
       }
     } catch { /* no file, unreadable, or first run: nothing to warn about */ }
+    // Stamped here, at the end of session_start rather than the top: this is
+    // as close as this handler gets to "extension setup for this run is
+    // done", the same reasoning /reload's own comments elsewhere in this
+    // handler already apply to state/activity/subagents restoration above.
+    packagesHash = computePackagesHash();
     persist(ctx);
 
     // Left-arrow at an empty prompt detaches this pane's tmux client — a
