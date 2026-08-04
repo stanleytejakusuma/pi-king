@@ -373,6 +373,10 @@ function readSessions(): DashboardEntry[] {
     }
   }
   const live = livePiPids(parsed.map((raw) => raw.pid));
+  // Hoisted above the loop (was previously read once, further down, purely
+  // for the pin/order sort) so the same read also backs the name override
+  // below — one readLayout() call per refresh either way.
+  const layout = readLayout();
   const entries: DashboardEntry[] = [];
   for (const raw of parsed) {
     // Identity, not just existence. A pid alone is not proof: you have many Pi
@@ -402,7 +406,18 @@ function readSessions(): DashboardEntry[] {
       shortId: raw.id.slice(0, 8),
       cwd: raw.cwd,
       project: raw.project,
-      name: raw.name,
+      // The dashboard's own rename wins over whatever Pi's status file says
+      // — see the Layout.names comment for why the status file's own name
+      // cannot be trusted to reflect a rename promptly. raw.name may
+      // legitimately be undefined (never named), which rowLabel() falls back
+      // to entry.project for — an empty override map entry must not turn
+      // that into "" and silently defeat the fallback, so this only touches
+      // name when an override actually exists. clean() again on the override
+      // even though raw.name was already cleaned above: layout.json is this
+      // process's own file, but the override value came from a composer
+      // typed by whatever ends up calling renameTmuxSession, and this is the
+      // one place it reaches the terminal.
+      name: layout.names[raw.id] ? clean(layout.names[raw.id]) : raw.name,
       state: raw.status,
       contextPct: typeof raw.contextPct === "number" && Number.isFinite(raw.contextPct)
         ? Math.max(0, Math.min(999, Math.round(raw.contextPct))) : undefined,
@@ -416,8 +431,8 @@ function readSessions(): DashboardEntry[] {
   }
   // Pinned sessions leave their directory group and form one section at the
   // top, in the order the user put them in. Everything else groups by
-  // directory, then by urgency, then by recency.
-  const layout = readLayout();
+  // directory, then by urgency, then by recency. (layout was already read
+  // above, before the entries loop, for the name override.)
   const rank = (id: string) => {
     const i = layout.order.indexOf(id);
     return i === -1 ? Number.MAX_SAFE_INTEGER : i;
@@ -448,7 +463,23 @@ function readSessions(): DashboardEntry[] {
  * back does not reset you to the top of the list. Not a strong preference
  * like pin/order: a stale id (its card was since dismissed) just fails the
  * lookup and falls back to row 0, same as never having one. */
-type Layout = { pinned: string[]; order: string[]; lastSelected?: string };
+/** names: sessionId -> the display name the dashboard's own rename composer
+ * set. This is the source of truth for a renamed row's label, not a cache of
+ * it. Renaming used to work by sending `/name <newName>` into the pane so Pi
+ * would rewrite its OWN status file with the new name for the dashboard to
+ * later read back — verified live (sandboxed session, PI_KING_STATUS_DIR)
+ * that this is broken in a specific way: `/name` updates Pi's in-session
+ * state immediately (its own title bar and composer footer change right
+ * away), but that state is only serialized into the status file on the
+ * SESSION'S OWN NEXT UNRELATED ACTIVITY WRITE, not on `/name` itself — a
+ * session renamed and then left alone (never given another prompt) shows
+ * the stale pre-rename name forever. Same failure class as the pid-token
+ * comment two sections up: trusting a second process's own timing for a
+ * value this dashboard can just own outright. `/name` is still sent (kept
+ * below in renameTmuxSession) so Pi's own UI stays in sync too, but it is
+ * now a best-effort nicety, not the mechanism this label's correctness
+ * depends on. */
+type Layout = { pinned: string[]; order: string[]; lastSelected?: string; names: Record<string, string> };
 const LAYOUT_FILE = join(SESSION_STATUS_DIR, "..", "layout.json");
 /** Records which boot generation reboot recovery has already run for, so a
  * second dashboard opened moments after the first does not race it into
@@ -459,9 +490,13 @@ function readLayout(): Layout {
   try {
     const raw = JSON.parse(readFileSync(LAYOUT_FILE, "utf8")) as Partial<Layout>;
     const strs = (v: unknown) => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
-    return { pinned: strs(raw.pinned), order: strs(raw.order), lastSelected: typeof raw.lastSelected === "string" ? raw.lastSelected : undefined };
+    const names: Record<string, string> = {};
+    if (raw.names && typeof raw.names === "object") {
+      for (const [k, v] of Object.entries(raw.names)) if (typeof v === "string") names[k] = v;
+    }
+    return { pinned: strs(raw.pinned), order: strs(raw.order), lastSelected: typeof raw.lastSelected === "string" ? raw.lastSelected : undefined, names };
   } catch {
-    return { pinned: [], order: [] };
+    return { pinned: [], order: [], names: {} };
   }
 }
 
@@ -709,24 +744,36 @@ function flushPendingRenames(rows: Row[]): void {
   }
 }
 
-function renameTmuxSession(oldName: string, newName: string, piIsIdle: boolean): { ok: boolean; message: string } {
+function renameTmuxSession(oldName: string, newName: string, piIsIdle: boolean, sessionId: string | undefined): { ok: boolean; message: string } {
   const result = spawnSync(TMUX, ["rename-session", "-t", oldName, newName], { encoding: "utf8", timeout: 3000 });
   if (result.status !== 0) return { ok: false, message: `Failed to rename: ${tmuxError(result)}` };
 
-  // Also rename the Pi session living inside it, via Pi's own /name command,
-  // so both halves agree and the rename is not half-applied.
+  // The label's correctness lives here, not in the /name call below. See the
+  // Layout.names comment: /name's effect on Pi's own status file is delayed
+  // until that session's next unrelated activity, sometimes indefinitely, so
+  // it cannot be what a rename's success depends on. Written immediately,
+  // synchronously, before this function returns — the row is correct on the
+  // very next render, not eventually. sessionId is undefined for an orphan
+  // (a tmux pane with no Pi session behind it, so no status-file name to
+  // override in the first place, and rowLabel() reads row.tmux.name for
+  // those directly).
+  if (sessionId) {
+    const layout = readLayout();
+    writeLayout({ ...layout, names: { ...layout.names, [sessionId]: newName } });
+  }
+
+  // Also rename the Pi session living inside it, via Pi's own /name command.
+  // Best-effort now, not load-bearing: this keeps Pi's OWN in-session state
+  // (its title bar, its composer footer) in sync with the dashboard's choice,
+  // but the row's label above no longer waits on it.
   //
   // Only when that session is settled at its prompt: send-keys types into the
   // live pane, and injecting text mid-turn would land in an in-flight prompt.
-  // If skipped, the queued rename applies once the session settles — and until
-  // then the row shows the STALE Pi name, because the label now prefers the
-  // session's own name over the tmux one (a /name typed inside a session must
-  // win). Queueing, not skipping, is what keeps the two halves converging.
   if (piIsIdle) {
     spawnSync(TMUX, ["send-keys", "-t", newName, `/name ${clean(newName)}`, "Enter"], { encoding: "utf8", timeout: 3000 });
     return { ok: true, message: `Renamed to "${newName}".` };
   }
-  // Busy: queue the Pi-side rename rather than dropping it. It applies
+  // Busy: queue the Pi-side nicety rather than dropping it. It applies
   // automatically once the session settles.
   pendingRenames.set(newName, newName);
   return { ok: true, message: `Renamed to "${newName}" \u2014 session is busy; its own name will follow once it settles.` };
@@ -1249,7 +1296,8 @@ class DashboardView implements Component {
         return;
       }
       const idle = step.row.kind === "session" && (step.row.entry.state === "idle" || step.row.entry.state === "background");
-      const result = renameTmuxSession(tmuxName, value, idle);
+      const sessionId = step.row.kind === "session" ? step.row.entry.sessionId : undefined;
+      const result = renameTmuxSession(tmuxName, value, idle, sessionId);
       this.showMessage(result.message);
       this.refresh();
       this.tui.requestRender();
@@ -1350,12 +1398,15 @@ class DashboardView implements Component {
             // once it is gone, the layout entry is a dangling id that would
             // otherwise accumulate forever.
             const l = readLayout();
-            if (l.pinned.includes(id) || l.order.includes(id) || l.lastSelected === id) {
+            if (l.pinned.includes(id) || l.order.includes(id) || l.lastSelected === id || id in l.names) {
+              const names = { ...l.names };
+              delete names[id];
               writeLayout({
                 ...l,
                 pinned: l.pinned.filter((x) => x !== id),
                 order: l.order.filter((x) => x !== id),
                 lastSelected: l.lastSelected === id ? undefined : l.lastSelected,
+                names,
               });
             }
             this.showMessage(`Card removed. The transcript is untouched: pi --session ${id}`);
