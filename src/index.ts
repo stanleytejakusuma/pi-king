@@ -169,6 +169,20 @@ import {
 } from "./data.ts";
 
 const REFRESH_MS = 1000;
+/** Ticks of REFRESH_MS between a full data refresh (ps, tmux list-sessions,
+ * any git-status cache misses) while nothing on the fleet is actively
+ * changing. The render tick itself stays at REFRESH_MS regardless — elapsed-
+ * time labels ('3m ago') are computed at render time from stored timestamps,
+ * so they keep advancing smoothly even on a tick that skips the data pull —
+ * only the underlying ps/tmux/git work slows down. Worth doing even after
+ * targeting ps -p at just the tracked pids (see livePiPids): most of a long
+ * session's wall-clock time, with 13+ concurrent sessions, has at most one or
+ * two "working" at once, so the fixed per-tick cost was being paid every
+ * second for a fleet that was not changing every second. 4 ticks is a
+ * deliberately small multiplier — worst case an idle session's death takes 4s
+ * longer to notice than before, which is a fine trade next to a 4x cut in
+ * background churn during the (common) stretches when nothing is happening. */
+const IDLE_REFRESH_TICKS = 4;
 const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, working: 1, background: 1, idle: 2, exited: 3 };
 /** Unknown states sort with the working set rather than at an edge: they are
  * live sessions saying something this dashboard has not learned yet, not
@@ -1005,6 +1019,7 @@ class DashboardView implements Component {
    * both are full-height, and stacking them would push one off the terminal. */
   private showStats = false;
   private timer: ReturnType<typeof setInterval> | undefined;
+  private ticksSinceRefresh = 0;
   private messageTimer: ReturnType<typeof setTimeout> | undefined;
   private message: string | undefined;
   private deleteArmedFor: string | undefined;
@@ -1047,7 +1062,19 @@ class DashboardView implements Component {
     try { this.inventory = readInventory(); } catch { this.inventory = undefined; }
     try { this.recent = readRecentProjects(8); } catch { this.recent = []; }
     this.timer = setInterval(() => {
-      this.refresh();
+      this.ticksSinceRefresh++;
+      // Fast cadence (every tick) while a turn is actively streaming or a
+      // subagent is running — the only states where a fresher read shows
+      // something genuinely new. Everything else (idle, background,
+      // attention, error, exited) is static until something external changes
+      // it, so a slower cadence loses nothing but promptness in noticing that
+      // change, bounded by IDLE_REFRESH_TICKS.
+      const anyActive = this.rows.some((r) => r.kind === "session" &&
+        (r.entry.state === "working" || r.entry.subagents.some((s) => s.status === "running" || s.status === "queued")));
+      if (anyActive || this.ticksSinceRefresh >= IDLE_REFRESH_TICKS) {
+        this.refresh();
+        this.ticksSinceRefresh = 0;
+      }
       this.tui.requestRender();
     }, REFRESH_MS);
   }
