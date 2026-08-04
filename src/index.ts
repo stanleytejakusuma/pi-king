@@ -899,20 +899,29 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
       ? th.fg("dim", "1h ") + th.fg("accent", String(stats.lastHour.calls)) +
         th.fg("dim", " calls \u00b7 ") + th.fg("accent", compactNum(stats.lastHour.tokensIn)) + th.fg("dim", " in")
       : th.fg("dim", "1h quiet"));
-    // A sparkline over a handful of calls is noise shaped like a chart; below a
-    // floor it says less than the number it sits next to, so it is omitted.
-    // Leading zero-hours are trimmed and replaced by a start label: zeros
-    // render as spaces (a measured zero is not a bar), and a morning of them
-    // put nine columns of blank ahead of the first bar, which read as a
-    // rendering bug rather than as a quiet night.
-    if (stats.calls >= 50 && stats.hourly.length >= 4) {
-      const first = stats.hourly.findIndex((n) => n > 0);
-      const trimmed = first > 0 ? stats.hourly.slice(first) : stats.hourly;
-      const tspark = sparkline(trimmed);
-      if (tspark) {
-        const from = first > 0 ? th.fg("dim", `${first}h `) : "";
-        segs.push(from + th.fg("accent", tspark) + th.fg("dim", ` peak ${stats.peakHour}/h`));
-      }
+    // Which part of the day carried the traffic, in four coarse buckets
+    // (morning/afternoon/evening/night) rather than a raw hour count — "peak
+    // 585/h" answers a question nobody asked; "busiest afternoon" answers the
+    // one people actually have (when am I busiest). Replaces the old per-hour
+    // sparkline, which packed the same shape into less legible ground.
+    if (stats.peakPeriod) {
+      segs.push(th.fg("dim", "busiest ") + th.fg("accent", stats.peakPeriod.label) +
+        th.fg("dim", ` ${stats.peakPeriod.pct}%`));
+    }
+  }
+  // Daily NET-token history — cache re-reads excluded, so a chatty week of
+  // re-sent history doesn't flatten the shape of how much new ground was
+  // actually covered each day. Lives outside the `if (stats)` block on
+  // purpose: history renders even on a fresh morning with zero calls yet.
+  // When today has data it is the last bar and is dimmed — a partial day
+  // ranked against completed ones is a false signal. When today is empty it
+  // is absent from the series, so every bar is a completed day.
+  if (daily.length >= 3) {
+    const bars = sparkline(daily.map((d) => netTokens(d.tokensIn, d.tokensCacheRead)));
+    if (bars) {
+      segs.push(th.fg("dim", `${daily.length}d `) + (stats
+        ? th.fg("accent", bars.slice(0, -1)) + th.fg("muted", bars.slice(-1))
+        : th.fg("accent", bars)));
     }
   }
   // Order matters: shedding drops from the end, so these sit ahead of the model
@@ -947,46 +956,34 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
     const cacheColor = cacheShare >= 80 ? "success" : cacheShare >= 50 ? "warning" : "muted";
     segs.push(th.fg(cacheColor, `${cacheShare}%`) + th.fg("dim", " cached"));
   }
-  const p95 = stats && stats.durations.length > 0
-    ? stats.durations[Math.min(stats.durations.length - 1, Math.floor(stats.durations.length * 0.95))]
-    : 0;
-  if (p95 > 0) {
-    // The mean hides the tail, and the tail is what someone waiting on a session
-    // actually experiences.
-    segs.push(th.fg("dim", "p95 ") + th.fg(p95 > 30_000 ? "warning" : "accent", `${(p95 / 1000).toFixed(1)}s`));
-  }
-  // Daily input-token history. When today has data it is the last bar and is
-  // dimmed — a partial day ranked against completed ones is a false signal.
-  // When today is empty it is absent from the series, so every bar is a
-  // completed day and none is set apart.
+  // Mean over COMPLETED days only. Including a partial today drags the
+  // average down by however much of the day is left.
   if (daily.length >= 3) {
-    const bars = sparkline(daily.map((d) => d.tokensIn));
-    if (bars) {
-      segs.push(th.fg("dim", `${daily.length}d `) + (stats
-        ? th.fg("accent", bars.slice(0, -1)) + th.fg("muted", bars.slice(-1))
-        : th.fg("accent", bars)));
-    }
-    // Mean over COMPLETED days only. Including a partial today drags the
-    // average down by however much of the day is left.
     const done = stats ? daily.slice(0, -1) : daily;
     if (done.length >= 2) {
       const mean = done.reduce((sum, d) => sum + d.tokensIn, 0) / done.length;
       segs.push(th.fg("dim", "avg ") + th.fg("accent", compactNum(Math.round(mean))) + th.fg("dim", "/day"));
     }
   }
-  if (stats?.peakPeriod) {
-    segs.push(th.fg("dim", "busiest ") + th.fg("accent", stats.peakPeriod.label) +
-      th.fg("dim", ` ${stats.peakPeriod.pct}%`));
-  }
   // Only the leader. The runner-up's share does not change what anyone does
   // next, and it was the first thing shed on a narrow terminal anyway.
   const lead = stats?.topModels[0];
   if (lead) segs.push(th.fg(modelColors[0], lead.model) + th.fg("dim", ` ${lead.pct}%`));
   if (stats?.partial) segs.push(th.fg("warning", "(partial)"));
+  // p95 goes dead last, on purpose: it is the first segment dropped when the
+  // row does not fit. Tail latency is real but the least actionable figure
+  // next to what's ahead of it in the band — volume, errors, when you're
+  // busiest, cache economics — worth showing, not worth the room to protect.
+  const p95 = stats && stats.durations.length > 0
+    ? stats.durations[Math.min(stats.durations.length - 1, Math.floor(stats.durations.length * 0.95))]
+    : 0;
+  if (p95 > 0) {
+    segs.push(th.fg("dim", "p95 ") + th.fg(p95 > 30_000 ? "warning" : "accent", `${(p95 / 1000).toFixed(1)}s`));
+  }
   // The band shares its row with a right-flushed clock. If the segments overrun
   // the space left for it, the clock is pushed past the terminal edge and
-  // silently truncated, so shed the least important segments (trailing models
-  // first) until what remains fits.
+  // silently truncated, so shed the least important segments (p95 first, see
+  // above) until what remains fits.
   const joiner = th.fg("dim", "  │  ");
   while (segs.length > 1 && visibleWidth(segs.join(joiner)) > budget) segs.pop();
   return segs.join(joiner);
