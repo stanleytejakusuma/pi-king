@@ -949,24 +949,13 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
       th.fg("dim", ` (${outShare < 1 ? outShare.toFixed(1) : Math.round(outShare)}% out)`),
     );
   }
-  // A raw cache percentage is still on the stats screen (`s`); here it never
-  // read as more than a number sitting between other numbers. tokenComparison
-  // turns today's DISTINCT tokens (net of cache re-reads, same reasoning as
-  // "net" above: history re-sent every turn should not inflate the count)
-  // into the same human-scale comparison already used for the lifetime total
-  // on the stats screen — a toy, and it reads as one, but the arithmetic is
-  // real. Small/early days correctly show nothing rather than a comparison
-  // too small to mean anything (tokenComparison returns undefined below its
-  // smallest work).
-  if (stats) {
-    const distinctToday = netTokens(stats.tokensIn, stats.tokensCacheRead) + stats.tokensOut;
-    const cmp = tokenComparison(distinctToday);
-    // Trimmed to "~Nx TITLE": the stats screen's full sentence ("the text of
-    // ... through this machine") reads naturally on its own line; here it is
-    // one segment among many competing for the same row, and "the text of"
-    // was 12 characters bought nothing a tighter phrasing didn't already say.
-    if (cmp) segs.push(th.fg("accent", cmp.replace("the text of ", "")));
-  }
+  // Today's most-used model, no share number: the ticker already spent its
+  // percentages on error rate and busiest period, and "which model" is
+  // answered completely by the name alone — the runner-up's share never
+  // changed what anyone did next either, which is why only the leader ever
+  // showed up here at all.
+  const lead = stats?.topModels[0];
+  if (lead) segs.push(th.fg("dim", "favorite ") + th.fg(modelColors[0], lead.model));
   // Mean over COMPLETED days only. Including a partial today drags the
   // average down by however much of the day is left.
   if (daily.length >= 3) {
@@ -976,10 +965,6 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
       segs.push(th.fg("dim", "avg ") + th.fg("accent", compactNum(Math.round(mean))) + th.fg("dim", "/day"));
     }
   }
-  // Only the leader. The runner-up's share does not change what anyone does
-  // next, and it was the first thing shed on a narrow terminal anyway.
-  const lead = stats?.topModels[0];
-  if (lead) segs.push(th.fg(modelColors[0], lead.model) + th.fg("dim", ` ${lead.pct}%`));
   if (stats?.partial) segs.push(th.fg("warning", "(partial)"));
   // p95 goes dead last, on purpose: it is the first segment dropped when the
   // row does not fit. Tail latency is real but the least actionable figure
@@ -1518,6 +1503,18 @@ class DashboardView implements Component {
     lines.push("  " + rule);
     lines.push(split("  " + (ticker ?? th.fg("dim", "no router activity today")), th.fg("dim", clockText) + "  "));
     lines.push("  " + rule);
+    // A human-scale comparison for today's distinct tokens, on its own row
+    // instead of competing with the ticker's other segments for width — it
+    // used to live there and lost the room to things people check more often
+    // (volume, errors, when they're busiest). Full phrasing here, unlike the
+    // trimmed ticker version this replaced: nothing else is on this line to
+    // compete with. Small/early days show nothing, same as everywhere else
+    // that reads tokenComparison — absence of logs is not a measurement.
+    if (stats) {
+      const distinctToday = netTokens(stats.tokensIn, stats.tokensCacheRead) + stats.tokensOut;
+      const cmp = tokenComparison(distinctToday);
+      if (cmp) lines.push("  " + th.fg("accent", cmp));
+    }
     lines.push("  " + th.fg("dim", `\u201c${this.quote}\u201d`));
     lines.push("");
 
