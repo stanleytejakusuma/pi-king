@@ -949,12 +949,23 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
       th.fg("dim", ` (${outShare < 1 ? outShare.toFixed(1) : Math.round(outShare)}% out)`),
     );
   }
-  if (stats && stats.tokensCacheRead > 0) {
-    const cacheShare = stats.tokensIn > 0 ? Math.round((stats.tokensCacheRead / stats.tokensIn) * 100) : 0;
-    // Cache share is why a large input count can still be cheap, so it gets the
-    // same threshold colouring as the error rate: good reads green.
-    const cacheColor = cacheShare >= 80 ? "success" : cacheShare >= 50 ? "warning" : "muted";
-    segs.push(th.fg(cacheColor, `${cacheShare}%`) + th.fg("dim", " cached"));
+  // A raw cache percentage is still on the stats screen (`s`); here it never
+  // read as more than a number sitting between other numbers. tokenComparison
+  // turns today's DISTINCT tokens (net of cache re-reads, same reasoning as
+  // "net" above: history re-sent every turn should not inflate the count)
+  // into the same human-scale comparison already used for the lifetime total
+  // on the stats screen — a toy, and it reads as one, but the arithmetic is
+  // real. Small/early days correctly show nothing rather than a comparison
+  // too small to mean anything (tokenComparison returns undefined below its
+  // smallest work).
+  if (stats) {
+    const distinctToday = netTokens(stats.tokensIn, stats.tokensCacheRead) + stats.tokensOut;
+    const cmp = tokenComparison(distinctToday);
+    // Trimmed to "~Nx TITLE": the stats screen's full sentence ("the text of
+    // ... through this machine") reads naturally on its own line; here it is
+    // one segment among many competing for the same row, and "the text of"
+    // was 12 characters bought nothing a tighter phrasing didn't already say.
+    if (cmp) segs.push(th.fg("accent", cmp.replace("the text of ", "")));
   }
   // Mean over COMPLETED days only. Including a partial today drags the
   // average down by however much of the day is left.
@@ -1492,10 +1503,17 @@ class DashboardView implements Component {
     const artLines = lines.length;
 
     // ---- ticker + quote -------------------------------------------------
-    // Budget: the row is "  " + ticker ... clock + "  ", so the ticker may use
-    // everything except the clock, the two-space margins and a separating gap.
+    // Budget: split() lays the row out as "  " + ticker + pad(>=1) + clock +
+    // "  ", so the most the ticker can be without split() forcing pad past its
+    // 1-space minimum (which would overflow the row by however much) is
+    // MEASURE - 2 (left margin) - 2 (right margin) - 1 (minimum pad) = -5. A
+    // previous -8 reserved 3 unnecessary characters, coarse-shedding a whole
+    // extra segment (e.g. "avg 356.9M/day") on renders that missed the tighter
+    // budget by only 1-2 characters — verified against a real 224-col render
+    // where correcting this alone was the difference between 7 and 8 segments
+    // surviving.
     const clockText = clockLine();
-    const ticker = tickerParts(th, stats, daily, loaded, Math.max(20, MEASURE - visibleWidth(clockText) - 8));
+    const ticker = tickerParts(th, stats, daily, loaded, Math.max(20, MEASURE - visibleWidth(clockText) - 5));
     const rule = th.fg("dim", "\u2500".repeat(Math.max(0, MEASURE - 4)));
     lines.push("  " + rule);
     lines.push(split("  " + (ticker ?? th.fg("dim", "no router activity today")), th.fg("dim", clockText) + "  "));
