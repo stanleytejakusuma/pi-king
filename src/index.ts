@@ -230,13 +230,35 @@ type HubAction =
  * Observed directly: a finished session's file reported ALIVE on pid 2304
  * after the pid had been reused.
  *
- * One `ps` snapshot per refresh, requiring the pid to still belong to a Pi
- * process. Also cheaper than a kill(2) syscall per entry.
+ * Targeted at exactly the pids the caller already knows about (from status
+ * files it just read), via `ps -p`, rather than scanning every process on the
+ * machine. Measured on this machine: 20ms for `-eo` against 624 processes,
+ * 1.5ms for `-p` against a handful of known pids — the scan was paying for
+ * every OTHER process on the system to answer a question about a known,
+ * small set. Empty input returns immediately without spawning anything.
+ *
+ * `ps -p` with NONE of the requested pids alive exits 1 with empty stdout —
+ * verified live, and a completely normal result (every tracked session just
+ * crashed), not a sign ps itself is broken. That is why failure is judged by
+ * `res.error` (spawn could not even start the process — genuinely unknown,
+ * e.g. ps missing or unreadable) rather than by exit code, which for `-p` — 
+ * unlike the old `-eo` scan, where any nonzero exit really was suspicious —
+ * conflates "zero matches" with "broken" if trusted the same way.
+ *
+ * pids are bounds-checked before being handed to ps: nothing validates what a
+ * status file contains, and one corrupted pid value in an unfiltered `-p`
+ * list makes ps reject the ENTIRE query ("process id too large"), which would
+ * fail identity verification for every OTHER session in the same call —
+ * observed directly while building this. A pid that fails the sanity check is
+ * simply left out of the query and therefore absent from the result, which is
+ * the correct answer anyway: no real process has a pid shaped like that.
  */
-function livePiPids(): Map<number, number> | undefined {
-  const res = spawnSync("/bin/ps", ["-eo", "pid=,lstart=,command="], { encoding: "utf8", timeout: 3000 });
-  if (res.status !== 0 || !res.stdout) return undefined; // unknown — do not prune
-  const pids = new Map<number, number>();
+function livePiPids(pids: number[]): Map<number, number> | undefined {
+  const safe = [...new Set(pids)].filter((p) => Number.isInteger(p) && p > 0 && p <= 99_999_999);
+  if (safe.length === 0) return new Map();
+  const res = spawnSync("/bin/ps", ["-p", safe.join(","), "-o", "pid=,lstart=,command="], { encoding: "utf8", timeout: 3000 });
+  if (res.error || typeof res.stdout !== "string") return undefined; // ps itself did not run — unknown, do not prune
+  const pidsOut = new Map<number, number>();
   for (const line of res.stdout.split("\n")) {
     // pid, lstart, then command. lstart is FIXED-WIDTH, not single-spaced: ps
     // pads the day to two columns, so the first nine days of any month print
@@ -255,10 +277,10 @@ function livePiPids(): Map<number, number> | undefined {
     const cmd = m[3].trim();
     if (cmd === "pi" || cmd.startsWith("pi-")) {
       const started = Date.parse(m[2]);
-      if (Number.isFinite(started)) pids.set(Number(m[1]), started);
+      if (Number.isFinite(started)) pidsOut.set(Number(m[1]), started);
     }
   }
-  return pids;
+  return pidsOut;
 }
 
 /** Cache for last-reply lookups, keyed by transcript path. Reading a tail is
@@ -304,13 +326,15 @@ function readSessions(): DashboardEntry[] {
   } catch {
     return [];
   }
-  const live = livePiPids();
-  const entries: DashboardEntry[] = [];
+  // Two passes: the pid list livePiPids() needs to target has to be known
+  // BEFORE it is called, so every status file is parsed once up front (cheap
+  // -- measured 0.2ms for this fleet's file count) and the identity check
+  // below runs against the already-parsed results, rather than parsing twice.
+  const parsed: SessionStatusFile[] = [];
   for (const file of files) {
     const full = join(SESSION_STATUS_DIR, file);
-    let raw: SessionStatusFile;
     try {
-      raw = JSON.parse(readFileSync(full, "utf8")) as SessionStatusFile;
+      const raw = JSON.parse(readFileSync(full, "utf8")) as SessionStatusFile;
       // Nothing validates what is in a status file: the directory is writable by
       // anything running as this user, and these fields are rendered straight
       // into the terminal. Strip control sequences at the boundary rather than
@@ -319,11 +343,15 @@ function readSessions(): DashboardEntry[] {
         const v = (raw as Record<string, unknown>)[k];
         if (typeof v === "string") (raw as Record<string, unknown>)[k] = clean(v);
       }
+      parsed.push(raw);
     } catch {
       // Rare race with the writer's atomic tmp+rename, or a leftover .tmp file.
       // Skip this cycle; it resolves itself on the next poll.
-      continue;
     }
+  }
+  const live = livePiPids(parsed.map((raw) => raw.pid));
+  const entries: DashboardEntry[] = [];
+  for (const raw of parsed) {
     // Identity, not just existence. A pid alone is not proof: you have many Pi
     // sessions open, so a dead session's leftover file can name a pid that now
     // belongs to a *different* live Pi. Require the process start time to match
@@ -608,15 +636,19 @@ export function restoreRebootOrphans(): { restored: number; failed: number } {
   let files: string[];
   try { files = readdirSync(SESSION_STATUS_DIR).filter((f) => f.endsWith(".json")); }
   catch { return { restored: 0, failed: 0 }; }
-  const live = livePiPids();
+  // Same two-pass shape as readSessions(): the pid list has to be known before
+  // livePiPids() is called, so every file is parsed once up front.
+  const parsed: SessionStatusFile[] = [];
+  for (const file of files) {
+    try { parsed.push(JSON.parse(readFileSync(join(SESSION_STATUS_DIR, file), "utf8")) as SessionStatusFile); }
+    catch { /* rare write race; skip, resolves next run */ }
+  }
+  const live = livePiPids(parsed.map((raw) => raw.pid));
   if (live === undefined) return { restored: 0, failed: 0 }; // ps unavailable: do not guess at liveness
 
   let restored = 0;
   let failed = 0;
-  for (const file of files) {
-    let raw: SessionStatusFile;
-    try { raw = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, file), "utf8")) as SessionStatusFile; }
-    catch { continue; }
+  for (const raw of parsed) {
     if (!raw.visible || !raw.lastActivity) continue;
     const ageBeforeBoot = boot - raw.lastActivity / 1000;
     if (ageBeforeBoot < 0 || ageBeforeBoot > REBOOT_WINDOW_SEC) continue; // not this reboot's doing
@@ -2092,7 +2124,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       const myId = ctx.sessionManager.getSessionId();
       const card = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${myId}.json`), "utf8")) as SessionStatusFile;
       const owner = Number(card.pid) || 0;
-      if (owner && owner !== process.pid && livePiPids()?.has(owner)) {
+      if (owner && owner !== process.pid && livePiPids([owner])?.has(owner)) {
         ctx.ui.notify(
           `Session ${myId.slice(0, 8)} is already running as pid ${owner}. ` +
           `Two processes appending to one transcript will corrupt its history. ` +
