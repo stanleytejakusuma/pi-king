@@ -772,6 +772,23 @@ export function restoreRebootOrphans(): { restored: number; failed: number } {
   return { restored, failed };
 }
 
+/** True when it is safe to type text into this session's live pane right
+ * now: the main agent is not mid-turn, AND no subagent behind it is running
+ * or queued either. Broader than "state === idle" on purpose -- attention
+ * and error both mean the main agent has already stopped and the prompt is
+ * empty and waiting, exactly like idle, just flagged for a different
+ * reason; "working" is the only state where text typed now would land
+ * inside an in-flight response. Subagents are checked directly rather than
+ * trusted to "background" state naming them correctly in every case: this
+ * gates literal send-keys text injection into a live process, and getting
+ * it wrong risks corrupting a real session's input, not just a rendering
+ * glitch. Shared by every send-keys call site (rename, reload, immediate
+ * and queued) so the rule only needs to be right in one place. */
+function isSettled(entry: DashboardEntry): boolean {
+  return entry.state !== "working" &&
+    !entry.subagents.some((s) => s.status === "running" || s.status === "queued");
+}
+
 /** tmux name -> desired Pi session name, applied once that session goes idle.
  * send-keys types into the live pane, so it must never fire mid-turn. */
 const pendingRenames = new Map<string, string>();
@@ -788,11 +805,7 @@ function flushPendingRenames(rows: Row[]): void {
     // that happened to land on a session that then exited before settling.
     // Caught reviewing the analogous reload queue below, same bug, same fix.
     if (!row || row.kind !== "session") { pendingRenames.delete(tmuxName); continue; }
-    // background counts as settled: the main agent is at its prompt, only
-    // subagents still run, and send-keys lands in an empty composer exactly as
-    // it would on idle. Excluding it left renames queued indefinitely on
-    // sessions that went background and then attention.
-    if (row.entry.state !== "idle" && row.entry.state !== "background") continue;
+    if (!isSettled(row.entry)) continue;
     spawnSync(TMUX, ["send-keys", "-t", tmuxName, `/name ${clean(desired)}`, "Enter"], { encoding: "utf8", timeout: 3000 });
     pendingRenames.delete(tmuxName);
   }
@@ -822,7 +835,7 @@ function flushPendingReloads(rows: Row[]): void {
     const row = rows.find((r) => r.kind === "session" && r.entry.sessionId === id);
     if (!row || row.kind !== "session") { pendingReloads.delete(id); continue; }
     if (!row.entry.stale) { pendingReloads.delete(id); continue; }
-    if (row.entry.state !== "idle" && row.entry.state !== "background") continue;
+    if (!isSettled(row.entry)) continue;
     const tmuxName = row.entry.tmuxName;
     if (!tmuxName) { pendingReloads.delete(id); continue; }
     spawnSync(TMUX, ["send-keys", "-t", tmuxName, "/reload", "Enter"], { encoding: "utf8", timeout: 3000 });
@@ -830,7 +843,7 @@ function flushPendingReloads(rows: Row[]): void {
   }
 }
 
-function renameTmuxSession(oldName: string, newName: string, piIsIdle: boolean, sessionId: string | undefined): { ok: boolean; message: string } {
+function renameTmuxSession(oldName: string, newName: string, settled: boolean, sessionId: string | undefined): { ok: boolean; message: string } {
   const result = spawnSync(TMUX, ["rename-session", "-t", oldName, newName], { encoding: "utf8", timeout: 3000 });
   if (result.status !== 0) return { ok: false, message: `Failed to rename: ${tmuxError(result)}` };
 
@@ -855,7 +868,7 @@ function renameTmuxSession(oldName: string, newName: string, piIsIdle: boolean, 
   //
   // Only when that session is settled at its prompt: send-keys types into the
   // live pane, and injecting text mid-turn would land in an in-flight prompt.
-  if (piIsIdle) {
+  if (settled) {
     spawnSync(TMUX, ["send-keys", "-t", newName, `/name ${clean(newName)}`, "Enter"], { encoding: "utf8", timeout: 3000 });
     return { ok: true, message: `Renamed to "${newName}".` };
   }
@@ -1243,7 +1256,7 @@ class DashboardView implements Component {
       if (row.kind !== "session" || !row.entry.stale) continue;
       const tmuxName = row.entry.tmuxName;
       if (!tmuxName) continue; // no live pane to reload
-      const settled = row.entry.state === "idle" || row.entry.state === "background";
+      const settled = isSettled(row.entry);
       if (settled) {
         spawnSync(TMUX, ["send-keys", "-t", tmuxName, "/reload", "Enter"], { encoding: "utf8", timeout: 3000 });
         firedNow++;
@@ -1422,9 +1435,9 @@ class DashboardView implements Component {
         this.showMessage("That session has no tmux name to rename.");
         return;
       }
-      const idle = step.row.kind === "session" && (step.row.entry.state === "idle" || step.row.entry.state === "background");
+      const settled = step.row.kind === "session" && isSettled(step.row.entry);
       const sessionId = step.row.kind === "session" ? step.row.entry.sessionId : undefined;
-      const result = renameTmuxSession(tmuxName, value, idle, sessionId);
+      const result = renameTmuxSession(tmuxName, value, settled, sessionId);
       this.showMessage(result.message);
       this.refresh();
       this.tui.requestRender();
