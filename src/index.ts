@@ -145,6 +145,19 @@ export type SessionStatusFile = {
    * every session running right now falls into exactly that bucket until
    * its first reload after this ships. */
   packagesHash?: string;
+  /** True when this exact sessionId originated from Pi's own /fork ("Create a
+   * new fork from a previous user message") rather than a normal launch.
+   * Determined once when the sessionId is first seen (session_start's own
+   * `reason === "fork"`) and then restored unchanged on every later reload
+   * of that SAME sessionId, never re-derived from that later reload's own
+   * reason -- a naive "set isFork = reason === 'fork'" on every session_start
+   * would silently erase this the moment the forked session is itself
+   * reloaded (reload's reason is "reload", not "fork"). A fork shares its
+   * parent's process (same pid, same tmux pane) and, observed live, its
+   * parent's display name too -- two identically-labelled cards with no way
+   * to tell which is the long-running original and which just branched off
+   * is exactly the ambiguity this field exists to resolve on the card. */
+  isFork?: boolean;
 };
 
 /**
@@ -237,6 +250,15 @@ type DashboardEntry = {
    * session: nothing to reload. Computed once per readSessions() call, not
    * per render — settings.json is read at refresh cadence, not every tick. */
   stale: boolean;
+  /** This sessionId originated from Pi's own /fork, not a normal launch. See
+   * the SessionStatusFile.isFork comment for why it is stamped once and
+   * preserved across later reloads rather than re-derived every time. The
+   * card this most needs to appear on is the one sitting in the SAME pane
+   * the user has been looking at the whole time -- /fork switches that
+   * pane's active session out from under whatever was previously there, so
+   * the thing left unmarked and unattended is the one that quietly stopped
+   * being current, not something that visibly moved away. */
+  isFork: boolean;
 };
 
 type TmuxSession = { name: string; attached: boolean; windows: number; createdAt: number; panePid: number };
@@ -457,6 +479,7 @@ function readSessions(): DashboardEntry[] {
       // fine" -- see the packagesHash field comment.
       stale: raw.status !== "exited" && currentPackagesHash !== undefined &&
         (raw.packagesHash === undefined || raw.packagesHash !== currentPackagesHash),
+      isFork: raw.isFork === true,
     });
   }
   // Pinned sessions leave their directory group and form one section at the
@@ -1910,7 +1933,14 @@ class DashboardView implements Component {
         const staleBadge = e.stale
           ? (pendingReloads.has(e.sessionId) ? th.fg("warning", "⟳ queued") : th.fg("warning", "⟳ stale"))
           : "";
-        const right = [sub ? th.fg("dim", sub) : "", ctxBadge, staleBadge, th.fg("dim", elapsed(e.updatedAt))]
+        // Plain text, no glyph -- unlike stale/queued this is not an action
+        // item, and a fork-shaped Unicode symbol is not confidently
+        // renderable everywhere. "accent" rather than "warning": nothing is
+        // wrong here, this is an identity fact, not something to fix. Placed
+        // ahead of ctx%/stale on purpose -- "what is this session" reads
+        // before "what is it doing right now".
+        const forkBadge = e.isFork ? th.fg("accent", "fork") : "";
+        const right = [sub ? th.fg("dim", sub) : "", forkBadge, ctxBadge, staleBadge, th.fg("dim", elapsed(e.updatedAt))]
           .filter(Boolean).join(th.fg("dim", " \u00b7 ")) + "  ";
         const left = `  ${marker} ${e.tmuxName ? th.fg("accent", "\u26fa") : th.fg("dim", "\u233f")} ` +
           (sel ? th.bold(nm) : nm) + " " + status +
@@ -2224,6 +2254,14 @@ function installSessionTracker(pi: ExtensionAPI) {
   // can compare it against a fresh read of its own, without this session
   // doing anything beyond what it already does on every status write.
   let packagesHash: string | undefined;
+  // Determined fresh in session_start whenever the sessionId itself changes
+  // (a genuinely new/forked/resumed transcript), and otherwise RESTORED from
+  // the card rather than recomputed -- see the restore block below and the
+  // DashboardEntry.isFork comment for why: this same handler also fires on
+  // every later /reload of this exact sessionId, with reason "reload" not
+  // "fork", and recomputing from reason on every firing would silently wipe
+  // the fact the moment a forked session is itself reloaded.
+  let isFork = false;
   let hadRun = false;
   /** Set when /bg is requested mid-turn; fires the moment the session settles. */
   let bgQueued = false;
@@ -2294,6 +2332,7 @@ function installSessionTracker(pi: ExtensionAPI) {
         visible,
         contextPct,
         packagesHash,
+        isFork,
       };
       const target = statusPath(ctx);
       const tmp = `${target}.tmp-${process.pid}`;
@@ -2346,11 +2385,15 @@ function installSessionTracker(pi: ExtensionAPI) {
     } catch { /* notification is best-effort, never worth disturbing the session */ }
   }
 
-  pi.on("session_start", (_e, ctx) => {
+  pi.on("session_start", (e, ctx) => {
     if (!isInteractive(ctx)) return;
     ctxRef = ctx;
     state = "idle"; activity = "Session started."; startedAt = PROCESS_STARTED_AT;
     hadRun = false; bgQueued = false; subagents.clear();
+    // Fresh guess for a sessionId never seen before (fork/new/resume/startup
+    // all land here on first read-failure below); overwritten from the card
+    // just below when this is instead a reload of a sessionId already ours.
+    isFork = e.reason === "fork";
     visible = process.env.PI_DASHBOARD_SPAWNED === "1";
     // One read of our own card serves two purposes, and it MUST happen before
     // the first persist() — persist() stamps our own pid into that card, so
@@ -2385,6 +2428,12 @@ function installSessionTracker(pi: ExtensionAPI) {
         );
       } else if (owner === process.pid) {
         visible = Boolean(card.visible);
+        // Same sessionId as before -- this start's own reason is "reload",
+        // not "fork", so the guess just above would be wrong here. The card
+        // already recorded whether THIS sessionId originated from a fork,
+        // back when it was first created; that fact does not change on a
+        // reload and must come from the card, not from this firing's reason.
+        isFork = Boolean(card.isFork);
         // Skip death-flavoured activity text: a reload out of an OLD build
         // arrives here with the card already stamped "Ended. Last: …" by that
         // build's shutdown handler, and restoring it verbatim would caption a
