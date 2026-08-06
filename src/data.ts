@@ -63,12 +63,18 @@ function loadPrices(): PriceSet | undefined {
  * a failure must never block stats. PI_KING_PIPELINE is the full command,
  * e.g. "python3 /Users/stanz/codebase/omniroute-cost-pipeline/cost_pipeline.py". */
 const PIPELINE = process.env.PI_KING_PIPELINE?.trim();
+const PIPELINE_LOG = join(HOME, ".omniroute", "cost-pipeline.log");
 function refreshPipeline(): void {
   if (!PIPELINE) return;
   const [cmd, ...rest] = PIPELINE.split(/\s+/);
   if (!cmd) return;
   try {
-    spawn(cmd, [...rest, "refresh"], { detached: true, stdio: "ignore" }).unref();
+    // Detached, output to a log file (never to this process): the pipeline
+    // prints actual-spend / price-refresh lines that matter for diagnosis.
+    const log = openSync(PIPELINE_LOG, "a");
+    const child = spawn(cmd, [...rest, "refresh"], { detached: true, stdio: ["ignore", log, log] });
+    child.on("close", () => closeSync(log));
+    child.unref();
   } catch { /* best-effort: prices stay at last-good */ }
 }
 
