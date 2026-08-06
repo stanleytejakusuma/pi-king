@@ -53,6 +53,8 @@ it for **every** participant.
   "activity": "Investigate the failing test",     // human-readable, what it's doing
   "title": "⏳ π · example-project · codebase #019fb27c",
   "sessionFile": "/Users/you/.pi/agent/sessions/.../<id>.jsonl",
+  "startupFingerprint": "aac1e12e5b1adae8",  // optional: hash of startup inputs
+  "isFork": false,                             // optional: true when /fork-born
   "subagents": [
     { "id": "64ca09e8", "agentType": "general-purpose", "description": "…",
       "status": "running", "startedAt": 1785400100000, "completedAt": null }
@@ -63,6 +65,18 @@ it for **every** participant.
 
 ### Field notes
 
+- **`startupFingerprint`** (optional) — deterministic hash of everything a
+  fresh process start in this session's `cwd` would load: the full canonical
+  global `settings.json` (so `enabledModels` and package declarations count),
+  global `trust.json`/`keybindings.json`, the global resource roots
+  (extensions/skills/prompts/themes), one marker per `settings.packages`
+  entry, and the project scope (`.pi/settings.json` + `.pi` resource roots).
+  Stamped only on a genuine process start, preserved across `/reload`, and
+  inherited by a `/fork` (which shares the process). A reader comparing it
+  against its own fresh read detects startup-only changes — provider
+  registration, model scope, OmniRoute routing — that a reload does not
+  apply. Absent means "predates the field" or "never stamped", which the
+  dashboard treats the same as a mismatch.
 - **`status`** is coarse lifecycle, not a free-form string. `attention` means a
   background result is waiting; `trust` means a permission decision is pending.
 - **`activity`** is prose for humans. It is intentionally NOT the same field as

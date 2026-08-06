@@ -203,6 +203,51 @@ library only.
 
 ---
 
+## Phase G — Startup restart (`r`)
+
+### G1. Full restart applies startup-only changes
+
+Attach any session, then change a startup input that `/reload` does **not**
+apply — e.g. edit an entry in `~/.pi/agent/settings.json` `enabledModels`,
+or touch `~/.pi/agent/extensions/omniroute.ts`. Back in the dashboard, press
+`r`.
+
+**PASS:** The session's badge reads `↻ restart`, then the row's pid changes
+(a `respawn-pane` replaced the process), the same session id/transcript file
+is retained, and the badge clears. A follow-up prompt in the session works.
+**FAIL:** badge never appears, or the session's transcript is replaced (new
+id) — restart must preserve history.
+
+### G2. Busy sessions queue
+
+Make a session busy (a long turn), change a startup input, press `r`.
+
+**PASS:** The busy row shows `↻ queued`, its pid does **not** change while
+working, and the restart fires automatically (pid changes) the moment the
+turn settles — no further keypress.
+**FAIL:** restart fires into a mid-turn process, or the queued restart never
+happens.
+
+### G3. Never-prompted sessions are left running
+
+Create a session via `n`, do **not** send it any prompt, change a startup
+input, press `r`.
+
+**PASS:** The session stays alive with no pid change; the dashboard explains
+it has no transcript yet. A session with no JSONL cannot be resumed via
+`pi --session`, so killing it would be unrecoverable — this guard is why.
+
+### G4. Fork badge survives a restart
+
+Fork a session (`/fork`), confirm the child row shows `fork`, change a
+startup input, press `r` on the child.
+
+**PASS:** After the restart the child still shows `fork` (immutable identity),
+its pid changed, its transcript is intact, and the parent's exited card is
+untouched.
+
+---
+
 ## Failure protocol
 
 On any failure: **stop, change nothing, capture the scene.**

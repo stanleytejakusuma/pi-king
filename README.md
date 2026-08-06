@@ -219,16 +219,23 @@ Longer reasoning in **[docs/SPEC.md](docs/SPEC.md)**. The short version:
 - **[docs/FORMAT.md](docs/FORMAT.md)** — the session-status contract
 - **[docs/SPEC.md](docs/SPEC.md)** — design decisions and what is deliberately
   *not* novel
-- **[docs/TEST-SUITE.md](docs/TEST-SUITE.md)** — 28 manual tests
+- **[docs/TEST-SUITE.md](docs/TEST-SUITE.md)** — 32 manual tests
 
 The wordmark is generated, not a magic constant:
 `python3 tools/braille-art.py 11`.
 
 ## Updating
 
-`/reload` inside a running session re-imports extensions from disk (it clears
-Pi's module cache), so a backgrounded session picks up newly installed or
-updated extensions without losing its history. No restart needed.
+`/reload` inside a running session re-imports extensions, skills, and
+prompts from disk (it clears Pi's module cache). What it does **not** do is
+re-run startup-only registration: `pi.registerProvider()` calls, the scoped
+model list, and OmniRoute routing are all bound once at process start and a
+reload leaves them unchanged. For those changes the dashboard's `r` key
+performs a full restart of every affected session — `tmux respawn-pane`
+replaces the Pi process in place with `pi --session <same-id>`, so the
+transcript history survives while the new process picks up the new
+providers. Busy sessions are queued and restart automatically once they
+settle.
 
 ## Knowing when to come back
 

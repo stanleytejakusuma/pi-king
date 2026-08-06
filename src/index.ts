@@ -144,7 +144,24 @@ export type SessionStatusFile = {
    * treats that the same as a real mismatch, not as "unknown, assume fine":
    * every session running right now falls into exactly that bucket until
    * its first reload after this ships. */
-  packagesHash?: string;
+  /** Deterministic fingerprint of everything a fresh `pi` process start would
+   * load: the full canonical global settings.json (which covers enabledModels,
+   * provider/model defaults, AND the packages field), global trust.json and
+   * keybindings.json when present, the global resource roots (extensions,
+   * skills, prompts, themes), package markers for every settings.packages
+   * entry (npm lockfile / git HEAD / local package source), and the session's
+   * own project scope (.pi/settings.json + .pi resource roots).
+   *
+   * Stamped once when the sessionId is first served by THIS process — the one
+   * moment registerProvider and the model scope genuinely ran — and then
+   * PRESERVED across later /reloads of that same sessionId (a reload re-imports
+   * extensions/skills/prompts but does NOT re-run startup registration, so the
+   * process's effective startup inputs are still the launch-time ones; see the
+   * session_start stamp logic). Absent on a session that predates this field
+   * being written at all (an older pi-king build) — the dashboard treats that
+   * the same as a real mismatch, because every session running right now falls
+   * into exactly that bucket until its first full restart after this ships. */
+  startupFingerprint?: string;
   /** True when this exact sessionId originated from Pi's own /fork ("Create a
    * new fork from a previous user message") rather than a normal launch.
    * Determined once when the sessionId is first seen (session_start's own
@@ -243,13 +260,16 @@ type DashboardEntry = {
   updatedAt: number;
   subagents: SubagentStatus[];
   tmuxName: string | undefined; // resolved live tmux session name, if correlated
-  /** True when this session's stamped packagesHash disagrees with the
-   * dashboard's own current read of settings.json's packages field — or
-   * when it has no stamped hash at all, which is the same fact (needs a
-   * reload to catch up) for a different reason. Already false for an exited
-   * session: nothing to reload. Computed once per readSessions() call, not
-   * per render — settings.json is read at refresh cadence, not every tick. */
-  stale: boolean;
+  /** True when this session's stamped startupFingerprint disagrees with the
+   * dashboard's own fresh read of the same startup inputs — or when it has
+   * no stamped fingerprint at all, which is the same fact (needs a full
+   * restart to catch up) for a different reason: a reload does not re-run
+   * startup registration, so "stamped by a reload" and "never stamped"
+   * both mean the process is running against launch-time inputs while disk
+   * has moved on. Already false for an exited session: nothing to restart.
+   * Computed once per readSessions() call, not per render — the startup
+   * inputs are read at refresh cadence, not every tick. */
+  restartNeeded: boolean;
   /** This sessionId originated from Pi's own /fork, not a normal launch. See
    * the SessionStatusFile.isFork comment for why it is stamped once and
    * preserved across later reloads rather than re-derived every time. The
@@ -417,9 +437,17 @@ function readSessions(): DashboardEntry[] {
   // for the pin/order sort) so the same read also backs the name override
   // below — one readLayout() call per refresh either way.
   const layout = readLayout();
-  // One settings.json read per readSessions() call, not per entry — every
-  // row compares against this same value.
-  const currentPackagesHash = computePackagesHash();
+  // One fingerprint per distinct cwd per readSessions() call: the global
+  // inputs (settings.json, resource roots, packages) are shared by every
+  // session and the project-scope inputs depend only on the session's own
+  // working dir, so memoizing by cwd avoids recomputing the shared part N
+  // times — 14 cards in the same handful of projects is a handful of
+  // computes, not 14.
+  const fpMemo = new Map<string, string | undefined>();
+  const fpFor = (cwd: string): string | undefined => {
+    if (!fpMemo.has(cwd)) fpMemo.set(cwd, computeStartupFingerprint(cwd));
+    return fpMemo.get(cwd);
+  };
   const entries: DashboardEntry[] = [];
   for (const raw of parsed) {
     // Identity, not just existence. A pid alone is not proof: you have many Pi
@@ -470,15 +498,17 @@ function readSessions(): DashboardEntry[] {
       updatedAt: raw.lastActivity || Date.now(),
       subagents: raw.subagents ?? [],
       tmuxName: undefined,
-      // Exited already excludes it: nothing to reload. currentPackagesHash
-      // undefined means the dashboard could not read settings.json this
-      // cycle -- fail closed to "not stale" rather than flag a fleet on a
-      // read that did not happen. raw.packagesHash undefined (no stamp yet,
-      // an older build or a session that has not been through session_start
-      // since) counts the same as a real mismatch, not as "unknown, assume
-      // fine" -- see the packagesHash field comment.
-      stale: raw.status !== "exited" && currentPackagesHash !== undefined &&
-        (raw.packagesHash === undefined || raw.packagesHash !== currentPackagesHash),
+      // Exited already excludes it: nothing to restart. fp undefined means
+      // the dashboard could not read the startup inputs this cycle -- fail
+      // closed to "not restartNeeded" rather than flag a fleet on a read
+      // that did not happen. raw.startupFingerprint undefined (no stamp yet,
+      // an older build or a session that has not been through a real process
+      // start since) counts the same as a real mismatch, not as "unknown,
+      // assume fine" -- see the startupFingerprint field comment.
+      restartNeeded: raw.status !== "exited" && (() => {
+        const fp = fpFor(raw.cwd);
+        return fp !== undefined && (raw.startupFingerprint === undefined || raw.startupFingerprint !== fp);
+      })(),
       isFork: raw.isFork === true,
     });
   }
@@ -658,40 +688,169 @@ function tmuxError(result: ReturnType<typeof spawnSync>): string {
  * a configuration they had not chosen. */
 const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.env.HOME ?? ""}/.pi/agent`;
 
-/** Short, stable fingerprint of the package set `pi install`/`pi uninstall`
- * change. Only the `packages` field is hashed, not the whole settings.json:
- * a model switch or a theme change touches that same file, and must not
- * flag every running session as needing a reload it does not need.
- * undefined means "could not read/parse settings.json right now", not "no
- * packages" — callers must treat that as "cannot judge staleness", never as
- * a mismatch against every session. Used identically on both sides of the
- * comparison: stamped by each session's own process at session_start
- * (below), and read fresh by the dashboard on every readSessions() call. */
-function computePackagesHash(): string | undefined {
+/** Content-digest cache: path -> {mtimeMs, size, digest}. A file is only
+ * re-read when its mtime or size actually changed; every other read of the
+ * same startup input is a stat() plus a map hit. This is what keeps the
+ * per-refresh cost of fingerprinting a whole fleet bounded by how many
+ * startup inputs actually changed, instead of re-reading every file every
+ * second. A file that disappears (or fails to stat) has no cache entry and
+ * contributes nothing to the fingerprint — absent and unreadable are the
+ * same "not loaded" fact. */
+const startupDigestCache = new Map<string, { mtimeMs: number; size: number; digest: string }>();
+
+function digestFile(p: string): string | undefined {
   try {
-    const raw = JSON.parse(readFileSync(join(NORMAL_AGENT_DIR, "settings.json"), "utf8")) as { packages?: unknown };
-    return createHash("sha256").update(JSON.stringify(raw.packages ?? [])).digest("hex").slice(0, 12);
+    const st = statSync(p);
+    const hit = startupDigestCache.get(p);
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.digest;
+    const digest = createHash("sha256").update(readFileSync(p)).digest("hex");
+    startupDigestCache.set(p, { mtimeMs: st.mtimeMs, size: st.size, digest });
+    return digest;
   } catch {
     return undefined;
   }
 }
 
-export function createTmuxSession(name: string, dir: string, resumeSessionId?: string): { ok: boolean; message: string } {
-  const result = spawnSync(TMUX, [
-    "new-session", "-d", "-s", name,
-    "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
-    // A new session inherits the tmux SERVER's environment, which may lack our
-    // PATH entirely. Pin it so `pi` resolves regardless of how the server started.
+/** Recursively hashes every file under `root` that passes `filter`, paths
+ * sorted for determinism, skipping .git and node_modules. Missing roots
+ * contribute nothing. Used for the global and project resource roots (the
+ * dirs a fresh process start actually loads) — NOT for transcripts, media,
+ * or the rest of the agent dir, which startup never reads. */
+function hashTree(h: ReturnType<typeof createHash>, root: string, filter: (full: string) => boolean): void {
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name === ".git" || e.name === "node_modules") continue;
+      const full = join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.isFile() && filter(full)) files.push(full);
+    }
+  };
+  walk(root);
+  files.sort();
+  for (const f of files) {
+    const d = digestFile(f);
+    if (d !== undefined) h.update(`${f}:${d}\n`);
+  }
+}
+
+/** Marker for one settings.packages entry: a digest of whatever changes when
+ * that package is installed/updated, WITHOUT walking its whole tree.
+ *  - npm: hash the single lockfile that covers every npm install — version
+ *    bumps change it, one stat+read covers all npm packages.
+ *  - git: hash the repo's .git/HEAD plus its package.json — `pi update`
+ *    moves HEAD, so the ref change is caught even though settings.json's
+ *    spec string is unchanged.
+ *  - local path (relative to the agent dir, e.g. ../../codebase/pi-king):
+ *    hash package.json + the source/resource dirs a fresh process start
+ *    loads from it. This is how an edit to pi-king's own src/index.ts flags
+ *    every session for restart — the package is a settings.packages entry. */
+function packageMarker(spec: string): string | undefined {
+  if (spec.startsWith("npm:")) {
+    const lock = join(NORMAL_AGENT_DIR, "npm", "package-lock.json");
+    return existsSync(lock) ? digestFile(lock) : undefined;
+  }
+  if (spec.startsWith("git:")) {
+    const repo = spec.slice(4).replace(/@[^/]+$/, ""); // strip @ref suffix
+    const dir = join(NORMAL_AGENT_DIR, "git", repo);
+    const h = createHash("sha256");
+    const head = join(dir, ".git", "HEAD");
+    if (existsSync(head)) h.update("head:" + (digestFile(head) ?? "") + "\n");
+    const pj = join(dir, "package.json");
+    if (existsSync(pj)) h.update("pkg:" + (digestFile(pj) ?? "") + "\n");
+    return h.digest("hex").slice(0, 12);
+  }
+  // Local path entry — resolve relative to the agent dir.
+  const dir = join(NORMAL_AGENT_DIR, spec);
+  if (!existsSync(dir)) return undefined;
+  const h = createHash("sha256");
+  const pj = join(dir, "package.json");
+  if (existsSync(pj)) h.update("pkg:" + (digestFile(pj) ?? "") + "\n");
+  hashTree(h, join(dir, "src"), (f) => /\.(ts|js|mjs|cjs)$/.test(f));
+  hashTree(h, join(dir, "extensions"), (f) => /\.(ts|js|mjs|cjs)$/.test(f));
+  hashTree(h, join(dir, "skills"), (f) => f.endsWith("/SKILL.md") || f.endsWith("\\SKILL.md"));
+  hashTree(h, join(dir, "prompts"), (f) => f.endsWith(".md"));
+  return h.digest("hex").slice(0, 12);
+}
+
+/** Deterministic fingerprint of everything a fresh `pi` process start in
+ * `cwd` would load: the full canonical global settings.json (covers
+ * enabledModels, provider/model defaults, packages, everything startup
+ * reads), trust.json and keybindings.json when present, the global resource
+ * roots, one marker per settings.packages entry, and the project scope
+ * (.pi/settings.json + .pi resource roots) for this specific working dir.
+ *
+ * undefined means "could not read/parse a startup input right now", not "no
+ * inputs" — callers must treat that as "cannot judge", never as a mismatch
+ * against every session. Used identically on both sides of the comparison:
+ * stamped by each session's own process at session_start (below), and read
+ * fresh by the dashboard on every readSessions() call. */
+function computeStartupFingerprint(cwd: string): string | undefined {
+  try {
+    const h = createHash("sha256");
+    const agent = NORMAL_AGENT_DIR;
+    const settingsPath = join(agent, "settings.json");
+    const settingsRaw = JSON.parse(readFileSync(settingsPath, "utf8")) as { packages?: unknown[] };
+    // Hash the parsed+stringified form, not the raw bytes: a format-only
+    // rewrite of settings.json must not flag a restart nothing needs.
+    h.update("settings:" + JSON.stringify(settingsRaw) + "\n");
+    for (const f of ["trust.json", "keybindings.json"]) {
+      const p = join(agent, f);
+      if (existsSync(p)) h.update(`${f}:${digestFile(p) ?? ""}\n`);
+    }
+    const isTsJs = (f: string) => /\.(ts|js|mjs|cjs)$/.test(f);
+    const isSkillMd = (f: string) => f.endsWith("/SKILL.md") || f.endsWith("\\SKILL.md");
+    hashTree(h, join(agent, "extensions"), isTsJs);
+    hashTree(h, join(agent, "skills"), isSkillMd);
+    hashTree(h, join(agent, "prompts"), (f) => f.endsWith(".md"));
+    hashTree(h, join(agent, "themes"), () => true);
+    for (const spec of settingsRaw.packages ?? []) {
+      const marker = packageMarker(String(spec));
+      if (marker !== undefined) h.update(`pkg:${spec}:${marker}\n`);
+    }
+    // Project scope: the same inputs a fresh process start in THIS directory
+    // would additionally load (project settings override global ones).
+    const projSettings = join(cwd, ".pi", "settings.json");
+    if (existsSync(projSettings)) h.update("proj-settings:" + (digestFile(projSettings) ?? "") + "\n");
+    hashTree(h, join(cwd, ".pi", "extensions"), isTsJs);
+    hashTree(h, join(cwd, ".pi", "skills"), isSkillMd);
+    hashTree(h, join(cwd, ".pi", "prompts"), (f) => f.endsWith(".md"));
+    hashTree(h, join(cwd, ".pi", "themes"), () => true);
+    return h.digest("hex").slice(0, 16);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The -e environment arguments every tmux-spawned pi process needs, shared
+ * by new-session (createTmuxSession) and respawn-pane (restartTmuxPane) so
+ * the two launch paths cannot drift: a restart that forgot the status dir
+ * would write its card where the dashboard never looks. */
+function tmuxLaunchEnv(): string[] {
+  return [
+    // A new process inherits the tmux SERVER's environment, which may lack
+    // our PATH entirely. Pin it so `pi` resolves regardless of how the
+    // server started.
     "-e", `PATH=${process.env.PATH ?? ""}`,
     // Dashboard-spawned sessions auto-opt-in to appearing on the dashboard
-    // (the session tracker below reads this at session_start) — an ad-hoc `pi`
-    // typed directly into a plain terminal does not set this, and stays
+    // (the session tracker below reads this at session_start) — an ad-hoc
+    // `pi` typed directly into a plain terminal does not set this, and stays
     // invisible to the dashboard unless it runs /bg itself.
     "-e", "PI_DASHBOARD_SPAWNED=1",
     // Same class of bug /bg once had: a supervisor pointed at a non-default
     // status dir must pass it on, or the session it starts writes its card
     // where this dashboard will never look.
     ...(process.env.PI_KING_STATUS_DIR ? ["-e", `PI_KING_STATUS_DIR=${process.env.PI_KING_STATUS_DIR}`] : []),
+  ];
+}
+
+export function createTmuxSession(name: string, dir: string, resumeSessionId?: string): { ok: boolean; message: string } {
+  const result = spawnSync(TMUX, [
+    "new-session", "-d", "-s", name,
+    "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
+    ...tmuxLaunchEnv(),
     "-c", dir, "--", "pi", "--name", name,
     // Resuming continues an existing transcript in place: same session id,
     // same file. The new process overwrites the exited card with a live one.
@@ -699,6 +858,49 @@ export function createTmuxSession(name: string, dir: string, resumeSessionId?: s
   ], { encoding: "utf8", timeout: 5000 });
   if (result.status !== 0) return { ok: false, message: `Failed to create session: ${tmuxError(result)}` };
   return { ok: true, message: resumeSessionId ? `Resumed "${name}" in ${dir}.` : `Created "${name}" in ${dir}.` };
+}
+
+/** Full startup restart of the pi process inside an existing tmux pane, in
+ * place: `tmux respawn-pane -k` kills the pane's current process and starts
+ * the new one under the same session name, same directory, same env — no
+ * new tmux session, no shell, and critically no text injected into the pane
+ * (unlike sending /reload, which is what this replaces for startup-only
+ * changes: /reload re-imports extensions/skills/prompts but does NOT re-run
+ * startup pi.registerProvider() calls, model-scope construction, or
+ * OmniRoute routing). Resuming the SAME session id keeps the transcript
+ * history: the new process continues the same JSONL file.
+ *
+ * Sandbox-proven: respawning a settled session yields a new pid, the same
+ * sessionId and sessionFile on the card, and a subsequent prompt works.
+ * Known ceiling, stated rather than hidden: an unsent draft in the editor of
+ * an otherwise-settled session is lost — the dashboard cannot inspect a
+ * remote editor. Accepted trade (Option A) for headless fleet sessions. */
+export function restartTmuxPane(name: string, dir: string, sessionId: string): { ok: boolean; message: string } {
+  // pi --session <id> fails with "No session found matching" when the
+  // transcript JSONL does not exist yet — a session that has never received
+  // a prompt has no JSONL. respawn-pane -k kills the pane's current process
+  // BEFORE the new pi starts, so firing into that state would kill a live
+  // session and fail to bring it back, taking the whole tmux session down
+  // with it (observed live). Verify resumability from the card before
+  // touching the pane: no card, or a card whose sessionFile is missing,
+  // means "nothing to resume" — skip, keep the live process.
+  try {
+    const card = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${sessionId}.json`), "utf8")) as { sessionFile?: string };
+    if (typeof card.sessionFile !== "string" || !existsSync(card.sessionFile)) {
+      return { ok: false, message: `"${name}" has no transcript yet — nothing to resume, left running.` };
+    }
+  } catch {
+    return { ok: false, message: `"${name}" has no status card — cannot restart.` };
+  }
+  const result = spawnSync(TMUX, [
+    "respawn-pane", "-k", "-t", `=${name}:0.0`,
+    "-c", dir,
+    "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
+    ...tmuxLaunchEnv(),
+    "--", "pi", "--name", name, "--session", sessionId,
+  ], { encoding: "utf8", timeout: 5000 });
+  if (result.status !== 0) return { ok: false, message: `Failed to restart "${name}": ${tmuxError(result)}` };
+  return { ok: true, message: `Restarted "${name}" in ${dir}.` };
 }
 
 /** Seconds since the epoch this machine last booted, or undefined when it
@@ -834,35 +1036,59 @@ function flushPendingRenames(rows: Row[]): void {
   }
 }
 
-/** sessionId -> queued for /reload once settled. Keyed by session id, not
- * tmux name: unlike a rename, there is no user-typed value to remember, and
- * session id survives a rename that might happen to the same session while
- * a reload is still queued behind it. send-keys types into the live pane,
- * so this must never fire mid-turn — same invariant as pendingRenames. */
-const pendingReloads = new Set<string>();
+/** sessionId -> queued for a full process restart (respawn-pane) once
+ * settled. Keyed by session id, not tmux name: session id survives a rename
+ * that might happen to the same session while a restart is still queued
+ * behind it. A respawn does not type into the pane (unlike the /reload this
+ * replaces), but killing a mid-turn process still loses whatever it was
+ * doing, so it must never fire mid-turn — same invariant as pendingRenames. */
+const pendingRestarts = new Set<string>();
 
-/** Applies any queued reload whose session has since settled. Called on
+/** sessionId -> pid observed when the restart was fired. Cleared once the
+ * card shows a different pid (the successor process has claimed the file) or
+ * the row disappears entirely — this is what stops a second `r` from
+ * respawning a session that is already mid-restart: between firing
+ * respawn-pane and the new process's first status write the card still shows
+ * the OLD pid and the OLD fingerprint, so without this guard a refresh would
+ * judge it "still stale, fire again" and kill the just-started successor. */
+const restartingSessions = new Map<string, number>();
+
+/** Applies any queued restart whose session has since settled. Called on
  * refresh, same as flushPendingRenames, and shares its three failure modes
  * by construction rather than by parallel maintenance:
- *   - gone: pruned, not left to leak (the bug just fixed above in the
- *     rename queue).
- *   - already fresh: re-checks entry.stale at FIRE time, not queue time —
- *     rows is rebuilt fresh every refresh(), so a session reloaded some
- *     other way (typed /reload by hand, or picked up by an earlier flush
- *     this same cycle) already shows stale:false here, and the queued fire
- *     is skipped as a no-op rather than sent redundantly.
- *   - still busy: left queued, tried again next cycle. */
-function flushPendingReloads(rows: Row[]): void {
-  if (pendingReloads.size === 0) return;
-  for (const id of [...pendingReloads]) {
+ *   - gone: pruned, not left to leak.
+ *   - already fresh: re-checks entry.restartNeeded at FIRE time, not queue
+ *     time — rows is rebuilt fresh every refresh(), so a session restarted
+ *     some other way already shows restartNeeded:false here, and the queued
+ *     fire is skipped as a no-op rather than sent redundantly.
+ *   - still busy: left queued, tried again next cycle.
+ * A restart failure (tmux refused, directory gone) also prunes: a broken
+ * config must not loop-respawn forever — the card keeps its restartNeeded
+ * badge, so the user still sees it needs a restart and can retry with r. */
+function flushPendingRestarts(rows: Row[]): void {
+  if (pendingRestarts.size === 0) return;
+  for (const id of [...pendingRestarts]) {
     const row = rows.find((r) => r.kind === "session" && r.entry.sessionId === id);
-    if (!row || row.kind !== "session") { pendingReloads.delete(id); continue; }
-    if (!row.entry.stale) { pendingReloads.delete(id); continue; }
+    if (!row || row.kind !== "session") { pendingRestarts.delete(id); continue; }
+    if (!row.entry.restartNeeded) { pendingRestarts.delete(id); continue; }
     if (!isSettled(row.entry)) continue;
     const tmuxName = row.entry.tmuxName;
-    if (!tmuxName) { pendingReloads.delete(id); continue; }
-    spawnSync(TMUX, ["send-keys", "-t", tmuxName, "/reload", "Enter"], { encoding: "utf8", timeout: 3000 });
-    pendingReloads.delete(id);
+    if (!tmuxName) { pendingRestarts.delete(id); continue; }
+    const result = restartTmuxPane(tmuxName, row.entry.cwd, row.entry.sessionId);
+    if (result.ok) restartingSessions.set(id, row.entry.pid);
+    pendingRestarts.delete(id);
+  }
+}
+
+/** Clears restartingSessions entries whose successor has claimed the card or
+ * whose row is gone. Called on refresh ahead of flushPendingRestarts so a
+ * completed restart is no longer in-flight when the queued sweep runs. */
+function pruneRestarting(rows: Row[]): void {
+  if (restartingSessions.size === 0) return;
+  for (const [id, oldPid] of [...restartingSessions]) {
+    const row = rows.find((r) => r.kind === "session" && r.entry.sessionId === id);
+    if (!row || row.kind !== "session") { restartingSessions.delete(id); continue; }
+    if (row.entry.pid !== oldPid) restartingSessions.delete(id);
   }
 }
 
@@ -1251,47 +1477,53 @@ class DashboardView implements Component {
   private refresh(): void {
     this.rows = buildRows();
     flushPendingRenames(this.rows);
-    flushPendingReloads(this.rows);
+    pruneRestarting(this.rows);
+    flushPendingRestarts(this.rows);
     if (this.selected >= this.rows.length) this.selected = Math.max(0, this.rows.length - 1);
     this.refreshGitDrift();
   }
 
-  /** `r`: reload every stale session in one keypress, without ever typing
-   * into a pane mid-turn. Settled sessions (idle/background) get /reload
-   * sent immediately; busy ones are queued and picked up automatically by
-   * flushPendingReloads on a later refresh, the moment they settle — one
-   * press converges the whole fleet instead of firing once and leaving
-   * whatever was busy to be caught manually later. */
-  private reloadStaleSessions(): void {
+  /** `r`: restart every session whose startup inputs changed, in one keypress,
+   * without ever killing a pane mid-turn. Settled sessions (idle/background)
+   * are respawned immediately; busy ones are queued and picked up
+   * automatically by flushPendingRestarts on a later refresh, the moment they
+   * settle — one press converges the whole fleet instead of firing once and
+   * leaving whatever was busy to be caught manually later. A full restart
+   * (not /reload) is required for startup-only changes: /reload re-imports
+   * extensions/skills/prompts but does NOT re-run pi.registerProvider(),
+   * model-scope construction, or OmniRoute routing. */
+  private restartStaleSessions(): void {
     // Refresh BEFORE deciding, not just after: this.rows otherwise reflects
     // whatever the last periodic tick happened to see, which on an idle
     // fleet can be up to IDLE_REFRESH_TICKS old. A press landing in that
-    // window would judge staleness and settledness against stale data and
-    // could act on nothing even though the badge on screen already shows
-    // stale (the render loop reads live off this.rows too, so the two would
-    // visibly disagree for a moment) -- caught exactly this way live,
-    // pressing r right after making a session stale and finding it fired on
-    // nothing.
+    // window would judge restartNeeded and settledness against stale data
+    // and could act on nothing even though the badge on screen already shows
+    // restartNeeded (the render loop reads live off this.rows too, so the
+    // two would visibly disagree for a moment).
     this.refresh();
     let firedNow = 0;
     let queued = 0;
     for (const row of this.rows) {
-      if (row.kind !== "session" || !row.entry.stale) continue;
+      if (row.kind !== "session" || !row.entry.restartNeeded) continue;
       const tmuxName = row.entry.tmuxName;
-      if (!tmuxName) continue; // no live pane to reload
+      if (!tmuxName) continue; // no live pane to restart
+      if (restartingSessions.has(row.entry.sessionId)) continue; // already in flight
       const settled = isSettled(row.entry);
       if (settled) {
-        spawnSync(TMUX, ["send-keys", "-t", tmuxName, "/reload", "Enter"], { encoding: "utf8", timeout: 3000 });
-        firedNow++;
+        const result = restartTmuxPane(tmuxName, row.entry.cwd, row.entry.sessionId);
+        if (result.ok) {
+          restartingSessions.set(row.entry.sessionId, row.entry.pid);
+          firedNow++;
+        }
       } else {
-        pendingReloads.add(row.entry.sessionId);
+        pendingRestarts.add(row.entry.sessionId);
         queued++;
       }
     }
-    if (firedNow === 0 && queued === 0) this.showMessage("No sessions need reloading.");
+    if (firedNow === 0 && queued === 0) this.showMessage("No sessions need restarting.");
     else this.showMessage(
-      `Reloaded ${firedNow} session${firedNow === 1 ? "" : "s"}` +
-      (queued > 0 ? `, ${queued} queued — will reload once settled.` : "."),
+      `Restarting ${firedNow} session${firedNow === 1 ? "" : "s"}` +
+      (queued > 0 ? `, ${queued} queued — will restart once settled.` : "."),
     );
     this.tui.requestRender();
   }
@@ -1510,7 +1742,7 @@ class DashboardView implements Component {
       return;
     }
     if (data === "r" || data === "R") {
-      this.reloadStaleSessions();
+      this.restartStaleSessions();
       return;
     }
     if (data === "n" || data === "N") {
@@ -1926,12 +2158,15 @@ class DashboardView implements Component {
         const ctxBadge = e.contextPct !== undefined && e.state !== "exited"
           ? th.fg(e.contextPct >= 85 ? "error" : e.contextPct >= 65 ? "warning" : "dim", `ctx ${e.contextPct}%`)
           : "";
-        // e.stale already excludes exited (see the DashboardEntry.stale
-        // comment) -- queued reads differently from stale-and-untouched so
-        // pressing `r` visibly does something even for the sessions it could
-        // not fire into immediately, instead of looking like nothing happened.
-        const staleBadge = e.stale
-          ? (pendingReloads.has(e.sessionId) ? th.fg("warning", "⟳ queued") : th.fg("warning", "⟳ stale"))
+        // e.restartNeeded already excludes exited (see the
+        // DashboardEntry.restartNeeded comment). In-flight reads differently
+        // from queued reads differently from stale-and-untouched so pressing
+        // `r` visibly does something even for the sessions it could not fire
+        // into immediately, instead of looking like nothing happened.
+        const restartBadge = e.restartNeeded
+          ? (restartingSessions.has(e.sessionId) ? th.fg("warning", "↻ restarting")
+            : pendingRestarts.has(e.sessionId) ? th.fg("warning", "↻ queued")
+            : th.fg("warning", "↻ restart"))
           : "";
         // Plain text, no glyph -- unlike stale/queued this is not an action
         // item, and a fork-shaped Unicode symbol is not confidently
@@ -1940,7 +2175,7 @@ class DashboardView implements Component {
         // ahead of ctx%/stale on purpose -- "what is this session" reads
         // before "what is it doing right now".
         const forkBadge = e.isFork ? th.fg("accent", "fork") : "";
-        const right = [sub ? th.fg("dim", sub) : "", forkBadge, ctxBadge, staleBadge, th.fg("dim", elapsed(e.updatedAt))]
+        const right = [sub ? th.fg("dim", sub) : "", forkBadge, ctxBadge, restartBadge, th.fg("dim", elapsed(e.updatedAt))]
           .filter(Boolean).join(th.fg("dim", " \u00b7 ")) + "  ";
         const left = `  ${marker} ${e.tmuxName ? th.fg("accent", "\u26fa") : th.fg("dim", "\u233f")} ` +
           (sel ? th.bold(nm) : nm) + " " + status +
@@ -1979,7 +2214,7 @@ class DashboardView implements Component {
         `${k("\u2191\u2193")}${l(" select ")}${k("enter")}${l(` ${verb}`)}` + l("   \u2502   ") +
         `${k("\u21e7\u2191\u2193")}${l(" move ")}${k("^t")}${l(" pin")}` + l("   \u2502   ") +
         `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${k("x")}${l(" detach ")}${th.fg("error", "X")}${l(" kill")}` + l("   \u2502   ") + `${k("s")}${l(" stats")}` + l("   \u2502   ") +
-        `${k("r")}${l(" reload stale ")}${k("esc")}${l(" close")}`);
+        `${k("r")}${l(" restart stale ")}${k("esc")}${l(" close")}`);
     }
 
     // ---- assemble: pinned head, scrolling body, pinned foot -------------
@@ -2248,12 +2483,15 @@ function installSessionTracker(pi: ExtensionAPI) {
   // the value is identical no matter how many times this module re-evaluates.
   const PROCESS_STARTED_AT = Date.now() - process.uptime() * 1000;
   let startedAt = PROCESS_STARTED_AT;
-  // Stamped fresh in session_start below, which fires at process launch AND
-  // on every /reload -- exactly the two moments this process's own loaded
-  // package set can change. Persisted with every snapshot so the dashboard
-  // can compare it against a fresh read of its own, without this session
-  // doing anything beyond what it already does on every status write.
-  let packagesHash: string | undefined;
+  // Stamped fresh in session_start below ONLY on a genuine process start
+  // (reason !== "reload"), and preserved across /reload of the same
+  // sessionId by the restore block: a reload re-imports extensions and
+  // skills but does NOT re-run startup pi.registerProvider()/model-scope
+  // construction, so the process's effective startup inputs are still the
+  // launch-time ones. Persisted with every snapshot so the dashboard can
+  // compare it against a fresh read of its own, without this session doing
+  // anything beyond what it already does on every status write.
+  let startupFingerprint: string | undefined;
   // Determined fresh in session_start whenever the sessionId itself changes
   // (a genuinely new/forked/resumed transcript), and otherwise RESTORED from
   // the card rather than recomputed -- see the restore block below and the
@@ -2331,7 +2569,7 @@ function installSessionTracker(pi: ExtensionAPI) {
         subagents: [...subagents.values()],
         visible,
         contextPct,
-        packagesHash,
+        startupFingerprint,
         isFork,
       };
       const target = statusPath(ctx);
@@ -2453,13 +2691,53 @@ function installSessionTracker(pi: ExtensionAPI) {
           if (s && typeof s.id === "string") subagents.set(s.id, s);
         }
         if ((state === "idle") && hasLiveSubagents() > 0) state = "background";
+        // Same class as isFork above: the startup fingerprint records what
+        // THIS sessionId ran with at process launch, and a reload does not
+        // re-run startup registration — preserve the card's stamp rather than
+        // recomputing a fresh one that would claim a reload made the process
+        // startup-fresh when it did not.
+        startupFingerprint = card.startupFingerprint;
+      } else if (owner && !livePiPids([owner])?.has(owner)) {
+        // Dead predecessor: this is a restart (respawn-pane replacing a dead
+        // process) or a plain resume of a transcript whose previous process
+        // is gone. Immutable identity facts — dashboard visibility (a /bg'd
+        // session must not drop off the dashboard) and fork origin — belong
+        // to the sessionId, not the pid, so they survive the process swap.
+        // NOT restored here: state/activity/subagents (they describe a
+        // process that is gone) and startupFingerprint (this process DID run
+        // startup registration — it gets a fresh stamp below).
+        visible = Boolean(card.visible);
+        isFork = Boolean(card.isFork);
       }
     } catch { /* no file, unreadable, or first run: nothing to warn about */ }
     // Stamped here, at the end of session_start rather than the top: this is
     // as close as this handler gets to "extension setup for this run is
     // done", the same reasoning /reload's own comments elsewhere in this
     // handler already apply to state/activity/subagents restoration above.
-    packagesHash = computePackagesHash();
+    // A reload preserves the card's stamp (restored above — the process did
+    // not re-run startup registration). A fork inherits its parent's stamp:
+    // it shares this process, so it shares the parent's launch-time startup
+    // inputs — claiming a fresh compute would silently hide a stale parent's
+    // missing providers behind a badge-free fork card. Only a genuinely
+    // fresh process start (startup/new/resume, including a restart via
+    // respawn-pane) computes a new one.
+    if (e.reason === "fork" && typeof e.previousSessionFile === "string") {
+      // Parent session id is embedded in the previous session file name:
+      // <timestamp>_<sessionId>.jsonl. Read the parent's card (it is either
+      // still live or already marked exited by the fork's own shutdown —
+      // either way it carries the parent's stamp; exited cards keep their
+      // fields) and inherit its startupFingerprint.
+      const m = /_([0-9a-f-]+)\.jsonl$/.exec(e.previousSessionFile);
+      if (m) {
+        try {
+          const parent = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${m[1]}.json`), "utf8")) as SessionStatusFile;
+          startupFingerprint = parent.startupFingerprint;
+        } catch { /* parent card gone: leave unstamped — the dashboard reads
+                     that as restart-needed, the safe direction */ }
+      }
+    } else if (e.reason !== "reload") {
+      startupFingerprint = computeStartupFingerprint(ctx.cwd);
+    }
     persist(ctx);
 
     // Left-arrow at an empty prompt detaches this pane's tmux client — a
