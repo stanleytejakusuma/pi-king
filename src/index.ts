@@ -3081,6 +3081,24 @@ function installSessionTracker(pi: ExtensionAPI) {
       ctx.ui.notify(`A tmux session named "${name}" already exists \u2014 not creating a duplicate. Attach to it from pi-king.`, "warning");
       return;
     }
+    // A session that has never received a prompt has no transcript JSONL yet.
+    // The copy runs `pi --session <id>`, which fails with "No session found
+    // matching" when the JSONL does not exist, and dies immediately — /bg then
+    // misreports it as a handoff failure and kills the tmux session it just
+    // created. Same hazard restartTmuxPane guards against; same fix: verify
+    // resumability from the card before spawning anything.
+    try {
+      const card = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${sessionId}.json`), "utf8")) as { sessionFile?: string };
+      if (typeof card.sessionFile !== "string" || !existsSync(card.sessionFile)) {
+        visible = true; persist(ctx);
+        ctx.ui.notify("Nothing to hand off yet \u2014 send a first prompt so the transcript exists, then try /bg again.", "warning");
+        return;
+      }
+    } catch {
+      visible = true; persist(ctx);
+      ctx.ui.notify("No status card for this session \u2014 cannot background yet. Try again after the session has started.", "warning");
+      return;
+    }
     const created = spawnSync(tmux, [
       "new-session", "-d", "-s", name,
       "-e", "PI_DASHBOARD_SPAWNED=1",
