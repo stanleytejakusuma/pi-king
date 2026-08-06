@@ -137,6 +137,26 @@ Attach to any pi-king session, run `/bg`.
 Run `/bg` from a directory whose derived name already exists as a tmux session.
 **PASS:** Refuses with a message; does not create a duplicate.
 
+### D6. No-transcript guard
+Start a plain `pi` in a normal tab. Do **not** send any prompt (a session that
+has never received a prompt has no transcript JSONL). Type `/bg` immediately.
+
+**PASS:** `"Nothing to hand off yet — send a first prompt so the transcript
+exists, then try /bg again."` The session is surfaced on the dashboard, the
+original process stays alive, and **no** tmux session is created.
+**FAIL (pre-fix behavior):** `"Handoff failed — the tmux copy exited
+immediately"` — the copy's `pi --session <id>` dies on a missing JSONL, and
+/bg churns a dead tmux session.
+
+### D7. Quote-containing session names
+Rename a session to a name containing literal quotes (e.g. `/name "prior
+reasoning summary unavailable" issue`) with a transcript present, then `/bg`.
+
+**PASS:** Session created under the quoted name, copy survives (`cmd=node`),
+original shuts down. All tmux primitives (spawn, `tmuxSessionExists`,
+`kill-session` raw and `=`-prefixed) handle quote names correctly — verified
+against tmux 3.7b.
+
 ---
 
 ## Phase E — Correctness
