@@ -1184,7 +1184,15 @@ function requestWrapperAction(action: HubAction): boolean {
   const target = process.env.PI_KING_ACTION_FILE;
   if (!target) return false;
   try {
-    writeFileSync(target, JSON.stringify(action));
+    // First line: the RAW tmux session name, never JSON-escaped. The wrapper
+    // reads exactly this line; a JSON-escaped name breaks sed extraction — a
+    // quote inside the name arrives as \" and the old sed stopped at that
+    // first quote, leaving a stray backslash as the attach target (observed
+    // live as `can't find session: \`). tmux rejects control characters in
+    // session names, so a single raw line is unambiguous. The JSON stays on
+    // line two for any future consumer that wants the full action.
+    const tmuxName = action.type === "attach" ? action.tmuxName : "";
+    writeFileSync(target, `${tmuxName}\n${JSON.stringify(action)}`);
     return true;
   } catch {
     return false;

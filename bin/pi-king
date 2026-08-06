@@ -72,7 +72,14 @@ while true; do
   # No action written => the user quit the dashboard. Done.
   [ -s "$ACTION_FILE" ] || break
 
-  target="$(sed -n 's/.*"tmuxName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ACTION_FILE" | head -1)"
+  # tmuxName is the RAW first line of the action file, not JSON. The file's
+  # second line carries the full JSON action for anything that wants it; the
+  # name itself must never be JSON-escaped, because a session name containing
+  # a double quote (e.g. a pi session renamed to "foo bar" issue) would then
+  # arrive as \"... and sed extraction stops at that first quote, leaving a
+  # stray backslash as the attach target (observed live as `can't find
+  # session: \`).
+  target="$(head -1 "$ACTION_FILE")"
   [ -n "$target" ] || break
 
   # tmux owns the terminal exclusively here; blocks until the user detaches.
