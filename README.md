@@ -196,6 +196,7 @@ Everything is optional; unset means the corresponding panel is simply absent.
 | Variable | Effect |
 |---|---|
 | `PI_KING_CALL_LOGS` | Directory of per-day call-log JSON. Unset means no metrics band. |
+| `PI_KING_PIPELINE` | Full command for the omniroute cost pipeline, fired fire-and-forget on each stats refresh (ingest + price TTL + export). Unset means costs update only when the export is refreshed by other means. |
 | `PI_KING_CLIS` | Comma-separated CLIs to report presence of. Defaults to common dev tools. |
 | `PI_KING_STATUS_DIR` | Overrides the session-status directory. Testing only. |
 

@@ -16,8 +16,12 @@
  *    therefore sorted alphabetically, not by usage.
  *  - Cost. call_logs carries no price data; a hardcoded price table would rot
  *    silently. A fabricated authoritative-looking number is worse than none.
+ *    Cost is therefore computed here from the omniroute cost pipeline's live
+ *    price catalog (see PRICES_FILE below) — rates come from OpenRouter /
+ *    DeepSeek public pricing, fetched on-demand, never hardcoded.
  */
 
+import { spawn } from "node:child_process";
 import { openSync, readSync, closeSync, fstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join, basename, dirname } from "node:path";
@@ -53,6 +57,21 @@ function loadPrices(): PriceSet | undefined {
   }
   return pricesCache;
 }
+/** Trigger the omniroute cost pipeline's on-demand refresh (ingest + price
+ * TTL + export + best-effort actuals). Fire-and-forget: the pipeline gates on
+ * its own 6h price TTL and ingest checkpoint, so an idle run is a few ms, and
+ * a failure must never block stats. PI_KING_PIPELINE is the full command,
+ * e.g. "python3 /Users/stanz/codebase/omniroute-cost-pipeline/cost_pipeline.py". */
+const PIPELINE = process.env.PI_KING_PIPELINE?.trim();
+function refreshPipeline(): void {
+  if (!PIPELINE) return;
+  const [cmd, ...rest] = PIPELINE.split(/\s+/);
+  if (!cmd) return;
+  try {
+    spawn(cmd, [...rest, "refresh"], { detached: true, stdio: "ignore" }).unref();
+  } catch { /* best-effort: prices stay at last-good */ }
+}
+
 /** API-equivalent cost of one call in USD. Resolution mirrors the pipeline:
  * openrouter id exact, deepseek by model suffix (provider must say deepseek),
  * else gateway defaults. 0 when no price is known (local/free routes). */
@@ -701,6 +720,9 @@ export class StatsCache {
   get(): { stats: UsageStats | undefined; daily: DayTotal[]; loaded: boolean } {
     if (!this.inFlight && Date.now() - this.fetchedAt > STATS_TTL_MS) {
       this.inFlight = true;
+      // Costs are fresh whenever stats are viewed: the pipeline ingests new
+      // calls and refreshes prices if stale, all gated by its own TTLs.
+      refreshPipeline();
       // Sequential on purpose: readUsageStats scans today's directory for the
       // band, and its totals are handed to readLifetimeStats so the lifetime
       // walk skips that directory rather than scanning it a second time in
