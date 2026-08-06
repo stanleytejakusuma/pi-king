@@ -792,6 +792,10 @@ function computeStartupFingerprint(cwd: string): string | undefined {
     const h = createHash("sha256");
     const agent = NORMAL_AGENT_DIR;
     const settingsPath = join(agent, "settings.json");
+    // ONE parsed snapshot, used for both the settings hash and the packages
+    // loop below. Reading the file twice (once for each) could hash a hybrid
+    // if pi rewrites settings.json between the two reads (Red review, risk
+    // #4) — a false fingerprint from a moment of write-in-progress.
     const settingsRaw = JSON.parse(readFileSync(settingsPath, "utf8")) as { packages?: unknown[] };
     // Hash the parsed+stringified form, not the raw bytes: a format-only
     // rewrite of settings.json must not flag a restart nothing needs.
@@ -1080,15 +1084,22 @@ function flushPendingRestarts(rows: Row[]): void {
   }
 }
 
-/** Clears restartingSessions entries whose successor has claimed the card or
- * whose row is gone. Called on refresh ahead of flushPendingRestarts so a
- * completed restart is no longer in-flight when the queued sweep runs. */
+/** Clears restartingSessions entries whose successor has acknowledged itself.
+ * Called on refresh ahead of flushPendingRestarts so a completed restart is no
+ * longer in-flight when the queued sweep runs. "Acknowledged" is stricter
+ * than "pid changed": the new process publishes its pid and its fingerprint
+ * in one session_start persist, so a card whose pid changed but whose
+ * fingerprint still disagrees (or is absent) has not finished initializing —
+ * clearing on pid alone would let a second `r` kill the half-started
+ * successor (Red review, risk #2). Row gone entirely = the restart failed and
+ * took the tmux session with it; clear so the card renders exited instead of
+ * hanging in "restarting" forever. */
 function pruneRestarting(rows: Row[]): void {
   if (restartingSessions.size === 0) return;
   for (const [id, oldPid] of [...restartingSessions]) {
     const row = rows.find((r) => r.kind === "session" && r.entry.sessionId === id);
     if (!row || row.kind !== "session") { restartingSessions.delete(id); continue; }
-    if (row.entry.pid !== oldPid) restartingSessions.delete(id);
+    if (row.entry.pid !== oldPid && !row.entry.restartNeeded) restartingSessions.delete(id);
   }
 }
 
