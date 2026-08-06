@@ -688,23 +688,28 @@ function tmuxError(result: ReturnType<typeof spawnSync>): string {
  * a configuration they had not chosen. */
 const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.env.HOME ?? ""}/.pi/agent`;
 
-/** Content-digest cache: path -> {mtimeMs, size, digest}. A file is only
- * re-read when its mtime or size actually changed; every other read of the
- * same startup input is a stat() plus a map hit. This is what keeps the
+/** Content-digest cache: path -> {mtimeMs, ctimeMs, size, digest}. A file is
+ * only re-read when its mtime, ctime, or size changed; every other read of
+ * the same startup input is a stat() plus a map hit. This is what keeps the
  * per-refresh cost of fingerprinting a whole fleet bounded by how many
  * startup inputs actually changed, instead of re-reading every file every
- * second. A file that disappears (or fails to stat) has no cache entry and
+ * second. ctimeMs is load-bearing, not belt-and-suspenders: mtime+size alone
+ * miss a same-size write that preserves its own mtime (a tool rewriting a
+ * file in place with -p), which would leave the cached digest stale and
+ * fingerprint a file as unchanged when it changed — a false negative. ctime
+ * changes on any inode update, including one that preserves mtime and size.
+ * A file that disappears (or fails to stat) has no cache entry and
  * contributes nothing to the fingerprint — absent and unreadable are the
  * same "not loaded" fact. */
-const startupDigestCache = new Map<string, { mtimeMs: number; size: number; digest: string }>();
+const startupDigestCache = new Map<string, { mtimeMs: number; ctimeMs: number; size: number; digest: string }>();
 
 function digestFile(p: string): string | undefined {
   try {
     const st = statSync(p);
     const hit = startupDigestCache.get(p);
-    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.digest;
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.ctimeMs === st.ctimeMs && hit.size === st.size) return hit.digest;
     const digest = createHash("sha256").update(readFileSync(p)).digest("hex");
-    startupDigestCache.set(p, { mtimeMs: st.mtimeMs, size: st.size, digest });
+    startupDigestCache.set(p, { mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, digest });
     return digest;
   } catch {
     return undefined;
@@ -2732,19 +2737,26 @@ function installSessionTracker(pi: ExtensionAPI) {
     // missing providers behind a badge-free fork card. Only a genuinely
     // fresh process start (startup/new/resume, including a restart via
     // respawn-pane) computes a new one.
-    if (e.reason === "fork" && typeof e.previousSessionFile === "string") {
-      // Parent session id is embedded in the previous session file name:
-      // <timestamp>_<sessionId>.jsonl. Read the parent's card (it is either
-      // still live or already marked exited by the fork's own shutdown —
-      // either way it carries the parent's stamp; exited cards keep their
-      // fields) and inherit its startupFingerprint.
-      const m = /_([0-9a-f-]+)\.jsonl$/.exec(e.previousSessionFile);
-      if (m) {
-        try {
-          const parent = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${m[1]}.json`), "utf8")) as SessionStatusFile;
-          startupFingerprint = parent.startupFingerprint;
-        } catch { /* parent card gone: leave unstamped — the dashboard reads
+    if (e.reason === "fork") {
+      // First choice: this process's own stamp. The fork is the SAME process
+      // (same pid, same tmux pane), so if the module was not re-evaluated for
+      // the fork, the closure variable still holds the exact stamp this
+      // process stamped at launch — the true source of truth, no filesystem
+      // involved (Red review: "the process already knows its own startup
+      // fingerprint"). If the module WAS re-evaluated (the closure is fresh
+      // undefined), fall back to the parent's card: the parent session id is
+      // embedded in the previous session file name <timestamp>_<id>.jsonl,
+      // and its card (still live, or already exited by the fork's own
+      // shutdown — exited cards keep their fields) carries the stamp.
+      if (startupFingerprint === undefined && typeof e.previousSessionFile === "string") {
+        const m = /_([0-9a-f-]+)\.jsonl$/.exec(e.previousSessionFile);
+        if (m) {
+          try {
+            const parent = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${m[1]}.json`), "utf8")) as SessionStatusFile;
+            startupFingerprint = parent.startupFingerprint;
+          } catch { /* parent card gone: leave unstamped — the dashboard reads
                      that as restart-needed, the safe direction */ }
+        }
       }
     } else if (e.reason !== "reload") {
       startupFingerprint = computeStartupFingerprint(ctx.cwd);
