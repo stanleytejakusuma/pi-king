@@ -37,6 +37,42 @@ const AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || join(HOME, ".pi", "
  * everyone who does not run it. Unset means the band is simply absent, which
  * matches the rule that missing data renders as nothing. See README. */
 const CALL_LOGS = process.env.PI_KING_CALL_LOGS?.trim() || undefined;
+/** Price catalog exported by the omniroute cost pipeline
+ * (~/codebase/omniroute-cost-pipeline/cost_pipeline.py export). All prices are
+ * $/1M tokens in [miss, hit, out, reason] form; hit falls back to miss when a
+ * model has no cache discount. Absent file or model = no price = $0 cost. */
+const PRICES_FILE = process.env.PI_KING_PRICES?.trim() || join(HOME, ".omniroute", "cost-prices.json");
+type PriceSet = { openrouter?: Record<string, number[]>; deepseek?: Record<string, number[]>; defaults?: Record<string, number[]> };
+let pricesCache: PriceSet | undefined;
+function loadPrices(): PriceSet | undefined {
+  if (pricesCache !== undefined) return pricesCache;
+  try {
+    pricesCache = JSON.parse(readFileSync(PRICES_FILE, "utf8")) as PriceSet;
+  } catch {
+    pricesCache = undefined;
+  }
+  return pricesCache;
+}
+/** API-equivalent cost of one call in USD. Resolution mirrors the pipeline:
+ * openrouter id exact, deepseek by model suffix (provider must say deepseek),
+ * else gateway defaults. 0 when no price is known (local/free routes). */
+export function costOfTokens(model: string, provider: string, tk: Record<string, unknown>): number {
+  const prices = loadPrices();
+  if (!prices) return 0;
+  let pr = prices.openrouter?.[model];
+  if (!pr && /deepseek/i.test(provider)) {
+    for (const cand of ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]) {
+      if (model.includes(cand)) { pr = prices.deepseek?.[cand]; break; }
+    }
+  }
+  if (!pr) pr = prices.defaults?.[model];
+  if (!pr || pr.length < 4) return 0;
+  const [miss, hit, out, reason] = pr;
+  const tin = Number(tk.in) || 0;
+  const tcr = Number(tk.cacheRead) || 0;
+  const uncached = Math.max(0, tin - tcr);
+  return (uncached * miss + tcr * hit + (Number(tk.out) || 0) * out + (Number(tk.reasoning) || 0) * reason) / 1e6;
+}
 
 /** Where per-day token totals are memoised. Kept beside the session status
  * files rather than inside the log directory, which belongs to whatever writes
@@ -168,8 +204,10 @@ export type UsageStats = {
   topModels: Array<{ model: string; pct: number }>;
   /** Per-model figures for the stats screen, sorted by call count. p95 is per
    * model because a slow tail usually belongs to one model, and the aggregate
-   * p95 hides which. */
-  perModel: Array<{ model: string; calls: number; tokensIn: number; errors: number; p95: number }>;
+   * p95 hides which. cost is today's API-equivalent USD for the model. */
+  perModel: Array<{ model: string; calls: number; tokensIn: number; errors: number; p95: number; cost: number }>;
+  /** API-equivalent USD for today, from cost-prices.json. */
+  cost: number;
   /** HTTP status codes >= 400 with their counts, most frequent first. The
    * band's error rate says how much is failing; this says what kind. */
   errorsByStatus: Array<[number, number]>;
@@ -262,14 +300,15 @@ type DayFields = Omit<DayTotal, "day">;
  * entry, or two when the directory straddles a local-day boundary). */
 type DirCacheEntry = Record<string, DayFields>;
 
-const ZERO_FIELDS = (): DayFields => ({ tokensIn: 0, tokensOut: 0, tokensCacheRead: 0, tokensCacheWrite: 0, tokensReasoning: 0, calls: 0 });
-const FIELD_NAMES = ["tokensIn", "tokensOut", "tokensCacheRead", "tokensCacheWrite", "tokensReasoning", "calls"] as const;
+const ZERO_FIELDS = (): DayFields => ({ tokensIn: 0, tokensOut: 0, tokensCacheRead: 0, tokensCacheWrite: 0, tokensReasoning: 0, calls: 0, cost: 0 });
+const FIELD_NAMES = ["tokensIn", "tokensOut", "tokensCacheRead", "tokensCacheWrite", "tokensReasoning", "calls", "cost"] as const;
 const isComplete = (h: Record<string, unknown> | undefined): h is DayFields =>
   !!h && FIELD_NAMES.every((f) => typeof h[f] === "number");
 function addFields(into: Map<string, DayFields>, localDay: string, e: DayFields): void {
   const cur = into.get(localDay) ?? ZERO_FIELDS();
   cur.tokensIn += e.tokensIn; cur.tokensOut += e.tokensOut; cur.tokensCacheRead += e.tokensCacheRead;
   cur.tokensCacheWrite += e.tokensCacheWrite; cur.tokensReasoning += e.tokensReasoning; cur.calls += e.calls;
+  cur.cost += e.cost;
   into.set(localDay, cur);
 }
 
@@ -293,6 +332,9 @@ export async function readDailyTokens(todayOverride?: DayTotal): Promise<DayTota
   let cache: Record<string, DirCacheEntry> = {};
   try {
     cache = JSON.parse(readFileSync(DAILY_CACHE, "utf8")) as typeof cache;
+    // cost was added after the cache shipped: backfill 0 (unknown) so rotated-away
+    // directories keep their token data and stay complete instead of dropping out.
+    for (const entry of Object.values(cache)) for (const f of Object.values(entry)) if (typeof f.cost !== "number") f.cost = 0;
   } catch { /* first run, or unreadable: rebuild */ }
 
   const merged = new Map<string, DayFields>();
@@ -332,6 +374,7 @@ export async function readDailyTokens(todayOverride?: DayTotal): Promise<DayTota
             e.tokensCacheRead += Number(tk.cacheRead) || 0;
             e.tokensCacheWrite += Number(tk.cacheWrite) || 0;
             e.tokensReasoning += Number(tk.reasoning) || 0;
+            e.cost += costOfTokens(String(r.summary.model ?? ""), String(r.summary.provider ?? ""), tk);
           }
           byLocal[localDay] = e;
         }
@@ -447,6 +490,7 @@ export async function readLifetimeStats(todayOverride?: DayTotal): Promise<Lifet
   const tokensCacheWrite = active.reduce((n, d) => n + d.tokensCacheWrite, 0);
   const tokensReasoning = active.reduce((n, d) => n + d.tokensReasoning, 0);
   const calls = active.reduce((n, d) => n + d.calls, 0);
+  const cost = active.reduce((n, d) => n + d.cost, 0);
 
   const dayMs = 86_400_000;
   const asDate = (d: string): number => new Date(`${d}T00:00:00`).getTime();
@@ -472,7 +516,7 @@ export async function readLifetimeStats(todayOverride?: DayTotal): Promise<Lifet
   const gapDays = Math.round((asDate(todayKey) - asDate(last)) / dayMs);
   if (gapDays > 1) current = 0;
 
-  return { tokensIn, tokensOut, tokensCacheRead, tokensCacheWrite, tokensReasoning, calls, activeDays: active.length, currentStreak: current, longestStreak: longest, days };
+  return { tokensIn, tokensOut, tokensCacheRead, tokensCacheWrite, tokensReasoning, calls, cost, activeDays: active.length, currentStreak: current, longestStreak: longest, days };
 }
 
 export async function readUsageStats(): Promise<UsageStats | undefined> {
@@ -504,7 +548,7 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
   }
   if (files.length === 0) return undefined;
 
-  const byModel = new Map<string, { calls: number; tokensIn: number; errors: number; durations: number[] }>();
+  const byModel = new Map<string, { calls: number; tokensIn: number; errors: number; durations: number[]; cost: number }>();
   const byStatus = new Map<number, number>();
   const byHour = new Map<number, number>();
   let calls = 0;
@@ -562,11 +606,12 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
         durations.push(dur);
         if (!slowest || dur > slowest.duration) slowest = { duration: dur, model };
       }
-      const m = byModel.get(model) ?? { calls: 0, tokensIn: 0, errors: 0, durations: [] };
+      const m = byModel.get(model) ?? { calls: 0, tokensIn: 0, errors: 0, durations: [], cost: 0 };
       m.calls++;
       m.tokensIn += callIn;
       if (status >= 400) m.errors++;
       if (Number.isFinite(dur) && dur > 0) m.durations.push(dur);
+      m.cost += costOfTokens(String(s.model ?? ""), String(s.provider ?? ""), tk ?? {});
       byModel.set(model, m);
       // Timestamps are ISO-8601 UTC. Slicing the hour out of the string buckets
       // by UTC, which put the busiest hour seven columns from where it happened
@@ -593,8 +638,9 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
       const p95 = m.durations.length > 0
         ? m.durations[Math.min(m.durations.length - 1, Math.floor(m.durations.length * 0.95))]
         : 0;
-      return { model, calls: m.calls, tokensIn: m.tokensIn, errors: m.errors, p95 };
+      return { model, calls: m.calls, tokensIn: m.tokensIn, errors: m.errors, p95, cost: m.cost };
     });
+  const cost = perModel.reduce((n, m) => n + m.cost, 0);
   const topModels = perModel
     .slice(0, 3)
     .map((m) => ({ model: m.model, pct: Math.round((m.calls / calls) * 100) }));
@@ -622,7 +668,7 @@ export async function readUsageStats(): Promise<UsageStats | undefined> {
   }
 
   durations.sort((a, b) => a - b);
-  return { calls, errors, tokensIn, tokensOut, tokensCacheRead, tokensCacheWrite, tokensReasoning, peakPeriod, durations, topModels, perModel, errorsByStatus, slowest, hourly, peakHour: Math.max(0, ...hourly), partial, lastHour: { calls: lastHourCalls, tokensIn: lastHourTokensIn } };
+  return { calls, errors, tokensIn, tokensOut, tokensCacheRead, tokensCacheWrite, tokensReasoning, cost, peakPeriod, durations, topModels, perModel, errorsByStatus, slowest, hourly, peakHour: Math.max(0, ...hourly), partial, lastHour: { calls: lastHourCalls, tokensIn: lastHourTokensIn } };
 }
 
 /**
@@ -663,7 +709,7 @@ export class StatsCache {
       readUsageStats()
         .then(async (s) => {
           const override: DayTotal | undefined = s
-            ? { day: today(), tokensIn: s.tokensIn, tokensOut: s.tokensOut, tokensCacheRead: s.tokensCacheRead, tokensCacheWrite: s.tokensCacheWrite, tokensReasoning: s.tokensReasoning, calls: s.calls }
+            ? { day: today(), tokensIn: s.tokensIn, tokensOut: s.tokensOut, tokensCacheRead: s.tokensCacheRead, tokensCacheWrite: s.tokensCacheWrite, tokensReasoning: s.tokensReasoning, calls: s.calls, cost: s.cost }
             : undefined;
           const l = await readLifetimeStats(override);
           this.value = s; this.life = l; this.daily = l ? l.days.slice(-DAILY_WINDOW) : [];
@@ -708,6 +754,8 @@ export type LifetimeStats = {
   activeDays: number;
   currentStreak: number;
   longestStreak: number;
+  /** API-equivalent USD across the whole series, from cost-prices.json. */
+  cost: number;
   days: DayTotal[];
 };
 
@@ -718,6 +766,9 @@ export type DayTotal = {
   // are recomputed on the next scan rather than read back as zero.
   tokensCacheWrite: number; tokensReasoning: number;
   calls: number;
+  // API-equivalent USD from cost-prices.json (see costOfTokens). Same cache
+  // discipline as the fields above; old entries are backfilled with 0.
+  cost: number;
 };
 
 export type RecentProject = { project: string; path: string; lastActive: number };

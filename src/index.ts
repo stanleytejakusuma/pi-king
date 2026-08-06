@@ -1980,6 +1980,10 @@ class DashboardView implements Component {
     lines.push("");
 
     // ---- stats screen ----------------------------------------------------
+    // Compact money: cents below $100, rounded dollars above. The lifetime
+    // figure runs to thousands; today's per-model figures are often cents.
+    const fmtMoney = (n: number): string =>
+      n >= 100 ? `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : `$${n.toFixed(2)}`;
     if (this.showStats) {
       const life = this.statsCache.lifetime();
       if (!life) {
@@ -1999,6 +2003,9 @@ class DashboardView implements Component {
           ["net tokens", compactNum(netTokens(life.tokensIn, life.tokensCacheRead))],
           ["cache reads", `${compactNum(life.tokensCacheRead)} (${life.tokensIn > 0 ? Math.round((life.tokensCacheRead / life.tokensIn) * 100) : 0}%)`],
         ];
+        // API-equivalent cost, from the pipeline's cost-prices.json. Only shown
+        // when a price is actually known — absence of prices is not a $0 bill.
+        if (life.cost > 0) pairs.push(["API-equiv", fmtMoney(life.cost)]);
         // Cache leverage: how many times each token written into the cache was
         // served back out. This is the number that justifies (or indicts) the
         // whole caching story — read share alone cannot say whether writes paid.
@@ -2060,6 +2067,7 @@ class DashboardView implements Component {
           const bits = [
             `${m.calls} call${m.calls === 1 ? "" : "s"}`,
             `${compactNum(m.tokensIn)} in`,
+            m.cost > 0 ? fmtMoney(m.cost) : "",
             m.p95 > 0 ? `p95 ${(m.p95 / 1000).toFixed(1)}s` : "",
             m.errors > 0 ? `${m.errors} err` : "",
           ].filter(Boolean).join(" · ");
