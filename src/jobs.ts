@@ -65,6 +65,9 @@ export interface JobMarker {
   resultPath?: string;
   nextStep?: string;
   cwd?: string;
+  /** Session id of the session that spawned the job (job_spawn writes it) —
+   * the injector's first targeting tier is an exact session match. */
+  spawnerSessionId?: string;
   createdAt?: string;
   completedAt?: string;
 }
@@ -100,6 +103,7 @@ export function validateMarker(raw: string): JobMarker | null {
   // cwd: the job's home project — the deterministic targeting hint. Absent
   // in older markers: targeting falls back to resultPath, then recency.
   marker.cwd = sanitizeField(m.cwd, MAX_CWD_CHARS);
+  marker.spawnerSessionId = sanitizeField(m.spawnerSessionId, 64);
   marker.createdAt = sanitizeField(m.createdAt, 64);
   marker.completedAt = sanitizeField(m.completedAt, 64);
   return marker;
@@ -170,7 +174,7 @@ export function scanJobs(dir: string = JOBS_DIR): Job[] {
  * (index.ts imports jobs.ts — the arrow must point one way only). */
 export type JobsRowLike = {
   kind: string;
-  entry?: { cwd?: string; tmuxName?: string; state?: string; updatedAt?: number };
+  entry?: { cwd?: string; tmuxName?: string; state?: string; updatedAt?: number; sessionId?: string };
 };
 /** Structural view of the session manager, for the goal-mode execution guard.
  * getEntries() returns unknown[] because the real SessionEntry union's
@@ -211,6 +215,10 @@ export function selectRestoreCards(
 /**
  * Injection targeting — deterministic, dashboard-independent (a job can
  * land while nobody is looking at the panel):
+ * 0. the marker's spawnerSessionId, matched EXACTLY against row session ids
+ *    (job_spawn writes it — the ping goes home to the spawning session
+ *    even when that session's process cwd differs from its row cwd, which
+ *    is what broke the cwd tiers for the atlas-eval-supervisor job);
  * 1. the marker's cwd hint, then the dirname of its resultPath, matched
  *    against session cwds (exact or nested prefix, either direction);
  * 2. the most-recently-active tmux-backed session;
@@ -227,6 +235,12 @@ export function targetRow(job: Job, rows: readonly JobsRowLike[]): JobsRowLike |
     const c = cwd.endsWith("/") ? cwd : `${cwd}/`;
     return c === h || c.startsWith(h) || h.startsWith(c);
   };
+  if (job.marker.spawnerSessionId) {
+    const home = rows.find(
+      (r) => r.kind === "session" && r.entry?.tmuxName && r.entry.sessionId === job.marker.spawnerSessionId,
+    );
+    if (home) return home;
+  }
   const hints = [
     job.marker.cwd,
     job.marker.resultPath, // raw path: a result file sits inside its session's cwd, and a result DIR matches its own cwd exactly

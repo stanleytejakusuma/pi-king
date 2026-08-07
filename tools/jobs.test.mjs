@@ -56,7 +56,7 @@ const writeMarker = (id, body) => {
   writeFileSync(join(jobsDir, `${id}.json`), typeof body === "string" ? body : JSON.stringify(body));
 };
 const noSession = { getEntries: () => [] };
-const sessionRow = (cwd, tmuxName, updatedAt = 0) => ({ kind: "session", entry: { cwd, tmuxName, updatedAt } });
+const sessionRow = (cwd, tmuxName, updatedAt = 0, sessionId) => ({ kind: "session", entry: { cwd, tmuxName, updatedAt, sessionId } });
 const resetLog = () => { rmSync(logFile, { force: true }); };
 const readLog = () => { try { return readFileSync(logFile, "utf8"); } catch { return ""; } };
 const settle = () => new Promise((r) => setTimeout(r, 100));
@@ -118,6 +118,25 @@ test("isStalePending: pending older than window, never terminal", () => {
   assert.equal(isStalePending({ status: "pending" }, now, windowMs), false); // no createdAt
   assert.equal(isStalePending({ status: "done", createdAt: "2026-01-01T00:00:00Z" }, now, windowMs), false);
   assert.equal(isStalePending({ status: "pending", createdAt: "2026-08-05T00:00:00Z" }, now, 0), false); // disabled
+});
+
+test("targetRow: spawnerSessionId exact match wins over cwd/recency (the atlas-eval-supervisor case)", () => {
+  const mk = (marker) => ({ id: "x", file: "", stale: false, marker });
+  // Spawner's row cwd is unrelated to the marker's cwd hint (the atlas bug:
+  // process cwd /tmp/atlas-minoml vs row cwd ~/codebase/atlas) — the exact
+  // session-id tier must still send the ping home.
+  const rows = [
+    sessionRow("/proj/atlas", "t-atlas", 10, "sess-atlas"),
+    sessionRow("/proj/hustle", "t-hustle", 999, "sess-hustle"),
+  ];
+  const job = mk({ status: "done", cwd: "/tmp/atlas-minoml", spawnerSessionId: "sess-atlas" });
+  assert.equal(targetRow(job, rows)?.entry?.tmuxName, "t-atlas");
+  // No session-id tier match (spawner headless) → falls through to cwd/recency
+  const orphan = mk({ status: "done", cwd: "/tmp/atlas-minoml", spawnerSessionId: "sess-gone" });
+  assert.equal(targetRow(orphan, rows)?.entry?.tmuxName, "t-hustle");
+  // tmux-less row with matching sessionId is skipped (still needs a pane)
+  const noTmux = [{ kind: "session", entry: { cwd: "/x", sessionId: "sess-atlas" } }, sessionRow("/y", "t-y", 3, "sess-y")];
+  assert.equal(targetRow(mk({ status: "done", spawnerSessionId: "sess-atlas" }), noTmux)?.entry?.tmuxName, "t-y");
 });
 
 test("targetRow: cwd hint > resultPath dirname > most-recently-active > none", () => {
