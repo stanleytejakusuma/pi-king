@@ -2735,11 +2735,20 @@ function installSessionTracker(pi: ExtensionAPI) {
         // is gone. Immutable identity facts — dashboard visibility (a /bg'd
         // session must not drop off the dashboard) and fork origin — belong
         // to the sessionId, not the pid, so they survive the process swap.
+        // The env var WINS over the old card: a /bg handoff launches the
+        // copy with PI_DASHBOARD_SPAWNED=1, but the predecessor card was
+        // written by the plain-terminal original (visible=false), and a
+        // copy that boots slower than the original's shutdown lands in this
+        // branch and previously had its env-driven true clobbered back to
+        // false — the session then vanished off the dashboard into "tmux
+        // (no Pi session)" (observed live 2026-08-07: codebase and
+        // hustle-ops both). The card remains the fallback for plain resumes
+        // where the env var is absent.
+        visible = process.env.PI_DASHBOARD_SPAWNED === "1" || Boolean(card.visible);
+        isFork = Boolean(card.isFork);
         // NOT restored here: state/activity/subagents (they describe a
         // process that is gone) and startupFingerprint (this process DID run
         // startup registration — it gets a fresh stamp below).
-        visible = Boolean(card.visible);
-        isFork = Boolean(card.isFork);
       }
     } catch { /* no file, unreadable, or first run: nothing to warn about */ }
     // Stamped here, at the end of session_start rather than the top: this is
