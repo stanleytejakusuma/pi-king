@@ -9,7 +9,7 @@
 // resolves all of it at load.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,7 +23,17 @@ process.env.PI_JOBS_DIR = jobsDir;
 const toolsDir = mkdtempSync(join(tmpdir(), "pi-king-tools-"));
 const logFile = join(toolsDir, "tmux.log");
 const fakeTmux = join(toolsDir, "fake-tmux.sh");
-writeFileSync(fakeTmux, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${logFile}"\n`, { mode: 0o755 });
+// Fake tmux: records every invocation to a log file so the single-fire
+// injection contract is observable. Exits non-zero while the fail marker
+// exists, so failed-injection paths are testable too. Lives OUTSIDE the
+// jobs dir — the tests wipe the jobs dir between cases.
+const failMarker = join(toolsDir, "fail.marker");
+process.env.PI_KING_TMUX_FAIL = failMarker;
+writeFileSync(
+  fakeTmux,
+  `#!/bin/sh\n[ -f "$PI_KING_TMUX_FAIL" ] && exit 1\nprintf '%s\\n' "$*" >> "${logFile}"\n`,
+  { mode: 0o755 },
+);
 process.env.PI_KING_TMUX = fakeTmux;
 
 const {
@@ -190,15 +200,21 @@ test("resume guards: pending, acked, active goal, active workflow", async () => 
   panel.poll(Date.now(), [], undefined);
   assert.match(await panel.resume("g-pend", [], undefined), /still pending/);
 
-  // acked → refuse (ack = sha256 of raw marker, first 16 hex — pi-jobs contract)
+  // no tmux target → refuse WITHOUT acking (a burned ack would block the
+  // retry once a target exists)
   writeMarker("g-ack", { status: "done", summary: "done once" });
   panel = new JobsPanel(noSession, "/proj/alpha", undefined);
   panel.poll(Date.now(), [], undefined);
-  await panel.resume("g-ack", [], undefined); // writes the ack, no target to inject
+  assert.match(await panel.resume("g-ack", [], undefined), /not resumed/);
+  assert.equal(existsSync(ACKS_DIR) ? readdirSync(ACKS_DIR).length : 0, 0, "no-target resume must not write an ack");
+  // with a target: inject then ack → second resume refused
+  const ackRows = [sessionRow("/proj/alpha", "t-alpha")];
+  resetLog();
+  assert.match(await panel.resume("g-ack", ackRows, ackRows[0]), /Resumed job g-ack/);
   const ackFiles = readdirSync(ACKS_DIR);
   assert.equal(ackFiles.length, 1);
   assert.ok(readFileSync(join(ACKS_DIR, ackFiles[0]), "utf8").includes("ackedAt"));
-  assert.match(await panel.resume("g-ack", [], undefined), /already resumed/);
+  assert.match(await panel.resume("g-ack", ackRows, ackRows[0]), /already resumed/);
 
   // active goal_mode entry → refuse
   writeMarker("g-goal", { status: "done", summary: "under goal" });
@@ -231,8 +247,8 @@ test("resume happy path: ack + framed injection into the target session", async 
   resetJobsDir();
   resetLog();
   rmSync(ACKS_DIR, { recursive: true, force: true });
-  const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
   writeMarker("ok-1", { status: "failed", summary: "exit=2", resultPath: "/proj/alpha/out.log" });
+  const panel = new JobsPanel(noSession, "/proj/alpha", undefined); // seeds ok-1 → no auto-inject
   const rows = [sessionRow("/proj/alpha", "t-alpha")];
   panel.poll(Date.now(), rows, rows[0]);
   const msg = await panel.resume("ok-1", rows, rows[0]);
@@ -275,4 +291,51 @@ test("clearFinished removes only finished markers (and their acks)", () => {
   const removed = panel.clearFinished();
   assert.equal(removed, 2);
   assert.deepEqual(panel.list.map((j) => j.id), ["clr-pend"]);
+});
+
+test("resume injects before acking: failed injection keeps the job resumable", async () => {
+  resetJobsDir();
+  resetLog();
+  rmSync(ACKS_DIR, { recursive: true, force: true });
+  mkdirSync(ACKS_DIR, { recursive: true });
+  const rows = [sessionRow("/proj/alpha", "t-alpha")];
+  writeMarker("f-1", { status: "done", summary: "flaky" });
+  writeFileSync(failMarker, "fail");
+  const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
+  panel.poll(Date.now(), rows, rows[0]);
+  const failed = await panel.resume("f-1", rows, rows[0]);
+  assert.match(failed, /not resumed/);
+  assert.match(failed, /nothing was acked/);
+  assert.equal(readdirSync(ACKS_DIR).length, 0, "failed injection must not burn the ack");
+  // retry after the failure clears: succeeds and acks
+  rmSync(failMarker, { force: true });
+  const msg = await panel.resume("f-1", rows, rows[0]);
+  assert.match(msg, /Resumed job f-1/);
+  assert.equal(readdirSync(ACKS_DIR).length, 1);
+});
+
+test("auto-injection acks the marker: exactly one injection per marker", async () => {
+  resetJobsDir();
+  resetLog();
+  rmSync(ACKS_DIR, { recursive: true, force: true });
+  mkdirSync(ACKS_DIR, { recursive: true });
+  const rows = [sessionRow("/proj/alpha", "t-alpha")];
+  const panel = new JobsPanel(noSession, "/proj/alpha", undefined); // seeds nothing yet
+  writeMarker("auto-1", { status: "done", summary: "auto" });
+  panel.poll(Date.now(), rows, rows[0]);
+  await settle();
+  const lines = readLog().trim().split("\n").filter(Boolean);
+  assert.equal(lines.length, 1, "auto-injection fires exactly once");
+  assert.equal(readdirSync(ACKS_DIR).length, 1, "successful auto-injection writes the ack");
+  assert.match(await panel.resume("auto-1", rows, rows[0]), /already resumed/);
+});
+
+test("isStalePending: pending older than the window is stale, done never", () => {
+  const now = Date.now();
+  const h = 24 * 60 * 60 * 1000;
+  assert.ok(isStalePending({ status: "pending", createdAt: new Date(now - 25 * h).toISOString() }, now, h));
+  assert.equal(isStalePending({ status: "pending", createdAt: new Date(now - 1 * h).toISOString() }, now, h), false);
+  assert.equal(isStalePending({ status: "done", createdAt: new Date(now - 25 * h).toISOString() }, now, h), false);
+  assert.equal(isStalePending({ status: "pending" }, now, h), false, "dateless pending is not stale");
+  assert.equal(isStalePending({ status: "pending", createdAt: new Date(now - 25 * h).toISOString() }, now, 0), false);
 });

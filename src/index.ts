@@ -1768,13 +1768,14 @@ class DashboardView implements Component {
       }
       if (matchesKey(data, "down")) {
         this.jobs.deleteArmedFor = null;
-        this.jobs.selected = Math.min(this.jobs.list.length - 1, this.jobs.selected + 1);
+        this.jobs.selected =
+          this.jobs.list.length === 0 ? -1 : Math.min(this.jobs.list.length - 1, this.jobs.selected + 1);
         this.tui.requestRender();
         return;
       }
       if (matchesKey(data, "up")) {
         this.jobs.deleteArmedFor = null;
-        this.jobs.selected = Math.max(0, this.jobs.selected - 1);
+        this.jobs.selected = this.jobs.list.length === 0 ? -1 : Math.max(0, this.jobs.selected - 1);
         this.tui.requestRender();
         return;
       }
@@ -1782,7 +1783,10 @@ class DashboardView implements Component {
         const job = this.jobs.list[this.jobs.selected];
         if (job) {
           const json = this.jobs.markerJson(job.id);
-          if (json) this.showMessage(clean(json, 400));
+          // Full marker JSON (like /jobs show): the max valid marker is
+          // ~2.7KB (500+1024+500 caps), so the cap must clear that or
+          // "show the full marker" truncates mid-string.
+          if (json) this.showMessage(clean(json, 4096));
         }
         return;
       }
@@ -2242,8 +2246,13 @@ class DashboardView implements Component {
           const marker = sel ? th.fg("accent", "\u276f") : " ";
           const hue = j.stale ? "dim" : j.marker.status === "done" ? "success"
             : j.marker.status === "failed" ? "error" : "accent";
-          const id = pad(truncateToWidth(j.id, idW, "\u2026", true), idW);
-          const status = pad(j.marker.status + (j.stale ? " (stale)" : ""), statusW);
+          const id = pad(truncateToWidth(clean(j.id), idW, "\u2026", true), idW);
+          // "pending (stale)" is 15 chars — must truncate or it overflows
+          // the status column and shoves the summary right.
+          const status = pad(
+            truncateToWidth(j.marker.status + (j.stale ? " (stale)" : ""), statusW, "\u2026", true),
+            statusW,
+          );
           const summary = j.marker.summary
             ? truncateToWidth(clean(j.marker.summary), Math.max(10, MEASURE - idW - statusW - 24), "\u2026", true)
             : "";
@@ -3352,31 +3361,12 @@ export default function piDashboard(pi: ExtensionAPI) {
     type: "boolean",
   });
 
-  // /jobs parity for the hub: the hub runs --no-tools --no-extensions, so
-  // pi-jobs' own /jobs and jobs_list tool never load there. This command
-  // opens the dashboard's jobs panel (or prints the list when no dashboard
-  // is open). In a normal session, pi-jobs registers its own /jobs — both
-  // sides implement the same marker contract, and whichever wins the name
-  // still lists/resumes/clears jobs.
-  pi.registerCommand("jobs", {
-    description: "Offload-job markers: open the jobs panel (enter show · r resume · c clear · X delete), or list markers when no dashboard is open",
-    handler: async (_args, ctx) => {
-      if (dashboardView) {
-        dashboardView.toggleJobsPanel();
-        return;
-      }
-      const jobs = scanJobs();
-      if (jobs.length === 0) {
-        ctx.ui.notify("No job markers in ~/.pi/jobs", "info");
-        return;
-      }
-      ctx.ui.notify(
-        jobs.map((j) => `${j.id} [${j.marker.status}${j.marker.summary ? ` | ${j.marker.summary}` : ""}]`).join("\n"),
-        "info",
-      );
-    },
-  });
-
+  // /jobs is registered inside the hub's session_start (see the agents-hub
+  // branch below), never from the factory: the hub runs --no-tools
+  // --no-extensions so pi-jobs' own /jobs never loads there, but in normal
+  // sessions both extensions load, and pi suffixes duplicate command names
+  // to jobs:1/jobs:2 — neither reachable as /jobs. Hub-only registration
+  // leaves /jobs to pi-jobs in normal sessions.
   pi.registerCommand("pi-dashboard", {
     description: "Live cross-project dashboard: attach/create/rename/delete tmux-backed Pi sessions",
     handler: async (_args, ctx) => {
@@ -3408,6 +3398,30 @@ export default function piDashboard(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     if (!pi.getFlag("agents-hub")) return;
+    // /jobs lives HERE, not in the factory: the hub runs --no-tools
+    // --no-extensions so pi-jobs' own /jobs never loads in this process,
+    // but normal sessions load both extensions, and pi suffixes duplicate
+    // command names to jobs:1/jobs:2 — neither reachable as /jobs. Hub-only
+    // registration leaves /jobs to pi-jobs in normal sessions.
+    pi.registerCommand("jobs", {
+      description:
+        "Offload-job markers: open the jobs panel (enter show · r resume · c clear · X delete), or list markers when no dashboard is open",
+      handler: async (_args, ctx) => {
+        if (dashboardView) {
+          dashboardView.toggleJobsPanel();
+          return;
+        }
+        const jobs = scanJobs();
+        if (jobs.length === 0) {
+          ctx.ui.notify("No job markers in ~/.pi/jobs", "info");
+          return;
+        }
+        ctx.ui.notify(
+          jobs.map((j) => `${clean(j.id)} [${j.marker.status}${j.marker.summary ? ` | ${j.marker.summary}` : ""}]`).join("\n"),
+          "info",
+        );
+      },
+    });
     if (ctx.mode !== "tui") {
       ctx.ui.notify("pi-king requires an interactive terminal.", "error");
       ctx.shutdown();
