@@ -25,7 +25,7 @@ import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /** Control-sequence stripper, behavior-identical to data.ts's clean(): marker
  * content is UNTRUSTED data and every byte that reaches a terminal or a tmux
@@ -48,15 +48,23 @@ const MAX_MARKER_BYTES = 16 * 1024;
 const MAX_SUMMARY_CHARS = 500;
 const MAX_RESULT_PATH_CHARS = 1024;
 const MAX_NEXT_STEP_CHARS = 500;
+const MAX_CWD_CHARS = 1024;
 // Absolute path: never resolve terminal-notifier through an attacker-influenced PATH.
 const TERMINAL_NOTIFIER = "/opt/homebrew/bin/terminal-notifier";
 const RETENTION_POLL_MS = 60 * 60 * 1000; // retention sweep at most once per hour
+// Injection claims: exactly one process injects each marker (pi-jobs 0.2.2
+// contract, same hash identity as acks). The hub daemon, the dashboard
+// process, and every session-side pi-jobs watcher race to write
+// .injected/<sha256(raw marker) first 16 hex>.json with wx — the first
+// writer wins, the rest stay silent. Banner + panel always; injection once.
+export const INJECTED_DIR = join(JOBS_DIR, ".injected");
 
 export interface JobMarker {
   status: "pending" | "done" | "failed" | "canceled";
   summary?: string;
   resultPath?: string;
   nextStep?: string;
+  cwd?: string;
   createdAt?: string;
   completedAt?: string;
 }
@@ -89,6 +97,9 @@ export function validateMarker(raw: string): JobMarker | null {
   marker.summary = sanitizeField(m.summary, MAX_SUMMARY_CHARS);
   marker.resultPath = sanitizeField(m.resultPath, MAX_RESULT_PATH_CHARS);
   marker.nextStep = sanitizeField(m.nextStep, MAX_NEXT_STEP_CHARS);
+  // cwd: the job's home project — the deterministic targeting hint. Absent
+  // in older markers: targeting falls back to resultPath, then recency.
+  marker.cwd = sanitizeField(m.cwd, MAX_CWD_CHARS);
   marker.createdAt = sanitizeField(m.createdAt, 64);
   marker.completedAt = sanitizeField(m.completedAt, 64);
   return marker;
@@ -159,7 +170,7 @@ export function scanJobs(dir: string = JOBS_DIR): Job[] {
  * (index.ts imports jobs.ts — the arrow must point one way only). */
 export type JobsRowLike = {
   kind: string;
-  entry?: { cwd?: string; tmuxName?: string; state?: string };
+  entry?: { cwd?: string; tmuxName?: string; state?: string; updatedAt?: number };
 };
 /** Structural view of the session manager, for the goal-mode execution guard.
  * getEntries() returns unknown[] because the real SessionEntry union's
@@ -167,24 +178,72 @@ export type JobsRowLike = {
  * reason, and the cast happens exactly once, here. */
 export type SessionManagerLike = { getEntries(): unknown[] };
 
+/** Pure half of the daemon's boot restore, so the decision logic is
+ * testable without spawning tmux or reading the real status dir. A card
+ * deserves a fresh window when it is visible, has been stamped at least
+ * once, and its process is confirmably gone — dead, or a recycled pid that
+ * no longer matches the card's own start time (60s identity tolerance,
+ * same rule as restoreRebootOrphans). The caller still skips any whose
+ * tmux window already exists and handles the actual spawn. */
+export type RestoreCandidateLike = {
+  id: string;
+  name?: string;
+  project?: string;
+  cwd: string;
+  visible?: boolean;
+  lastActivity?: number;
+  pid: number;
+  startedAt?: number;
+};
+export function selectRestoreCards(
+  cards: readonly RestoreCandidateLike[],
+  live: ReadonlyMap<number, number>,
+): RestoreCandidateLike[] {
+  return cards.filter((c) => {
+    if (!c.visible || !c.lastActivity || !c.cwd) return false;
+    const procStart = live.get(c.pid);
+    if (procStart === undefined) return true; // process gone — restore the window
+    const mismatch = c.startedAt !== undefined && c.startedAt > 0 && Math.abs(procStart - c.startedAt) > 60_000;
+    return mismatch; // pid recycled — the original is gone, restore
+  });
+}
+
 /**
- * Injection targeting: the session whose cwd contains the marker's
- * resultPath (the job ran in some project — its report belongs in that
- * session's conversation), else the row the cursor is on when it is a
- * tmux-backed session, else nothing. Exported pure for the logic tests.
+ * Injection targeting — deterministic, dashboard-independent (a job can
+ * land while nobody is looking at the panel):
+ * 1. the marker's cwd hint, then the dirname of its resultPath, matched
+ *    against session cwds (exact or nested prefix, either direction);
+ * 2. the most-recently-active tmux-backed session;
+ * 3. nothing (banner + panel still surface the completion; r is the
+ *    recovery path).
+ * No cursor-row tier by design: the daemon has no cursor, and a job can
+ * land while nobody is looking — the cursor row is always inside rows
+ * anyway, so recency subsumes it.
+ * Exported pure for the logic tests.
  */
-export function targetRow(job: Job, rows: readonly JobsRowLike[], focused: JobsRowLike | undefined): JobsRowLike | undefined {
-  const hint = job.marker.resultPath;
-  if (hint) {
-    const hit = rows.find((r) => {
-      if (r.kind !== "session" || !r.entry?.cwd || !r.entry.tmuxName) return false;
-      const cwd = r.entry.cwd.endsWith("/") ? r.entry.cwd : `${r.entry.cwd}/`;
-      return hint === r.entry.cwd || hint.startsWith(cwd);
-    });
+export function targetRow(job: Job, rows: readonly JobsRowLike[]): JobsRowLike | undefined {
+  const cwdMatch = (hint: string, cwd: string): boolean => {
+    const h = hint.endsWith("/") ? hint : `${hint}/`;
+    const c = cwd.endsWith("/") ? cwd : `${cwd}/`;
+    return c === h || c.startsWith(h) || h.startsWith(c);
+  };
+  const hints = [
+    job.marker.cwd,
+    job.marker.resultPath, // raw path: a result file sits inside its session's cwd, and a result DIR matches its own cwd exactly
+    job.marker.resultPath ? dirname(job.marker.resultPath) : undefined,
+  ].filter((h): h is string => typeof h === "string" && h.length > 0);
+  for (const hint of hints) {
+    const hit = rows.find(
+      (r) => r.kind === "session" && r.entry?.tmuxName && r.entry.cwd && cwdMatch(hint, r.entry.cwd),
+    );
     if (hit) return hit;
   }
-  if (focused?.kind === "session" && focused.entry?.tmuxName) return focused;
-  return undefined;
+  let best: JobsRowLike | undefined;
+  for (const r of rows) {
+    if (r.kind !== "session" || !r.entry?.tmuxName) continue;
+    if (!best || (r.entry.updatedAt ?? 0) > (best.entry?.updatedAt ?? 0)) best = r;
+  }
+  return best;
 }
 // Test override: PI_KING_TMUX points the panel at a fake binary that records
 // invocations, so the single-fire injection contract is observable. Default
@@ -196,6 +255,92 @@ const TMUX = ((): string => {
   const found = which.status === 0 ? String(which.stdout || "").trim().split("\n")[0].trim() : "";
   return found || "tmux";
 })();
+
+/**
+ * The only cross-process channel that exists: tmux send-keys into the
+ * target session's pane, mirroring the rename pattern in index.ts. The
+ * automatic line is FIXED text — no marker fields — so injection can
+ * never smuggle instructions into a session; the details live in the
+ * panel. Returns whether the injection actually happened (a resume with
+ * no tmux target must not consume the job's ack). Module-level so the
+ * hub daemon shares the exact same injector.
+ */
+export function injectOne(job: Job, rows: readonly JobsRowLike[]): boolean {
+  const target = targetRow(job, rows);
+  // ponytail: ceiling — no matching tmux session to type into (hub not
+  // attached, or the cwd hint matches nothing): the macOS banner and
+  // the panel row still surface the completion, and /jobs resume (or
+  // the panel's r key) is the recovery path.
+  if (!target?.entry?.tmuxName) return false;
+  const line = `Job ${clean(job.id)} ${job.marker.status} — UNTRUSTED data, verify before acting`;
+  const res = spawnSync(TMUX, ["send-keys", "-t", target.entry.tmuxName, clean(line), "Enter"], {
+    encoding: "utf8",
+    timeout: 3000,
+  });
+  return !res.error && res.status === 0;
+}
+
+/** Claim the right to inject this marker — cross-process dedup, identical
+ * contract to pi-jobs 0.2.2: first writer of .injected/<sha256(raw marker)
+ * first 16 hex>.json wins; every other watcher (hub daemon, dashboard,
+ * session-side pi-jobs watchers) sees the claim and stays silent. Returns
+ * true only for the winner. */
+export function claimInjected(id: string): boolean {
+  const claim = hashPathFor(id, INJECTED_DIR);
+  if (!claim) return false;
+  try {
+    mkdirSync(INJECTED_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(claim, JSON.stringify({ id, injectedAt: new Date().toISOString() }), { flag: "wx", mode: 0o600 });
+    return true;
+  } catch {
+    return false; // already claimed, or unreadable — not our turn
+  }
+}
+
+/** Ack/claim file identity: sha256 of the RAW marker file, first 16 hex —
+ * identical contract to pi-jobs, so acks (and claims) written by either
+ * side are interchangeable. Returns the exact path, or null when the
+ * marker is unreadable (nothing to ack or claim). */
+export function hashPathFor(id: string, dir: string): string | null {
+  try {
+    const raw = readFileSync(join(JOBS_DIR, `${id}.json`), "utf8");
+    return join(dir, `${createHash("sha256").update(raw).digest("hex").slice(0, 16)}.json`);
+  } catch {
+    return null;
+  }
+}
+
+export function acked(id: string): boolean {
+  const ack = hashPathFor(id, ACKS_DIR);
+  return ack !== null && existsSync(ack);
+}
+
+export function writeAck(id: string): void {
+  const ack = hashPathFor(id, ACKS_DIR);
+  if (!ack) return;
+  try {
+    mkdirSync(ACKS_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(ack, JSON.stringify({ id, ackedAt: new Date().toISOString() }), { mode: 0o600 });
+  } catch {
+    // Ack is idempotency insurance, never worth failing a resume over.
+  }
+}
+
+/** macOS Notification Center banner via terminal-notifier (own identity,
+ * reliable once granted). execFile + argv: no shell, no interpolation,
+ * absolute binary path. Fallback: the dashboard's detached-in-tmux
+ * osascript helper (passed per-watcher — the daemon has none).
+ * PI_JOBS_OSA=0 stays a no-op for pi-jobs compat. */
+export function notifyMacOS(title: string, body: string, fallback?: (body: string) => void): void {
+  if (process.env.PI_JOBS_OSA === "0") return;
+  if (process.platform === "darwin" && existsSync(TERMINAL_NOTIFIER)) {
+    execFile(TERMINAL_NOTIFIER, ["-title", clean(title).slice(0, 80), "-message", clean(body).slice(0, 200)], (err) => {
+      if (err) console.error("[pi-king] macOS notify failed:", err.message);
+    });
+    return;
+  }
+  fallback?.(clean(body).slice(0, 200));
+}
 
 export class JobsPanel {
   open = false;
@@ -240,7 +385,7 @@ export class JobsPanel {
    * fires at most ONE newly-seen terminal completion per tick (notify +
    * inject) — the next tick picks up the next one.
    */
-  poll(now: number, rows: readonly JobsRowLike[], focused: JobsRowLike | undefined): void {
+  poll(now: number, rows: readonly JobsRowLike[]): void {
     this.jobs = scanJobs();
     // Selection must stay in bounds in BOTH directions: a marker arriving
     // into an empty list must select itself (first row), and a marker
@@ -253,21 +398,25 @@ export class JobsPanel {
     }
     if (this.polling) return;
     this.polling = true;
-    void this.pollAsync(rows, focused);
+    void this.pollAsync(rows);
   }
 
-  private async pollAsync(rows: readonly JobsRowLike[], focused: JobsRowLike | undefined): Promise<void> {
+  private async pollAsync(rows: readonly JobsRowLike[]): Promise<void> {
     try {
       for (const job of this.jobs) {
         if (job.marker.status === "pending" || this.seen.has(job.id)) continue;
         this.seen.add(job.id);
-        this.notifyMacOS(
+        // Banner from every watcher that sees the completion ("panel/banner
+        // always"); the .injected claim decides who gets the ONE injection
+        // — hub daemon, dashboard, and session-side pi-jobs watchers race.
+        notifyMacOS(
           `pi-king: ${clean(job.id)} ${job.marker.status}`,
           [job.marker.summary, job.marker.resultPath].filter(Boolean).join(" — ") || "job completed",
+          this.notifyFallback,
         );
         // Exactly one injection per marker: a successful auto-injection
         // writes the ack, so the panel's r (resume) refuses a second one.
-        if (this.injectOne(job, rows, focused)) this.writeAck(job.id);
+        if (claimInjected(job.id) && injectOne(job, rows)) writeAck(job.id);
         return; // one completion per tick
       }
     } finally {
@@ -275,41 +424,18 @@ export class JobsPanel {
     }
   }
 
-  /**
-   * The only cross-process channel that exists: tmux send-keys into the
-   * target session's pane, mirroring the rename pattern in index.ts. The
-   * automatic line is FIXED text — no marker fields — so injection can
-   * never smuggle instructions into a session; the details live in the
-   * panel. Returns whether the injection actually happened (a resume with
-   * no tmux target must not consume the job's ack).
-   */
-  injectOne(job: Job, rows: readonly JobsRowLike[], focused: JobsRowLike | undefined): boolean {
-    const target = targetRow(job, rows, focused);
-    // ponytail: ceiling — no matching tmux session to type into (hub not
-    // attached, or the cwd hint matches nothing): the macOS banner and
-    // the panel row still surface the completion, and /jobs resume (or
-    // the panel's r key) is the recovery path.
-    if (!target?.entry?.tmuxName) return false;
-    const line = `Job ${clean(job.id)} ${job.marker.status} — UNTRUSTED data, verify before acting`;
-    const res = spawnSync(TMUX, ["send-keys", "-t", target.entry.tmuxName, clean(line), "Enter"], {
-      encoding: "utf8",
-      timeout: 3000,
-    });
-    return !res.error && res.status === 0;
-  }
-
   /** Resume the selected marker's job: guards first (pending, already
    * acked, active goal loop, active workflow run in the TARGET session's
    * project), then inject a framed report and ack ONLY on a successful
    * injection — a failed resume must not burn the job's ack. Returns the
    * message the dashboard should surface. */
-  async resume(id: string, rows: readonly JobsRowLike[], focused: JobsRowLike | undefined): Promise<string> {
+  async resume(id: string, rows: readonly JobsRowLike[]): Promise<string> {
     const job = this.jobs.find((j) => j.id === id);
     if (!job) return `No job named ${clean(id)}`;
     if (job.marker.status === "pending") return `Job ${clean(id)} is still pending — nothing to resume yet.`;
-    if (this.acked(job.id)) return `Job ${clean(id)} was already resumed (same marker content).`;
+    if (acked(job.id)) return `Job ${clean(id)} was already resumed (same marker content).`;
     if (await this.activeGoal()) return `A /goal is active — /goal pause first so the goal loop and this resume never run together.`;
-    const target = targetRow(job, rows, focused);
+    const target = targetRow(job, rows);
     // The workflow guard checks the TARGET session's project when the cwd
     // hint resolves (a run active in the target's .pi/workflows is the one
     // that would collide); the goal guard stays hub-scoped — the target
@@ -341,7 +467,7 @@ export class JobsPanel {
     if (res.error || res.status !== 0) {
       return `Job ${clean(id)} not resumed — injection failed (${res.error?.message ?? `tmux exit ${res.status}`}); nothing was acked, try again.`;
     }
-    this.writeAck(job.id);
+    writeAck(job.id);
     return `Resumed job ${clean(id)}.`;
   }
 
@@ -368,52 +494,12 @@ export class JobsPanel {
   }
 
   private removeMarker(job: Job): void {
-    const ack = this.ackPathFor(job.id);
+    const ack = hashPathFor(job.id, ACKS_DIR);
     if (ack) rmSync(ack, { force: true });
+    const claim = hashPathFor(job.id, INJECTED_DIR);
+    if (claim) rmSync(claim, { force: true });
     rmSync(job.file, { force: true });
     this.seen.delete(job.id);
-  }
-
-  /** macOS Notification Center banner via terminal-notifier (own identity,
-   * reliable once granted). execFile + argv: no shell, no interpolation,
-   * absolute binary path. Fallback: the dashboard's detached-in-tmux
-   * osascript helper. PI_JOBS_OSA=0 stays a no-op for pi-jobs compat. */
-  notifyMacOS(title: string, body: string): void {
-    if (process.env.PI_JOBS_OSA === "0") return;
-    if (process.platform === "darwin" && existsSync(TERMINAL_NOTIFIER)) {
-      execFile(TERMINAL_NOTIFIER, ["-title", clean(title).slice(0, 80), "-message", clean(body).slice(0, 200)], (err) => {
-        if (err) console.error("[pi-king] macOS notify failed:", err.message);
-      });
-      return;
-    }
-    this.notifyFallback?.(clean(body).slice(0, 200));
-  }
-
-  /** Ack = sha256 of the RAW marker file, first 16 hex chars — identical
-   * contract to pi-jobs, so acks written by either side are interchangeable. */
-  private ackPathFor(id: string): string | null {
-    try {
-      const raw = readFileSync(join(JOBS_DIR, `${id}.json`), "utf8");
-      return join(ACKS_DIR, `${createHash("sha256").update(raw).digest("hex").slice(0, 16)}.json`);
-    } catch {
-      return null;
-    }
-  }
-
-  private acked(id: string): boolean {
-    const ack = this.ackPathFor(id);
-    return ack !== null && existsSync(ack);
-  }
-
-  private writeAck(id: string): void {
-    const ack = this.ackPathFor(id);
-    if (!ack) return;
-    try {
-      mkdirSync(ACKS_DIR, { recursive: true, mode: 0o700 });
-      writeFileSync(ack, JSON.stringify({ id, ackedAt: new Date().toISOString() }), { mode: 0o600 });
-    } catch {
-      // Ack is idempotency insurance, never worth failing a resume over.
-    }
   }
 
   /** Execution guard, ported verbatim from pi-jobs: refuse autonomous

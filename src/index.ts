@@ -208,7 +208,7 @@ import {
   type UsageStats,
   type DayTotal,
 } from "./data.ts";
-import { JobsPanel, scanJobs, type SessionManagerLike } from "./jobs.ts";
+import { JobsPanel, notifyMacOS, scanJobs, selectRestoreCards, type SessionManagerLike } from "./jobs.ts";
 
 const REFRESH_MS = 1000;
 /** Ticks of REFRESH_MS between a full data refresh (ps, tmux list-sessions,
@@ -241,6 +241,10 @@ const MESSAGE_LINGER_MS = 4000;
  * sessions and looked broken rather than misconfigured. Falls back to a bare
  * name so PATH lookup still gets a chance. */
 const TMUX = ((): string => {
+  // Test override, same contract as jobs.ts: PI_KING_TMUX points every
+  // tmux call at a fake binary that records invocations.
+  const forced = process.env.PI_KING_TMUX?.trim();
+  if (forced) return forced;
   const which = spawnSync("/usr/bin/env", ["which", "tmux"], { encoding: "utf8", timeout: 3000 });
   const found = which.status === 0 ? String(which.stdout || "").trim().split("\n")[0].trim() : "";
   return found || "tmux";
@@ -1007,6 +1011,73 @@ export function restoreRebootOrphans(): { restored: number; failed: number } {
   return { restored, failed };
 }
 
+/** The hub daemon's boot restore. Unlike restoreRebootOrphans it is NOT
+ * gated on reboot proximity: the daemon starts with launchd at login (and
+ * restarts on crash via KeepAlive), when the tmux server is down and every
+ * window is gone — the user's intent on daemon start is "windows back".
+ * Every visible card whose process is confirmably gone (dead, or a recycled
+ * pid) and whose window does not already exist gets a fresh window, exactly
+ * like the fleet recovery done by hand after the 2026-08-07 kill-server
+ * accident. Deliberate: a session killed with X does come back — the card
+ * is the only tombstone-free record; hit X again. */
+function restoreMissingSessions(): number {
+  let files: string[];
+  try {
+    files = readdirSync(SESSION_STATUS_DIR).filter((f) => f.endsWith(".json"));
+  } catch {
+    return 0;
+  }
+  const parsed: SessionStatusFile[] = [];
+  for (const file of files) {
+    try {
+      parsed.push(JSON.parse(readFileSync(join(SESSION_STATUS_DIR, file), "utf8")) as SessionStatusFile);
+    } catch {
+      // rare write race; skip, resolves next run
+    }
+  }
+  const live = livePiPids(parsed.map((raw) => raw.pid));
+  if (live === undefined) return 0; // ps unavailable: do not guess at liveness
+  let restored = 0;
+  for (const raw of selectRestoreCards(parsed, live)) {
+    if (!existsSync(raw.cwd)) continue;
+    const base = (raw.name ?? raw.project ?? "").trim() || raw.id.slice(0, 8);
+    const names = [base, `${base}-${raw.id.slice(0, 8)}`];
+    if (names.some((n) => tmuxSessionExists(TMUX, n))) continue; // window already there
+    let result = createTmuxSession(base, raw.cwd, raw.id);
+    if (!result.ok) result = createTmuxSession(names[1], raw.cwd, raw.id);
+    if (result.ok) restored++;
+  }
+  return restored;
+}
+
+/** The detached hub daemon (launchd KeepAlive agent com.stanz.pi-king-hub):
+ * owns marker polling (1s tick), injection, macOS banner, and session-window
+ * restore 24/7, so a job landing while the user is attached inside tmux
+ * still pings — the E2E proved the interactive hub dies on attach and takes
+ * the idle-wake loop with it. The TUI dashboard is a view of the same
+ * state, attachable on demand; the .injected claim protocol dedupes
+ * injections between daemon, dashboard, and session-side pi-jobs watchers.
+ * Runs headless (no TUI): launchd wraps this in bin/pi-king --daemon. */
+async function runHubDaemon(ctx: ExtensionContext): Promise<void> {
+  // A tmux server with no sessions exits non-zero from has-session but is
+  // still "running" — start-server is a no-op when the server already exists.
+  spawnSync(TMUX, ["start-server"], { encoding: "utf8", timeout: 3000 });
+  const restored = restoreMissingSessions();
+  if (restored > 0) {
+    notifyMacOS(`pi-king hub`, `Restored ${restored} session window${restored === 1 ? "" : "s"} after a restart.`);
+  }
+  console.log(`[pi-king-hub] started ${new Date().toISOString()}${restored > 0 ? ` — restored ${restored} sessions` : ""}`);
+  const panel = new JobsPanel(ctx.sessionManager, ctx.cwd, undefined);
+  // Same 1s tick as the dashboard; one completion per tick; claims dedupe
+  // against every other watcher. Stale-pending reconciliation needs no code:
+  // dimming is render-side, and nothing auto-deletes.
+  for (;;) {
+    const rows = buildRows();
+    panel.poll(Date.now(), rows);
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
 /** True when it is safe to type text into this session's live pane right
  * now: the main agent is not mid-turn, AND no subagent behind it is running
  * or queued either. Broader than "state === idle" on purpose -- attention
@@ -1489,7 +1560,7 @@ class DashboardView implements Component {
       // refresh below is throttled to every IDLE_REFRESH_TICKS. The scan is
       // a stat-cached readdir — cheap enough for 1s — and the panel's seen
       // set guarantees exactly one injection per marker per hub run.
-      this.jobs.poll(Date.now(), this.rows, this.rows[this.selected]);
+      this.jobs.poll(Date.now(), this.rows);
       // Fast cadence (every tick) while a turn is actively streaming or a
       // subagent is running — the only states where a fresher read shows
       // something genuinely new. Everything else (idle, background,
@@ -1624,7 +1695,7 @@ class DashboardView implements Component {
   toggleJobsPanel(): void {
     this.jobs.open = !this.jobs.open;
     this.jobs.deleteArmedFor = null;
-    if (this.jobs.open) this.jobs.poll(Date.now(), this.rows, this.rows[this.selected]);
+    if (this.jobs.open) this.jobs.poll(Date.now(), this.rows);
     this.tui.requestRender();
   }
 
@@ -1793,7 +1864,7 @@ class DashboardView implements Component {
       if (data === "r" || data === "R") {
         const job = this.jobs.list[this.jobs.selected];
         if (!job) return;
-        void this.jobs.resume(job.id, this.rows, this.rows[this.selected]).then((msg) => {
+        void this.jobs.resume(job.id, this.rows).then((msg) => {
           this.showMessage(msg);
           this.tui.requestRender();
         });
@@ -2681,6 +2752,21 @@ function notifyDetached(ctx: ExtensionContext, body: string): void {
   } catch { /* notification is best-effort, never worth disturbing the session */ }
 }
 
+/** Exact-name existence check. `has-session -t <name>` does NOT do this:
+ * tmux target resolution falls back to prefix and fnmatch matching, so
+ * asking for "proj" returns success when only "proj-a1b2c3d4" exists —
+ * verified against tmux 3.7b. On a machine running ten related session
+ * names that reports a duplicate that is not there, which is exactly the
+ * shape of an intermittent failure. Compare against the real list instead.
+ * Module scope: shared by the dashboard, the /bg handoff, and the hub
+ * daemon's boot restore. */
+function tmuxSessionExists(tmux: string, name: string): boolean {
+  const r = spawnSync(tmux, ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8", timeout: 3000 });
+  // A tmux server with no sessions exits non-zero; that is "no", not an error.
+  if (r.status !== 0) return false;
+  return String(r.stdout || "").split("\n").some((l) => l === name);
+}
+
 function installSessionTracker(pi: ExtensionAPI) {
   let state: TitleState = "idle";
   let activity = "Session started.";
@@ -3204,19 +3290,6 @@ function installSessionTracker(pi: ExtensionAPI) {
     persist(ctx);
   });
 
-  /** Exact-name existence check. `has-session -t <name>` does NOT do this:
-   * tmux target resolution falls back to prefix and fnmatch matching, so
-   * asking for "proj" returns success when only "proj-a1b2c3d4" exists —
-   * verified against tmux 3.7b. On a machine running ten related session
-   * names that reports a duplicate that is not there, which is exactly the
-   * shape of an intermittent failure. Compare against the real list instead. */
-  function tmuxSessionExists(tmux: string, name: string): boolean {
-    const r = spawnSync(tmux, ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8", timeout: 3000 });
-    // A tmux server with no sessions exits non-zero; that is "no", not an error.
-    if (r.status !== 0) return false;
-    return String(r.stdout || "").split("\n").some((l) => l === name);
-  }
-
   function hasLiveSubagents(): number {
     return [...subagents.values()].filter((s) => s.status === "running" || s.status === "queued").length;
   }
@@ -3360,6 +3433,10 @@ export default function piDashboard(pi: ExtensionAPI) {
     description: "Launch directly into the cross-session tmux-backed dashboard hub, looping until quit",
     type: "boolean",
   });
+  pi.registerFlag("agents-hub-daemon", {
+    description: "Detached hub daemon (launchd KeepAlive agent): marker polling, injection, banner, and session-window restore with no TUI",
+    type: "boolean",
+  });
 
   // /jobs is registered inside the hub's session_start (see the agents-hub
   // branch below), never from the factory: the hub runs --no-tools
@@ -3422,6 +3499,16 @@ export default function piDashboard(pi: ExtensionAPI) {
         );
       },
     });
+    // Daemon mode: the launchd KeepAlive agent (com.stanz.pi-king-hub).
+    // Headless — no TUI, no terminal. Polls markers, injects, banners, and
+    // restores session windows until launchd takes it down; KeepAlive
+    // relaunches it if it ever dies. Everything it needs is already wired
+    // above (jobs command registration, tracker, subagent monitor).
+    if (pi.getFlag("agents-hub-daemon")) {
+      await runHubDaemon(ctx);
+      ctx.shutdown();
+      return;
+    }
     if (ctx.mode !== "tui") {
       ctx.ui.notify("pi-king requires an interactive terminal.", "error");
       ctx.shutdown();

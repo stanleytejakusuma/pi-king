@@ -45,6 +45,9 @@ const {
   scanJobs,
   JobsPanel,
   ACKS_DIR,
+  INJECTED_DIR,
+  claimInjected,
+  selectRestoreCards,
 } = await import("../src/jobs.ts");
 
 // ---- helpers -------------------------------------------------------------
@@ -53,7 +56,7 @@ const writeMarker = (id, body) => {
   writeFileSync(join(jobsDir, `${id}.json`), typeof body === "string" ? body : JSON.stringify(body));
 };
 const noSession = { getEntries: () => [] };
-const sessionRow = (cwd, tmuxName) => ({ kind: "session", entry: { cwd, tmuxName } });
+const sessionRow = (cwd, tmuxName, updatedAt = 0) => ({ kind: "session", entry: { cwd, tmuxName, updatedAt } });
 const resetLog = () => { rmSync(logFile, { force: true }); };
 const readLog = () => { try { return readFileSync(logFile, "utf8"); } catch { return ""; } };
 const settle = () => new Promise((r) => setTimeout(r, 100));
@@ -117,33 +120,76 @@ test("isStalePending: pending older than window, never terminal", () => {
   assert.equal(isStalePending({ status: "pending", createdAt: "2026-08-05T00:00:00Z" }, now, 0), false); // disabled
 });
 
-test("targetRow: cwd hint > focused > none", () => {
-  const job = { id: "x", file: "", stale: false, marker: { status: "done", resultPath: "/proj/alpha/out.txt" } };
+test("targetRow: cwd hint > resultPath dirname > most-recently-active > none", () => {
+  const mk = (marker) => ({ id: "x", file: "", stale: false, marker });
   const rows = [
     sessionRow("/proj/beta", "t-beta"),
     sessionRow("/proj/alpha", "t-alpha"),
+    sessionRow("/proj/alpha/sub", "t-alpha-sub"),
     { kind: "orphan" },
   ];
-  const focused = sessionRow("/proj/gamma", "t-gamma");
-  // cwd-hint match wins even over a valid focused row
-  assert.equal(targetRow(job, rows, focused)?.entry?.tmuxName, "t-alpha");
-  // hint matches nothing → focused (when it is a tmux-backed session)
-  const miss = { ...job, marker: { status: "done", resultPath: "/elsewhere/out.txt" } };
-  assert.equal(targetRow(miss, rows, focused)?.entry?.tmuxName, "t-gamma");
-  // no hint → focused
-  const noHint = { ...job, marker: { status: "done" } };
-  assert.equal(targetRow(noHint, rows, focused)?.entry?.tmuxName, "t-gamma");
-  // no hint, focused not a session → none
-  assert.equal(targetRow(noHint, rows, undefined), undefined);
-  // hint match without tmuxName is skipped, focused used
-  const noTmux = [{ kind: "session", entry: { cwd: "/proj/alpha" } }];
-  assert.equal(targetRow(job, noTmux, focused)?.entry?.tmuxName, "t-gamma");
+  // cwd field beats resultPath dirname and recency
+  const cwdJob = mk({ status: "done", cwd: "/proj/alpha", resultPath: "/proj/beta/out.txt" });
+  assert.equal(targetRow(cwdJob, rows)?.entry?.tmuxName, "t-alpha");
+  // resultPath dirname matched when no cwd field (older markers)
+  const rpJob = mk({ status: "done", resultPath: "/proj/alpha/out.txt" });
+  assert.equal(targetRow(rpJob, rows)?.entry?.tmuxName, "t-alpha");
+  // session nested inside the hint matches too
+  const subRows = [sessionRow("/proj/beta", "t-beta"), sessionRow("/proj/alpha/sub", "t-alpha-sub")];
+  assert.equal(targetRow(cwdJob, subRows)?.entry?.tmuxName, "t-alpha-sub");
+  // no hints → most-recently-active tmux-backed session
+  const recencyRows = [sessionRow("/proj/beta", "t-beta", 100), sessionRow("/proj/gamma", "t-gamma", 999)];
+  const noHint = mk({ status: "done" });
+  assert.equal(targetRow(noHint, recencyRows)?.entry?.tmuxName, "t-gamma");
+  // hint match without tmuxName is skipped; recency still applies
+  const noTmux = [{ kind: "session", entry: { cwd: "/proj/alpha" } }, sessionRow("/proj/delta", "t-delta", 5)];
+  assert.equal(targetRow(rpJob, noTmux)?.entry?.tmuxName, "t-delta");
+  // nothing tmux-backed at all → none
+  assert.equal(targetRow(noHint, [{ kind: "session", entry: { cwd: "/proj/alpha" } }]), undefined);
+  assert.equal(targetRow(noHint, []), undefined);
   // exact-cwd hit (not just prefix)
-  const exact = { ...job, marker: { status: "done", resultPath: "/proj/alpha" } };
-  assert.equal(targetRow(exact, rows, focused)?.entry?.tmuxName, "t-alpha");
+  const exact = mk({ status: "done", resultPath: "/proj/alpha" });
+  assert.equal(targetRow(exact, rows)?.entry?.tmuxName, "t-alpha");
+});
+
+test("claimInjected: first writer wins across watchers", async () => {
+  const rows = [sessionRow("/proj/alpha", "t-alpha", 1)];
+  // watcher A (e.g. hub daemon) and watcher B (dashboard / session-side
+  // pi-jobs) BOTH construct before the marker lands, so neither has it in
+  // its seen set — the .injected claim, not the seen set, is the dedup.
+  const panelA = new JobsPanel(noSession, "/proj/alpha", undefined);
+  const panelB = new JobsPanel(noSession, "/proj/alpha", undefined);
+  writeMarker("claim-1", { status: "done", summary: "claim test" });
+  panelA.poll(Date.now(), rows);
+  await settle();
+  const logAfterA = readLog().trim().split("\n").filter(Boolean);
+  assert.equal(logAfterA.length, 1, "first watcher injects exactly once");
+  assert.equal(readdirSync(ACKS_DIR).length, 1, "winner writes the ack");
+  assert.equal(readdirSync(INJECTED_DIR).length, 1, "claim file exists");
+  panelB.poll(Date.now(), rows);
+  await settle();
+  const logAfterB = readLog().trim().split("\n").filter(Boolean);
+  assert.equal(logAfterB.length, 1, "second watcher stays silent — exactly one injection total");
+  // manual resume still works regardless of the claim
+  assert.match(await panelA.resume("claim-1", rows), /already resumed/);
+});
+
+test("selectRestoreCards: dead + recycled restored, alive/invisible/unstamped skipped", () => {
+  const live = new Map([[1, 100], [2, 999999]]);
+  const cards = [
+    { id: "a", cwd: "/x", visible: true, lastActivity: Date.now(), pid: 1, startedAt: 100 }, // alive → skip
+    { id: "b", cwd: "/x", visible: true, lastActivity: Date.now(), pid: 2, startedAt: 100 }, // recycled → restore
+    { id: "c", cwd: "/x", visible: true, lastActivity: Date.now(), pid: 3, startedAt: 100 }, // dead → restore
+    { id: "d", cwd: "/x", visible: false, lastActivity: Date.now(), pid: 4, startedAt: 100 }, // invisible → skip
+    { id: "e", cwd: "/x", visible: true, pid: 5, startedAt: 100 }, // never stamped → skip
+  ];
+  assert.deepEqual(selectRestoreCards(cards, live).map((c) => c.id), ["b", "c"]);
+  // empty liveness map (ps unavailable): every stamped card looks restoreable
+  assert.deepEqual(selectRestoreCards(cards, new Map()).map((c) => c.id), ["a", "b", "c"]);
 });
 
 test("scanJobs reads markers, skips malformed, caches via stat", () => {
+  resetJobsDir(); // claim/restore tests above leave markers behind
   writeMarker("a-1", { status: "done", summary: "alpha" });
   writeMarker("b-2", { status: "pending" });
   writeMarker("bad-3", "{{{");
@@ -163,11 +209,11 @@ test("poll: exactly one injection per marker (single-fire seen set)", async () =
   writeMarker("fire-1", { status: "done", summary: "boom", resultPath: "/proj/alpha/out.txt" });
   const rows = [sessionRow("/proj/alpha", "t-alpha")];
 
-  panel.poll(Date.now(), rows, rows[0]);
+  panel.poll(Date.now(), rows);
   await settle();
   const afterFirst = readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean);
 
-  panel.poll(Date.now(), rows, rows[0]); // second poll: seen → no re-injection
+  panel.poll(Date.now(), rows); // second poll: seen → no re-injection
   await settle();
 
   const all = readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean);
@@ -184,9 +230,9 @@ test("poll: pending markers are never injected", async () => {
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
   writeMarker("pend-1", { status: "pending" });
   const rows = [sessionRow("/proj/alpha", "t-alpha")];
-  panel.poll(Date.now(), rows, rows[0]);
+  panel.poll(Date.now(), rows);
   await settle();
-  panel.poll(Date.now(), rows, rows[0]);
+  panel.poll(Date.now(), rows);
   await settle();
   assert.equal(readLog().trim(), "");
 });
@@ -198,23 +244,23 @@ test("resume guards: pending, acked, active goal, active workflow", async () => 
   writeMarker("g-pend", { status: "pending" });
   let panel = new JobsPanel(noSession, "/proj/alpha", undefined);
   panel.poll(Date.now(), [], undefined);
-  assert.match(await panel.resume("g-pend", [], undefined), /still pending/);
+  assert.match(await panel.resume("g-pend", []), /still pending/);
 
   // no tmux target → refuse WITHOUT acking (a burned ack would block the
   // retry once a target exists)
   writeMarker("g-ack", { status: "done", summary: "done once" });
   panel = new JobsPanel(noSession, "/proj/alpha", undefined);
   panel.poll(Date.now(), [], undefined);
-  assert.match(await panel.resume("g-ack", [], undefined), /not resumed/);
+  assert.match(await panel.resume("g-ack", []), /not resumed/);
   assert.equal(existsSync(ACKS_DIR) ? readdirSync(ACKS_DIR).length : 0, 0, "no-target resume must not write an ack");
   // with a target: inject then ack → second resume refused
   const ackRows = [sessionRow("/proj/alpha", "t-alpha")];
   resetLog();
-  assert.match(await panel.resume("g-ack", ackRows, ackRows[0]), /Resumed job g-ack/);
+  assert.match(await panel.resume("g-ack", ackRows), /Resumed job g-ack/);
   const ackFiles = readdirSync(ACKS_DIR);
   assert.equal(ackFiles.length, 1);
   assert.ok(readFileSync(join(ACKS_DIR, ackFiles[0]), "utf8").includes("ackedAt"));
-  assert.match(await panel.resume("g-ack", ackRows, ackRows[0]), /already resumed/);
+  assert.match(await panel.resume("g-ack", ackRows), /already resumed/);
 
   // active goal_mode entry → refuse
   writeMarker("g-goal", { status: "done", summary: "under goal" });
@@ -223,7 +269,7 @@ test("resume guards: pending, acked, active goal, active workflow", async () => 
   };
   panel = new JobsPanel(goalSession, "/proj/alpha", undefined);
   panel.poll(Date.now(), [], undefined);
-  assert.match(await panel.resume("g-goal", [], undefined), /\/goal is active/);
+  assert.match(await panel.resume("g-goal", []), /\/goal is active/);
 
   // non-terminal workflow run in cwd → refuse (flat layout)
   const wfDir = mkdtempSync(join(tmpdir(), "pi-king-wf-"));
@@ -232,7 +278,7 @@ test("resume guards: pending, acked, active goal, active workflow", async () => 
   writeMarker("g-wf", { status: "done", summary: "under workflow" });
   panel = new JobsPanel(noSession, wfDir, undefined);
   panel.poll(Date.now(), [], undefined);
-  assert.match(await panel.resume("g-wf", [], undefined), /workflow run is active/);
+  assert.match(await panel.resume("g-wf", []), /workflow run is active/);
   // legacy layout refusal
   const legacyDir = mkdtempSync(join(tmpdir(), "pi-king-wf-legacy-"));
   mkdirSync(join(legacyDir, ".pi", "workflows", "run-1"), { recursive: true });
@@ -240,7 +286,7 @@ test("resume guards: pending, acked, active goal, active workflow", async () => 
   writeMarker("g-wf2", { status: "done" });
   panel = new JobsPanel(noSession, legacyDir, undefined);
   panel.poll(Date.now(), [], undefined);
-  assert.match(await panel.resume("g-wf2", [], undefined), /workflow run is active/);
+  assert.match(await panel.resume("g-wf2", []), /workflow run is active/);
 });
 
 test("resume happy path: ack + framed injection into the target session", async () => {
@@ -250,15 +296,15 @@ test("resume happy path: ack + framed injection into the target session", async 
   writeMarker("ok-1", { status: "failed", summary: "exit=2", resultPath: "/proj/alpha/out.log" });
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined); // seeds ok-1 → no auto-inject
   const rows = [sessionRow("/proj/alpha", "t-alpha")];
-  panel.poll(Date.now(), rows, rows[0]);
-  const msg = await panel.resume("ok-1", rows, rows[0]);
+  panel.poll(Date.now(), rows);
+  const msg = await panel.resume("ok-1", rows);
   assert.match(msg, /Resumed job ok-1/);
   const log = readFileSync(logFile, "utf8").trim();
   assert.match(log, /send-keys -t t-alpha/);
   assert.match(log, /UNTRUSTED report, verify before acting/);
   assert.match(log, /Summarize what the job reports/);
   // ack written → a second resume is refused
-  assert.match(await panel.resume("ok-1", rows, rows[0]), /already resumed/);
+  assert.match(await panel.resume("ok-1", rows), /already resumed/);
 });
 
 test("poll seeds seen with pre-existing markers (no re-inject on reopen)", async () => {
@@ -267,14 +313,14 @@ test("poll seeds seen with pre-existing markers (no re-inject on reopen)", async
   writeMarker("old-1", { status: "done", summary: "from before" });
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined); // seeds old-1
   const rows = [sessionRow("/proj/alpha", "t-alpha")];
-  panel.poll(Date.now(), rows, rows[0]);
+  panel.poll(Date.now(), rows);
   await settle();
   assert.equal(readLog().trim(), "", "pre-existing markers must not inject");
   // a marker written after open still injects exactly once
   writeMarker("new-1", { status: "done", summary: "while open", resultPath: "/proj/alpha/x" });
-  panel.poll(Date.now(), rows, rows[0]);
+  panel.poll(Date.now(), rows);
   await settle();
-  panel.poll(Date.now(), rows, rows[0]);
+  panel.poll(Date.now(), rows);
   await settle();
   const lines = readLog().trim().split("\n").filter(Boolean);
   assert.equal(lines.length, 1);
@@ -302,14 +348,14 @@ test("resume injects before acking: failed injection keeps the job resumable", a
   writeMarker("f-1", { status: "done", summary: "flaky" });
   writeFileSync(failMarker, "fail");
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
-  panel.poll(Date.now(), rows, rows[0]);
-  const failed = await panel.resume("f-1", rows, rows[0]);
+  panel.poll(Date.now(), rows);
+  const failed = await panel.resume("f-1", rows);
   assert.match(failed, /not resumed/);
   assert.match(failed, /nothing was acked/);
   assert.equal(readdirSync(ACKS_DIR).length, 0, "failed injection must not burn the ack");
   // retry after the failure clears: succeeds and acks
   rmSync(failMarker, { force: true });
-  const msg = await panel.resume("f-1", rows, rows[0]);
+  const msg = await panel.resume("f-1", rows);
   assert.match(msg, /Resumed job f-1/);
   assert.equal(readdirSync(ACKS_DIR).length, 1);
 });
@@ -322,12 +368,12 @@ test("auto-injection acks the marker: exactly one injection per marker", async (
   const rows = [sessionRow("/proj/alpha", "t-alpha")];
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined); // seeds nothing yet
   writeMarker("auto-1", { status: "done", summary: "auto" });
-  panel.poll(Date.now(), rows, rows[0]);
+  panel.poll(Date.now(), rows);
   await settle();
   const lines = readLog().trim().split("\n").filter(Boolean);
   assert.equal(lines.length, 1, "auto-injection fires exactly once");
   assert.equal(readdirSync(ACKS_DIR).length, 1, "successful auto-injection writes the ack");
-  assert.match(await panel.resume("auto-1", rows, rows[0]), /already resumed/);
+  assert.match(await panel.resume("auto-1", rows), /already resumed/);
 });
 
 test("isStalePending: pending older than the window is stale, done never", () => {

@@ -190,6 +190,33 @@ rather than being killed.
 
 Detach from an attached session with tmux's own `Ctrl+B d`.
 
+## Hub daemon (offload jobs + boot restore, 24/7)
+
+The interactive dashboard exits when you attach into tmux, which used to kill
+marker watching with it (a job landing mid-attach went silent). The detached
+hub daemon owns marker polling, injection, the macOS banner, and session-
+window restore as a launchd KeepAlive agent — it never dies. The dashboard is
+a view of the same state, attachable on demand.
+
+```bash
+pi-king --daemon-install      # write plist + bootstrap com.stanz.pi-king-hub
+pi-king --daemon-status       # launchd state + hub.log tail
+pi-king --daemon-uninstall    # stop + remove
+```
+
+- **Exactly one injection per marker** across daemon + dashboard + session-side
+  pi-jobs watchers: first writer of `~/.pi/jobs/.injected/<hash>.json` wins
+  (wx claim, same hash identity as acks). Banner + panel always; injection
+  once.
+- **Deterministic targeting**: marker `cwd` (or `resultPath` dirname) prefix-
+  matches the home session; else the most-recently-active tmux-backed session;
+  else none. Never the cursor row — a job can land while nobody is looking.
+- **Boot restore**: `tmux start-server` if down, then every visible card whose
+  process is gone and whose window is missing gets a fresh window (the fleet
+  recovery from the 2026-08-07 kill-server accident, automated). A session
+  killed with `X` does come back — the card is the only tombstone-free record.
+- Log: `~/.pi/king/hub.log`. Marker writer: `~/.pi/jobs/scripts/pi-jobs-run.sh`.
+
 ## Configuration
 
 Everything is optional; unset means the corresponding panel is simply absent.

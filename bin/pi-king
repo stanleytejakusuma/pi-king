@@ -27,6 +27,78 @@ while [ -L "$SELF" ]; do
 done
 HUB_DIR="$(cd "$(dirname "$SELF")/.." && pwd)/hub"
 EXTENSION="$(cd "$(dirname "$SELF")/.." && pwd)/src/index.ts"
+
+# Detached hub daemon (launchd KeepAlive agent com.stanz.pi-king-hub). Owns
+# marker polling, injection, banner, and session-window restore 24/7 — the
+# interactive hub exits on tmux attach, this one never does.
+case "${1:-}" in
+  --daemon)
+    shift
+    if [ -f "$EXTENSION" ]; then
+      exec pi --no-session --no-tools --no-context-files --no-skills \
+        --no-extensions --extension "$EXTENSION" --agents-hub --agents-hub-daemon "$@"
+    fi
+    exec pi --no-session --no-tools --no-context-files --no-skills \
+      --agents-hub --agents-hub-daemon "$@"
+    ;;
+  --daemon-install)
+    PLIST="$HOME/Library/LaunchAgents/com.stanz.pi-king-hub.plist"
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.pi/king"
+    cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.stanz.pi-king-hub</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>exec "$SELF" --daemon</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>$HOME/.pi/king/hub.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/.pi/king/hub.log</string>
+</dict>
+</plist>
+EOF
+    launchctl bootout "gui/$(id -u)/com.stanz.pi-king-hub" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    echo "pi-king hub daemon installed + started. Log: ~/.pi/king/hub.log"
+    exit 0
+    ;;
+  --daemon-uninstall)
+    launchctl bootout "gui/$(id -u)/com.stanz.pi-king-hub" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/com.stanz.pi-king-hub.plist"
+    echo "pi-king hub daemon stopped + removed."
+    exit 0
+    ;;
+  --daemon-status)
+    if launchctl print "gui/$(id -u)/com.stanz.pi-king-hub" >/dev/null 2>&1; then
+      launchctl print "gui/$(id -u)/com.stanz.pi-king-hub" | grep -E 'state|pid|last exit' || true
+      echo "--- hub.log tail ---"
+      tail -5 "$HOME/.pi/king/hub.log" 2>/dev/null || true
+    else
+      echo "pi-king hub daemon is NOT loaded."
+      exit 1
+    fi
+    exit 0
+    ;;
+esac
+
 ACTION_FILE="$(mktemp -t pi-king-action)"
 export PI_KING_ACTION_FILE="$ACTION_FILE"
 

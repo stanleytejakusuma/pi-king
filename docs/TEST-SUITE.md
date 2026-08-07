@@ -326,6 +326,39 @@ Press `c`.
 
 ---
 
+## Phase I — Hub daemon (launchd KeepAlive) + boot restore
+
+Daemon install/uninstall/status live in the launcher:
+
+```bash
+bin/pi-king --daemon-install      # writes the plist, bootstraps com.stanz.pi-king-hub
+bin/pi-king --daemon-status       # launchd state + hub.log tail
+bin/pi-king --daemon-uninstall    # bootout + remove plist
+```
+
+### I1. launchd start/stop cycle
+`bin/pi-king --daemon-install`, then `launchctl print gui/$(id -u)/com.stanz.pi-king-hub | grep pid` shows a live pid. Run `bin/pi-king --daemon-uninstall`.
+**PASS:** the process is gone; `--daemon-install` again restarts it. KeepAlive: `kill <pid>` → launchd relaunches it within seconds (verify via `--daemon-status`).
+
+### I2. Hub alive while attached (the E2E failure mode)
+Attach into a fleet session via the dashboard, then `bin/pi-king --daemon-status`.
+**PASS:** the daemon pid is unchanged and `hub.log` keeps advancing ticks — the attach no longer kills the watcher. Previously the interactive hub exited on attach and took the idle-wake loop with it (observed live).
+
+### I3. One injection across hub + session watchers
+While the daemon is live and sessions are attached, write one fake marker
+(`printf '{"status":"done","summary":"i3"}' > ~/.pi/jobs/i3-$$.json`).
+**PASS:** exactly one session's activity shows the injected line; `~/.pi/jobs/.injected/` contains one claim file; banner fired. The `.injected` wx claim is first-writer-wins across the daemon, the dashboard process, and session-side pi-jobs watchers.
+
+### I4. Boot restore recreates the fleet
+With the daemon installed: `tmux kill-server` (daemon restarts it via `start-server` on its next tick only if the daemon itself restarts — kill-server alone leaves the daemon's tick running, so instead: `bin/pi-king --daemon-uninstall` + `tmux kill-server` + `--daemon-install`).
+**PASS:** `~/.pi/king/hub.log` shows `restored N sessions` and the full fleet's tmux windows exist again within ~10s; exited/invisible cards are NOT recreated. (Automated logic equivalent: `tools/jobs.test.mjs` `selectRestoreCards`.)
+
+### I5. Deterministic targeting
+Write a marker with `"cwd":"/abs/path/to/project"` whose project session exists.
+**PASS:** the injection lands in that project's session, not the most-recently-active one. A marker without `cwd`/`resultPath` lands in the most-recently-active tmux-backed session (never the cursor row — the daemon has no cursor).
+
+---
+
 ## Failure protocol
 
 On any failure: **stop, change nothing, capture the scene.**
