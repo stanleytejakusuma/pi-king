@@ -1353,6 +1353,15 @@ function elapsed(ms: number): string {
   return `${Math.round(s / 86_400)}d`;
 }
 
+/** Wall-clock span between two timestamps (for durations, unlike elapsed). */
+function duration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86_400) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86_400)}d`;
+}
+
 function clockLine(): string {
   const d = new Date();
   const day = d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
@@ -2311,6 +2320,7 @@ class DashboardView implements Component {
       } else {
         const idW = Math.min(28, Math.max(12, Math.floor(MEASURE * 0.2)));
         const statusW = 10;
+        const timeW = 9;
         jobs.forEach((j, i) => {
           const sel = i === this.jobs.selected;
           if (sel) selectedLine = body.length;
@@ -2324,14 +2334,26 @@ class DashboardView implements Component {
             truncateToWidth(j.marker.status + (j.stale ? " (stale)" : ""), statusW, "\u2026", true),
             statusW,
           );
+          // Time elapsed: live count-up since createdAt while pending;
+          // total runtime (completedAt − createdAt) once terminal. Ticks
+          // with the panel's 1s refresh.
+          let timeText = "\u2014";
+          if (j.marker.createdAt) {
+            const start = Date.parse(j.marker.createdAt);
+            const end = j.marker.status === "pending"
+              ? Date.now()
+              : j.marker.completedAt ? Date.parse(j.marker.completedAt) : Date.now();
+            if (Number.isFinite(start) && Number.isFinite(end)) timeText = duration(end - start);
+          }
+          const time = th.fg("muted", pad(truncateToWidth(timeText, timeW, "\u2026", true), timeW));
           const summary = j.marker.summary
-            ? truncateToWidth(clean(j.marker.summary), Math.max(10, MEASURE - idW - statusW - 24), "\u2026", true)
+            ? truncateToWidth(clean(j.marker.summary), Math.max(10, MEASURE - idW - statusW - timeW - 24), "\u2026", true)
             : "";
           const right = j.marker.resultPath
             ? th.fg("dim", truncateToWidth(clean(j.marker.resultPath), 40, "\u2026", true))
             : "";
           body.push(split(
-            `  ${marker} ${sel ? th.bold(th.fg(hue, id)) : th.fg(hue, id)} ${th.fg(hue, status)} ` + th.fg("muted", summary),
+            `  ${marker} ${sel ? th.bold(th.fg(hue, id)) : th.fg(hue, id)} ${th.fg(hue, status)} ${time} ` + th.fg("muted", summary),
             right,
           ));
         });
