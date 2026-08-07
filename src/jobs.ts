@@ -220,6 +220,14 @@ export class JobsPanel {
 		this.sessionManager = sessionManager;
 		this.cwd = cwd;
 		this.notifyFallback = notifyFallback;
+		// Seed the seen set with every marker that already exists: within one
+		// process (a hub run spans many dashboard opens across attach/detach
+		// cycles, each with its own panel instance), a marker injects exactly
+		// once, and only markers written while the dashboard is open inject at
+		// all. Markers that finished while the hub was closed stay visible in
+		// the list — /jobs resume is their recovery path, same as pi-jobs'
+		// session_start seeding.
+		for (const job of scanJobs()) this.seen.add(job.id);
 	}
 
 	get list(): Job[] {

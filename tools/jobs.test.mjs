@@ -147,6 +147,8 @@ test("scanJobs reads markers, skips malformed, caches via stat", () => {
 test("poll: exactly one injection per marker (single-fire seen set)", async () => {
   resetJobsDir();
   resetLog();
+  // Panel first: construction seeds `seen` with pre-existing markers, so a
+  // marker written after open is what injects (per-hub-run semantics).
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
   writeMarker("fire-1", { status: "done", summary: "boom", resultPath: "/proj/alpha/out.txt" });
   const rows = [sessionRow("/proj/alpha", "t-alpha")];
@@ -229,8 +231,8 @@ test("resume happy path: ack + framed injection into the target session", async 
   resetJobsDir();
   resetLog();
   rmSync(ACKS_DIR, { recursive: true, force: true });
-  writeMarker("ok-1", { status: "failed", summary: "exit=2", resultPath: "/proj/alpha/out.log" });
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
+  writeMarker("ok-1", { status: "failed", summary: "exit=2", resultPath: "/proj/alpha/out.log" });
   const rows = [sessionRow("/proj/alpha", "t-alpha")];
   panel.poll(Date.now(), rows, rows[0]);
   const msg = await panel.resume("ok-1", rows, rows[0]);
@@ -241,6 +243,26 @@ test("resume happy path: ack + framed injection into the target session", async 
   assert.match(log, /Summarize what the job reports/);
   // ack written → a second resume is refused
   assert.match(await panel.resume("ok-1", rows, rows[0]), /already resumed/);
+});
+
+test("poll seeds seen with pre-existing markers (no re-inject on reopen)", async () => {
+  resetJobsDir();
+  resetLog();
+  writeMarker("old-1", { status: "done", summary: "from before" });
+  const panel = new JobsPanel(noSession, "/proj/alpha", undefined); // seeds old-1
+  const rows = [sessionRow("/proj/alpha", "t-alpha")];
+  panel.poll(Date.now(), rows, rows[0]);
+  await settle();
+  assert.equal(readLog().trim(), "", "pre-existing markers must not inject");
+  // a marker written after open still injects exactly once
+  writeMarker("new-1", { status: "done", summary: "while open", resultPath: "/proj/alpha/x" });
+  panel.poll(Date.now(), rows, rows[0]);
+  await settle();
+  panel.poll(Date.now(), rows, rows[0]);
+  await settle();
+  const lines = readLog().trim().split("\n").filter(Boolean);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /Job new-1/);
 });
 
 test("clearFinished removes only finished markers (and their acks)", () => {
