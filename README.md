@@ -173,6 +173,7 @@ pi-king          # open the dashboard (installed as a bin by the package)
 | `enter` / `→` | attach (tmux-backed) or jump to its terminal tab |
 | `n` | new session |
 | `e` | rename |
+| `j` | offload-job panel (`~/.pi/jobs` markers): `enter` show JSON, `r` resume, `c` clear finished, `x`/`X` delete |
 | `x` `x` | delete (two presses) |
 | `r` | refresh |
 | `esc` | close |

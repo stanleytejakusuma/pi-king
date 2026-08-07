@@ -208,6 +208,7 @@ import {
   type UsageStats,
   type DayTotal,
 } from "./data.ts";
+import { JobsPanel, scanJobs, type SessionManagerLike } from "./jobs.ts";
 
 const REFRESH_MS = 1000;
 /** Ticks of REFRESH_MS between a full data refresh (ps, tmux list-sessions,
@@ -1446,15 +1447,23 @@ class DashboardView implements Component {
   private recent: RecentProject[] = [];
   /** Stable for the whole day; resolved once at open. */
   private quote = quoteOfTheDay();
+  /** Offload-job markers: polling lives on the existing REFRESH_MS tick (one
+   * cadence, no second timer), the panel replaces the session body while
+   * open, and /jobs parity in the hub routes through the same instance. */
+  private jobs: JobsPanel;
 
   constructor(
     private tui: TUI,
     private theme: Theme,
     private done: (result: HubAction | undefined) => void,
-    private selfSessionId: string,
+    sessionManager: SessionManagerLike,
     private invocationCwd: string,
     initialMessage?: string,
+    /** macOS fallback notification: the dashboard's detached-in-tmux osascript
+     * helper, bound to the live ExtensionContext by showDashboardInner. */
+    notifyFallback?: (body: string) => void,
   ) {
+    this.jobs = new JobsPanel(sessionManager, invocationCwd, notifyFallback);
     this.refresh();
     // Restores the cursor to wherever it was left last time, rather than
     // always opening on row 0 — leaving "Homelab Setup" and coming straight
@@ -1475,6 +1484,12 @@ class DashboardView implements Component {
     try { this.recent = readRecentProjects(8); } catch { this.recent = []; }
     this.timer = setInterval(() => {
       this.ticksSinceRefresh++;
+      // Jobs poll on the SAME tick, unconditionally: completion detection is
+      // bounded by REFRESH_MS even on an idle fleet where the heavier data
+      // refresh below is throttled to every IDLE_REFRESH_TICKS. The scan is
+      // a stat-cached readdir — cheap enough for 1s — and the panel's seen
+      // set guarantees exactly one injection per marker per hub run.
+      this.jobs.poll(Date.now(), this.rows, this.rows[this.selected]);
       // Fast cadence (every tick) while a turn is actively streaming or a
       // subagent is running — the only states where a fresher read shows
       // something genuinely new. Everything else (idle, background,
@@ -1504,6 +1519,7 @@ class DashboardView implements Component {
     pruneRestarting(this.rows);
     flushPendingRestarts(this.rows);
     if (this.selected >= this.rows.length) this.selected = Math.max(0, this.rows.length - 1);
+    if (this.jobs.selected >= this.jobs.list.length) this.jobs.selected = Math.max(0, this.jobs.list.length - 1);
     this.refreshGitDrift();
   }
 
@@ -1599,6 +1615,16 @@ class DashboardView implements Component {
       this.message = undefined;
       this.tui.requestRender();
     }, MESSAGE_LINGER_MS);
+    this.tui.requestRender();
+  }
+
+  /** Opens/closes the offload-job panel (`j`). Opening does a fresh poll so
+   * the list is current the instant it appears, not a tick later. Public:
+   * the hub's /jobs command routes through the live view via this. */
+  toggleJobsPanel(): void {
+    this.jobs.open = !this.jobs.open;
+    this.jobs.deleteArmedFor = null;
+    if (this.jobs.open) this.jobs.poll(Date.now(), this.rows, this.rows[this.selected]);
     this.tui.requestRender();
   }
 
@@ -1730,6 +1756,75 @@ class DashboardView implements Component {
       this.tui.requestRender();
       return;
     }
+    // Jobs mode owns the keyboard: every key below is a JOB action, never a
+    // session action, while the panel is open. Unhandled keys clear the
+    // delete arm and stop — session keys must not leak through.
+    if (this.jobs.open) {
+      if (matchesKey(data, "escape") || data === "j" || data === "J") {
+        this.jobs.open = false;
+        this.jobs.deleteArmedFor = null;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, "down")) {
+        this.jobs.deleteArmedFor = null;
+        this.jobs.selected = Math.min(this.jobs.list.length - 1, this.jobs.selected + 1);
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, "up")) {
+        this.jobs.deleteArmedFor = null;
+        this.jobs.selected = Math.max(0, this.jobs.selected - 1);
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, "enter") || matchesKey(data, "right")) {
+        const job = this.jobs.list[this.jobs.selected];
+        if (job) {
+          const json = this.jobs.markerJson(job.id);
+          if (json) this.showMessage(clean(json, 400));
+        }
+        return;
+      }
+      if (data === "r" || data === "R") {
+        const job = this.jobs.list[this.jobs.selected];
+        if (!job) return;
+        void this.jobs.resume(job.id, this.rows, this.rows[this.selected]).then((msg) => {
+          this.showMessage(msg);
+          this.tui.requestRender();
+        });
+        return;
+      }
+      if (data === "c" || data === "C") {
+        const removed = this.jobs.clearFinished();
+        this.showMessage(`Removed ${removed} finished job marker${removed === 1 ? "" : "s"}.`);
+        this.tui.requestRender();
+        return;
+      }
+      if (data === "x") {
+        const job = this.jobs.list[this.jobs.selected];
+        if (!job) return;
+        this.jobs.deleteArmedFor = job.id;
+        this.showMessage("Press X again to delete this marker (the ack goes too).");
+        this.tui.requestRender();
+        return;
+      }
+      if (data === "X") {
+        const job = this.jobs.list[this.jobs.selected];
+        if (!job) return;
+        if (this.jobs.deleteArmedFor === job.id) {
+          this.jobs.deleteArmedFor = null;
+          this.showMessage(this.jobs.deleteMarker(job.id));
+        } else {
+          this.jobs.deleteArmedFor = job.id;
+          this.showMessage("Press X again to delete this marker (the ack goes too).");
+        }
+        this.tui.requestRender();
+        return;
+      }
+      this.jobs.deleteArmedFor = null;
+      return;
+    }
     // Esc (and the terminal's own Ctrl+C/Ctrl+D) are the only ways to quit —
     // "q" is deliberately not a quit key here: it's too easy to hit by
     // accident while navigating (e.g. inside a session name), and this is a
@@ -1782,6 +1877,13 @@ class DashboardView implements Component {
         return;
       }
       this.startComposer({ kind: "rename", row }, tmuxName);
+      return;
+    }
+    // j opens the offload-job panel (markers in ~/.pi/jobs); J closes it the
+    // same way j does when open. Verified unbound before taking it. The
+    // session delete-arm (X) is untouched by either.
+    if (data === "j" || data === "J") {
+      this.toggleJobsPanel();
       return;
     }
     // x detaches, X kills. The destructive action no longer sits on the key a
@@ -2123,7 +2225,38 @@ class DashboardView implements Component {
     /** Index in `body` of the currently selected row, so the window can be
      * centred on it rather than on the top of the list. */
     let selectedLine = 0;
-    if (this.rows.length === 0) {
+    if (this.jobs.open) {
+      // Jobs panel: the session body is replaced by the marker list. Marker
+      // content is UNTRUSTED data — every field passes through clean() +
+      // truncateToWidth before it is rendered.
+      body.push("  " + th.fg("accent", "Jobs") + th.fg("dim", " — j/esc back · enter show · r resume · c clear · X delete"));
+      const jobs = this.jobs.list;
+      if (jobs.length === 0) {
+        body.push("  " + th.fg("dim", "No job markers in ~/.pi/jobs."));
+      } else {
+        const idW = Math.min(28, Math.max(12, Math.floor(MEASURE * 0.2)));
+        const statusW = 10;
+        jobs.forEach((j, i) => {
+          const sel = i === this.jobs.selected;
+          if (sel) selectedLine = body.length;
+          const marker = sel ? th.fg("accent", "\u276f") : " ";
+          const hue = j.stale ? "dim" : j.marker.status === "done" ? "success"
+            : j.marker.status === "failed" ? "error" : "accent";
+          const id = pad(truncateToWidth(j.id, idW, "\u2026", true), idW);
+          const status = pad(j.marker.status + (j.stale ? " (stale)" : ""), statusW);
+          const summary = j.marker.summary
+            ? truncateToWidth(clean(j.marker.summary), Math.max(10, MEASURE - idW - statusW - 24), "\u2026", true)
+            : "";
+          const right = j.marker.resultPath
+            ? th.fg("dim", truncateToWidth(clean(j.marker.resultPath), 40, "\u2026", true))
+            : "";
+          body.push(split(
+            `  ${marker} ${sel ? th.bold(th.fg(hue, id)) : th.fg(hue, id)} ${th.fg(hue, status)} ` + th.fg("muted", summary),
+            right,
+          ));
+        });
+      }
+    } else if (this.rows.length === 0) {
       body.push("  " + th.fg("dim", "No backgrounded sessions. Press ") + th.fg("muted", "n") +
         th.fg("dim", " to start one, or run ") + th.fg("muted", "/bg") + th.fg("dim", " inside a session to surface it here."));
       if (this.recent.length > 0) {
@@ -2376,6 +2509,7 @@ class DashboardView implements Component {
       clearTimeout(this.messageTimer);
       this.messageTimer = undefined;
     }
+    if (dashboardView === this) dashboardView = undefined;
   }
 }
 
@@ -2408,6 +2542,9 @@ async function showDashboardOnce(ctx: ExtensionContext): Promise<HubAction | und
  * check and silently detached the client out from under the dashboard the
  * user was looking at. */
 let dashboardOpen = false;
+/** The live DashboardView, while one is open. The hub's /jobs command routes
+ * through this to open the jobs panel; cleared on dispose. */
+let dashboardView: DashboardView | undefined;
 
 async function showDashboardInner(ctx: ExtensionContext): Promise<HubAction | undefined> {
   // render(width) is given a width and no height, so the view cannot fit
@@ -2427,7 +2564,9 @@ async function showDashboardInner(ctx: ExtensionContext): Promise<HubAction | un
   let view: DashboardView | undefined;
   return ctx.ui.custom<HubAction | undefined>(
     (tui, theme, _keybindings, done) => {
-      view = new DashboardView(tui, theme, done, ctx.sessionManager.getSessionId(), ctx.cwd, initialMessage);
+      view = new DashboardView(tui, theme, done, ctx.sessionManager, ctx.cwd, initialMessage,
+        (body) => notifyDetached(ctx, body));
+      dashboardView = view;
       return view;
     },
     {
@@ -2499,6 +2638,40 @@ function dispatchHubAction(action: HubAction): { deferred: boolean; message?: st
  * no notification extension, no subagent package, no terminal-specific tools.
  * Optional integrations are feature-detected and degrade to absent.
  */
+/** True only when this session lives in tmux AND no client is attached —
+ * the one situation where the user cannot be watching this terminal.
+ * undefined = not in tmux, or tmux did not answer; treated as attended,
+ * because notifying someone who is already looking is noise. Hoisted to
+ * module scope so the jobs panel's macOS fallback notification can share
+ * it (see showDashboardInner). */
+function detachedInTmux(): boolean {
+  if (!process.env.TMUX) return false;
+  try {
+    const r = spawnSync(TMUX, ["display-message", "-p", "#{session_attached}"], { encoding: "utf8", timeout: 2000 });
+    return r.status === 0 && String(r.stdout || "").trim() === "0";
+  } catch { return false; }
+}
+let osascriptOk: boolean | undefined;
+/** Desktop notification, only when nobody is watching (in tmux, detached).
+ * Attached-session alerting belongs to whatever notifier the user runs;
+ * this fires precisely in the gap that tool cannot see a need for.
+ * stdlib-only: osascript on macOS, feature-detected once; elsewhere this is
+ * a no-op rather than a dependency. Text goes through argv, never spliced
+ * into the AppleScript source — prompts are attacker-adjacent input. */
+function notifyDetached(ctx: ExtensionContext, body: string): void {
+  if (process.platform !== "darwin" || !detachedInTmux()) return;
+  if (osascriptOk === undefined) osascriptOk = existsSync("/usr/bin/osascript");
+  if (!osascriptOk) return;
+  const title = `Pi — ${ctx.sessionManager.getSessionName() ?? basename(ctx.cwd)}`;
+  try {
+    const child = spawn("/usr/bin/osascript", [
+      "-e", "on run argv\n  display notification (item 1 of argv) with title (item 2 of argv)\nend run",
+      clean(body).slice(0, 200), title,
+    ], { stdio: "ignore" });
+    child.unref();
+  } catch { /* notification is best-effort, never worth disturbing the session */ }
+}
+
 function installSessionTracker(pi: ExtensionAPI) {
   let state: TitleState = "idle";
   let activity = "Session started.";
@@ -2556,7 +2729,6 @@ function installSessionTracker(pi: ExtensionAPI) {
   /** The prompt that started the current turn, kept so settling can say what
    * finished instead of erasing it with a generic "Waiting for input.". */
   let lastPrompt = "";
-  let osascriptOk: boolean | undefined;
   let ctxRef: ExtensionContext | undefined;
 
   const isInteractive = (ctx: ExtensionContext) =>
@@ -2623,36 +2795,6 @@ function installSessionTracker(pi: ExtensionAPI) {
     } catch {
       return false;
     }
-  }
-  /** True only when this session lives in tmux AND no client is attached —
-   * the one situation where the user cannot be watching this terminal.
-   * undefined = not in tmux, or tmux did not answer; treated as attended,
-   * because notifying someone who is already looking is noise. */
-  function detachedInTmux(): boolean {
-    if (!process.env.TMUX) return false;
-    try {
-      const r = spawnSync(TMUX, ["display-message", "-p", "#{session_attached}"], { encoding: "utf8", timeout: 2000 });
-      return r.status === 0 && String(r.stdout || "").trim() === "0";
-    } catch { return false; }
-  }
-  /** Desktop notification, only when nobody is watching (in tmux, detached).
-   * Attached-session alerting belongs to whatever notifier the user runs;
-   * this fires precisely in the gap that tool cannot see a need for.
-   * stdlib-only: osascript on macOS, feature-detected once; elsewhere this is
-   * a no-op rather than a dependency. Text goes through argv, never spliced
-   * into the AppleScript source — prompts are attacker-adjacent input. */
-  function notifyDetached(ctx: ExtensionContext, body: string): void {
-    if (process.platform !== "darwin" || !detachedInTmux()) return;
-    if (osascriptOk === undefined) osascriptOk = existsSync("/usr/bin/osascript");
-    if (!osascriptOk) return;
-    const title = `Pi — ${ctx.sessionManager.getSessionName() ?? basename(ctx.cwd)}`;
-    try {
-      const child = spawn("/usr/bin/osascript", [
-        "-e", "on run argv\n  display notification (item 1 of argv) with title (item 2 of argv)\nend run",
-        clean(body).slice(0, 200), title,
-      ], { stdio: "ignore" });
-      child.unref();
-    } catch { /* notification is best-effort, never worth disturbing the session */ }
   }
 
   pi.on("session_start", (e, ctx) => {
@@ -3208,6 +3350,31 @@ export default function piDashboard(pi: ExtensionAPI) {
   pi.registerFlag("agents-hub", {
     description: "Launch directly into the cross-session tmux-backed dashboard hub, looping until quit",
     type: "boolean",
+  });
+
+  // /jobs parity for the hub: the hub runs --no-tools --no-extensions, so
+  // pi-jobs' own /jobs and jobs_list tool never load there. This command
+  // opens the dashboard's jobs panel (or prints the list when no dashboard
+  // is open). In a normal session, pi-jobs registers its own /jobs — both
+  // sides implement the same marker contract, and whichever wins the name
+  // still lists/resumes/clears jobs.
+  pi.registerCommand("jobs", {
+    description: "Offload-job markers: open the jobs panel (enter show · r resume · c clear · X delete), or list markers when no dashboard is open",
+    handler: async (_args, ctx) => {
+      if (dashboardView) {
+        dashboardView.toggleJobsPanel();
+        return;
+      }
+      const jobs = scanJobs();
+      if (jobs.length === 0) {
+        ctx.ui.notify("No job markers in ~/.pi/jobs", "info");
+        return;
+      }
+      ctx.ui.notify(
+        jobs.map((j) => `${j.id} [${j.marker.status}${j.marker.summary ? ` | ${j.marker.summary}` : ""}]`).join("\n"),
+        "info",
+      );
+    },
   });
 
   pi.registerCommand("pi-dashboard", {

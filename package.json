@@ -1,7 +1,7 @@
 {
   "name": "pi-king",
   "version": "0.2.0",
-  "description": "tmux-backed session manager and supervisor for the Pi coding agent \u2014 background a session and come back to it later",
+  "description": "tmux-backed session manager and supervisor for the Pi coding agent — background a session and come back to it later",
   "keywords": [
     "pi",
     "pi-coding-agent",
@@ -53,11 +53,12 @@
   },
   "scripts": {
     "prepublishOnly": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs",
-    "check": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs",
+    "check": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs && node --test tools/jobs.test.mjs",
     "verify": "node tools/verify-metrics.mjs && node tools/verify-reboot-recovery.mjs && node tools/verify-live-pids.mjs",
     "verify:reboot": "node tools/verify-reboot-recovery.mjs",
     "verify:pids": "node tools/verify-live-pids.mjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test tools/jobs.test.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.83.0",

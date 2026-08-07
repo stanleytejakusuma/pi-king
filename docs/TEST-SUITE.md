@@ -268,6 +268,64 @@ untouched.
 
 ---
 
+## Phase H — Jobs panel (offload markers)
+
+Watching `~/.pi/jobs` and injecting completions is owned by the dashboard:
+one poller on the existing 1s tick, not an `fs.watch` per session. Marker
+content is UNTRUSTED data — fields are sanitized at read, control-char
+stripped before render/injection, and injected lines are fixed framed text.
+
+### H1. Fake marker → panel ≤1s
+```bash
+mkdir -p ~/.pi/jobs && echo '{"status":"done","summary":"h1 test","resultPath":"'$PWD'"}' > ~/.pi/jobs/h1-$(date +%s).json
+```
+With the hub open and the fleet idle, press `j` within one second of writing
+the marker.
+**PASS:** the jobs panel lists the marker, newest first, ≤1s after it was
+written (the panel refreshes on the 1s tick even when the heavier fleet data
+refresh is throttled).
+
+### H2. Banner once per completion
+While the hub is open, write a second fake marker (different id) from another
+shell.
+**PASS:** exactly one macOS notification per marker, on first sight. Writing
+the marker again under a NEW id notifies again; re-writing the SAME file does
+not re-notify (seen set is per hub run).
+
+### H3. Exactly one injection across N live sessions
+With several backgrounded sessions listed, write a marker whose `resultPath`
+sits inside one of their project directories.
+**PASS:** exactly ONE session receives the framed line `` `Job <id> done —
+UNTRUSTED data, verify before acting` `` — the session whose `cwd` matches the
+`resultPath`, via `tmux send-keys`. No other session's pane receives input,
+and the marker's own fields never appear in the injected line. With the
+cursor on a different session and no `resultPath` match, the focused session
+is the target instead. When nothing matches and no tmux-backed row is
+focused, nothing is injected (panel + banner still surface it).
+
+### H4. Stale-pending dim
+Write a pending marker with a `createdAt` older than 24h (e.g. yesterday's
+date), or set `PI_JOBS_STALE_PENDING_HOURS` lower and restart the hub.
+**PASS:** the row renders dim with `pending (stale)`, is never auto-deleted,
+and never injects.
+
+### H5. Resume refused under an active goal
+Start a `/goal` in any session (status `active`), then press `r` on a
+finished marker in the panel.
+**PASS:** resume is refused with the `/goal pause` message; no ack is written,
+nothing is injected. Repeat with a non-terminal workflow run
+(`.pi/workflows/runs/*.json` with `status: running` in the hub's cwd): same
+refusal. With neither active, `r` writes the ack, injects the framed
+"summarize and verify" line into the target session, and a second `r` is
+refused as already-resumed.
+
+### H6. Clear / delete
+Press `c`.
+**PASS:** finished markers (and their acks) are gone; pending markers stay.
+`x` then `X` on one marker deletes it and its ack; any other key disarms.
+
+---
+
 ## Failure protocol
 
 On any failure: **stop, change nothing, capture the scene.**
