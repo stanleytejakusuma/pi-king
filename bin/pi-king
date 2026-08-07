@@ -25,6 +25,9 @@ while [ -L "$SELF" ]; do
     *)  SELF="$(dirname "$SELF")/$LINK" ;;
   esac
 done
+# Absolute path: launchd runs the plist with cwd=/ and the install case
+# bakes SELF into the plist's ProgramArguments.
+SELF="$(cd "$(dirname "$SELF")" && pwd)/$(basename "$SELF")"
 HUB_DIR="$(cd "$(dirname "$SELF")/.." && pwd)/hub"
 EXTENSION="$(cd "$(dirname "$SELF")/.." && pwd)/src/index.ts"
 
