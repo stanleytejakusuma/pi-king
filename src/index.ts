@@ -2321,6 +2321,17 @@ class DashboardView implements Component {
         const idW = Math.min(28, Math.max(12, Math.floor(MEASURE * 0.2)));
         const statusW = 10;
         const timeW = 9;
+        const spawnerW = 16;
+        // sessionId → display name, from the live rows (the dashboard's own
+        // read of the fleet, same source the injector targets against).
+        const spawnerName = new Map<string, string>();
+        for (const r of this.rows) {
+          const e = r.entry;
+          if (r.kind === "session" && e?.sessionId) {
+            const nm = (e as { name?: string }).name?.trim();
+            spawnerName.set(e.sessionId, nm ? `${nm} #${e.sessionId.slice(0, 8)}` : `#${e.sessionId.slice(0, 8)}`);
+          }
+        }
         jobs.forEach((j, i) => {
           const sel = i === this.jobs.selected;
           if (sel) selectedLine = body.length;
@@ -2346,14 +2357,27 @@ class DashboardView implements Component {
             if (Number.isFinite(start) && Number.isFinite(end)) timeText = duration(end - start);
           }
           const time = th.fg("muted", pad(truncateToWidth(timeText, timeW, "\u2026", true), timeW));
+          // Spawner provenance: which session this job came from (job_spawn
+          // stamps spawnerSessionId since 0.2.5). Lets a misroute be spotted
+          // in the panel itself — a job delivered elsewhere while its
+          // "spawned by" column names a different session is a red flag.
+          const spawner = j.marker.spawnerSessionId
+            ? th.fg("dim", pad(
+                truncateToWidth(
+                  spawnerName.get(j.marker.spawnerSessionId) ?? `#${j.marker.spawnerSessionId.slice(0, 8)}`,
+                  spawnerW, "\u2026", true,
+                ),
+                spawnerW,
+              ))
+            : th.fg("dim", pad("\u2014", spawnerW));
           const summary = j.marker.summary
-            ? truncateToWidth(clean(j.marker.summary), Math.max(10, MEASURE - idW - statusW - timeW - 24), "\u2026", true)
+            ? truncateToWidth(clean(j.marker.summary), Math.max(10, MEASURE - idW - statusW - timeW - spawnerW - 24), "\u2026", true)
             : "";
           const right = j.marker.resultPath
             ? th.fg("dim", truncateToWidth(clean(j.marker.resultPath), 40, "\u2026", true))
             : "";
           body.push(split(
-            `  ${marker} ${sel ? th.bold(th.fg(hue, id)) : th.fg(hue, id)} ${th.fg(hue, status)} ${time} ` + th.fg("muted", summary),
+            `  ${marker} ${sel ? th.bold(th.fg(hue, id)) : th.fg(hue, id)} ${th.fg(hue, status)} ${time} ${spawner} ` + th.fg("muted", summary),
             right,
           ));
         });

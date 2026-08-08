@@ -174,7 +174,7 @@ export function scanJobs(dir: string = JOBS_DIR): Job[] {
  * (index.ts imports jobs.ts — the arrow must point one way only). */
 export type JobsRowLike = {
   kind: string;
-  entry?: { cwd?: string; tmuxName?: string; state?: string; updatedAt?: number; sessionId?: string };
+  entry?: { cwd?: string; tmuxName?: string; state?: string; updatedAt?: number; sessionId?: string; name?: string };
 };
 /** Structural view of the session manager, for the goal-mode execution guard.
  * getEntries() returns unknown[] because the real SessionEntry union's
