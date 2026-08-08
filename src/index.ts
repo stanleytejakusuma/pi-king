@@ -2326,9 +2326,10 @@ class DashboardView implements Component {
         // read of the fleet, same source the injector targets against).
         const spawnerName = new Map<string, string>();
         for (const r of this.rows) {
+          if (r.kind !== "session") continue;
           const e = r.entry;
-          if (r.kind === "session" && e?.sessionId) {
-            const nm = (e as { name?: string }).name?.trim();
+          if (e?.sessionId) {
+            const nm = e.name?.trim();
             spawnerName.set(e.sessionId, nm ? `${nm} #${e.sessionId.slice(0, 8)}` : `#${e.sessionId.slice(0, 8)}`);
           }
         }
