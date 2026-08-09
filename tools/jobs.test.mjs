@@ -238,13 +238,16 @@ test("resume guards: pending, acked, active goal, active workflow", async () => 
   assert.match(await panel.resume("g-ack", []), /not resumed/);
   assert.equal(existsSync(ACKS_DIR) ? readdirSync(ACKS_DIR).length : 0, 0, "no-target resume must not write an ack");
   // with a target: inject then ack → second resume refused
-  const ackRows = [sessionRow("/proj/alpha", "t-alpha")];
+  const ackRows = [sessionRow("/proj/alpha", "t-alpha", 0, "sess-alpha")];
   resetLog();
-  assert.match(await panel.resume("g-ack", ackRows, ackRows[0]), /Resumed job g-ack/);
+  writeMarker("g-owned", { status: "done", summary: "done once", spawnerSessionId: "sess-alpha" });
+  panel = new JobsPanel(noSession, "/proj/alpha", undefined);
+  panel.poll(Date.now(), ackRows);
+  assert.match(await panel.resume("g-owned", ackRows), /Resumed job g-owned/);
   const ackFiles = readdirSync(ACKS_DIR);
   assert.equal(ackFiles.length, 1);
   assert.ok(readFileSync(join(ACKS_DIR, ackFiles[0]), "utf8").includes("ackedAt"));
-  assert.match(await panel.resume("g-ack", ackRows), /already resumed/);
+  assert.match(await panel.resume("g-owned", ackRows), /already resumed/);
 
   // active goal_mode entry → refuse
   writeMarker("g-goal", { status: "done", summary: "under goal" });
@@ -277,11 +280,11 @@ test("resume happy path: ack + framed injection into the target session", async 
   resetJobsDir();
   resetLog();
   rmSync(ACKS_DIR, { recursive: true, force: true });
-  writeMarker("ok-1", { status: "failed", summary: "exit=2", resultPath: "/proj/alpha/out.log" });
+  writeMarker("ok-1", { status: "failed", summary: "exit=2", resultPath: "/proj/alpha/out.log", spawnerSessionId: "sess-alpha" });
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined); // seeds ok-1 → no auto-inject
-  const rows = [sessionRow("/proj/alpha", "t-alpha")];
+  const rows = [sessionRow("/proj/alpha", "t-alpha", 0, "sess-alpha")];
   panel.poll(Date.now(), rows);
-  const msg = await panel.resume("ok-1", rows, rows[0]);
+  const msg = await panel.resume("ok-1", rows);
   assert.match(msg, /Resumed job ok-1/);
   const log = readFileSync(logFile, "utf8").trim();
   assert.match(log, /send-keys -t t-alpha/);
@@ -328,18 +331,18 @@ test("resume injects before acking: failed injection keeps the job resumable", a
   resetLog();
   rmSync(ACKS_DIR, { recursive: true, force: true });
   mkdirSync(ACKS_DIR, { recursive: true });
-  const rows = [sessionRow("/proj/alpha", "t-alpha")];
-  writeMarker("f-1", { status: "done", summary: "flaky" });
+  const rows = [sessionRow("/proj/alpha", "t-alpha", 0, "sess-alpha")];
+  writeMarker("f-1", { status: "done", summary: "flaky", spawnerSessionId: "sess-alpha" });
   writeFileSync(failMarker, "fail");
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
   panel.poll(Date.now(), rows);
-  const failed = await panel.resume("f-1", rows, rows[0]);
+  const failed = await panel.resume("f-1", rows);
   assert.match(failed, /not resumed/);
   assert.match(failed, /nothing was acked/);
   assert.equal(readdirSync(ACKS_DIR).length, 0, "failed injection must not burn the ack");
   // retry after the failure clears: succeeds and acks
   rmSync(failMarker, { force: true });
-  const msg = await panel.resume("f-1", rows, rows[0]);
+  const msg = await panel.resume("f-1", rows);
   assert.match(msg, /Resumed job f-1/);
   assert.equal(readdirSync(ACKS_DIR).length, 1);
 });

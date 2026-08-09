@@ -422,16 +422,16 @@ export class JobsPanel {
    * project), then inject a framed report and ack ONLY on a successful
    * injection — a failed resume must not burn the job's ack. Returns the
    * message the dashboard should surface. */
-  async resume(id: string, rows: readonly JobsRowLike[], explicitTarget?: JobsRowLike): Promise<string> {
+  async resume(id: string, rows: readonly JobsRowLike[]): Promise<string> {
     const job = this.jobs.find((j) => j.id === id);
     if (!job) return `No job named ${clean(id)}`;
     if (job.marker.status === "pending") return `Job ${clean(id)} is still pending — nothing to resume yet.`;
     if (acked(job.id)) return `Job ${clean(id)} was already resumed (same marker content).`;
     if (await this.activeGoal()) return `A /goal is active — /goal pause first so the goal loop and this resume never run together.`;
-    // Automatic delivery is exact-owner-only. Manual resume is an explicit
-    // user action: callers may supply the selected dashboard row as the
-    // destination. Otherwise use the exact owner only — never a heuristic.
-    const target = explicitTarget ?? targetRow(job, rows);
+    // Panel resume stays owner-bound too. To deliver an ownerless/headless
+    // marker into a session explicitly, open that session and run
+    // `/jobs resume <id>` there — never guess another pane from this panel.
+    const target = targetRow(job, rows);
     // The workflow guard checks the TARGET session's project when the cwd
     // hint resolves (a run active in the target's .pi/workflows is the one
     // that would collide); the goal guard stays hub-scoped — the target
@@ -443,7 +443,7 @@ export class JobsPanel {
       return `A workflow run is active in ${target?.entry?.cwd ?? this.cwd} — wait for it or /workflow stop it before resuming.`;
     }
     if (!target?.entry?.tmuxName) {
-      return `Job ${clean(id)} not resumed — its owner has no verified tmux pane. Open that session, or select a dashboard session and resume explicitly.`;
+      return `Job ${clean(id)} not resumed — its owner has no verified tmux pane. Open the owner session and run /jobs resume ${clean(id)} there.`;
     }
     // Marker content is UNTRUSTED data. The report is framed as data to
     // summarize and verify — never as instructions to follow. Fields are
