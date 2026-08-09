@@ -25,7 +25,7 @@ import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 /** Control-sequence stripper, behavior-identical to data.ts's clean(): marker
  * content is UNTRUSTED data and every byte that reaches a terminal or a tmux
@@ -213,51 +213,20 @@ export function selectRestoreCards(
 }
 
 /**
- * Injection targeting — deterministic, dashboard-independent (a job can
- * land while nobody is looking at the panel):
- * 0. the marker's spawnerSessionId, matched EXACTLY against row session ids
- *    (job_spawn writes it — the ping goes home to the spawning session
- *    even when that session's process cwd differs from its row cwd, which
- *    is what broke the cwd tiers for the atlas-eval-supervisor job);
- * 1. the marker's cwd hint, then the dirname of its resultPath, matched
- *    against session cwds (exact or nested prefix, either direction);
- * 2. the most-recently-active tmux-backed session;
- * 3. nothing (banner + panel still surface the completion; r is the
- *    recovery path).
- * No cursor-row tier by design: the daemon has no cursor, and a job can
- * land while nobody is looking — the cursor row is always inside rows
- * anyway, so recency subsumes it.
- * Exported pure for the logic tests.
+ * Automatic injection is an identity operation, not a relevance guess.
+ * Only the exact spawner session may receive a job completion. If that
+ * session has no verified tmux pane (headless, invisible, exited, or not in
+ * this dashboard), return nothing: the macOS banner + Jobs panel surface the
+ * completion and manual resume remains available. Never substitute cwd,
+ * resultPath, or "most recent" sessions — those heuristics caused repeated
+ * cross-session interruptions.
  */
 export function targetRow(job: Job, rows: readonly JobsRowLike[]): JobsRowLike | undefined {
-  const cwdMatch = (hint: string, cwd: string): boolean => {
-    const h = hint.endsWith("/") ? hint : `${hint}/`;
-    const c = cwd.endsWith("/") ? cwd : `${cwd}/`;
-    return c === h || c.startsWith(h) || h.startsWith(c);
-  };
-  if (job.marker.spawnerSessionId) {
-    const home = rows.find(
-      (r) => r.kind === "session" && r.entry?.tmuxName && r.entry.sessionId === job.marker.spawnerSessionId,
-    );
-    if (home) return home;
-  }
-  const hints = [
-    job.marker.cwd,
-    job.marker.resultPath, // raw path: a result file sits inside its session's cwd, and a result DIR matches its own cwd exactly
-    job.marker.resultPath ? dirname(job.marker.resultPath) : undefined,
-  ].filter((h): h is string => typeof h === "string" && h.length > 0);
-  for (const hint of hints) {
-    const hit = rows.find(
-      (r) => r.kind === "session" && r.entry?.tmuxName && r.entry.cwd && cwdMatch(hint, r.entry.cwd),
-    );
-    if (hit) return hit;
-  }
-  let best: JobsRowLike | undefined;
-  for (const r of rows) {
-    if (r.kind !== "session" || !r.entry?.tmuxName) continue;
-    if (!best || (r.entry.updatedAt ?? 0) > (best.entry?.updatedAt ?? 0)) best = r;
-  }
-  return best;
+  const owner = job.marker.spawnerSessionId;
+  if (!owner) return undefined;
+  return rows.find(
+    (r) => r.kind === "session" && r.entry?.tmuxName && r.entry.sessionId === owner,
+  );
 }
 // Test override: PI_KING_TMUX points the panel at a fake binary that records
 // invocations, so the single-fire injection contract is observable. Default
@@ -309,6 +278,11 @@ export function claimInjected(id: string): boolean {
   } catch {
     return false; // already claimed, or unreadable — not our turn
   }
+}
+/** A claim authorizes one delivery attempt; failed send-keys must not burn it. */
+export function releaseInjected(id: string): void {
+  const claim = hashPathFor(id, INJECTED_DIR);
+  if (claim) rmSync(claim, { force: true });
 }
 
 /** Ack/claim file identity: sha256 of the RAW marker file, first 16 hex —
@@ -420,17 +394,22 @@ export class JobsPanel {
       for (const job of this.jobs) {
         if (job.marker.status === "pending" || this.seen.has(job.id)) continue;
         this.seen.add(job.id);
-        // Banner from every watcher that sees the completion ("panel/banner
-        // always"); the .injected claim decides who gets the ONE injection
-        // — hub daemon, dashboard, and session-side pi-jobs watchers race.
+        // Banner/panel are global observability. Conversation injection is an
+        // ownership operation and is attempted only for the exact spawner.
         notifyMacOS(
           `pi-king: ${clean(job.id)} ${job.marker.status}`,
           [job.marker.summary, job.marker.resultPath].filter(Boolean).join(" — ") || "job completed",
           this.notifyFallback,
         );
-        // Exactly one injection per marker: a successful auto-injection
-        // writes the ack, so the panel's r (resume) refuses a second one.
-        if (claimInjected(job.id) && injectOne(job, rows)) writeAck(job.id);
+        const target = targetRow(job, rows);
+        if (!target) return; // owner headless/invisible: panel + banner only; no claim burned
+        if (claimInjected(job.id)) {
+          if (injectOne(job, [target])) writeAck(job.id);
+          else {
+            releaseInjected(job.id);
+            this.seen.delete(job.id); // retry next tick; a failed send never loses the wake-up
+          }
+        }
         return; // one completion per tick
       }
     } finally {
@@ -443,13 +422,16 @@ export class JobsPanel {
    * project), then inject a framed report and ack ONLY on a successful
    * injection — a failed resume must not burn the job's ack. Returns the
    * message the dashboard should surface. */
-  async resume(id: string, rows: readonly JobsRowLike[]): Promise<string> {
+  async resume(id: string, rows: readonly JobsRowLike[], explicitTarget?: JobsRowLike): Promise<string> {
     const job = this.jobs.find((j) => j.id === id);
     if (!job) return `No job named ${clean(id)}`;
     if (job.marker.status === "pending") return `Job ${clean(id)} is still pending — nothing to resume yet.`;
     if (acked(job.id)) return `Job ${clean(id)} was already resumed (same marker content).`;
     if (await this.activeGoal()) return `A /goal is active — /goal pause first so the goal loop and this resume never run together.`;
-    const target = targetRow(job, rows);
+    // Automatic delivery is exact-owner-only. Manual resume is an explicit
+    // user action: callers may supply the selected dashboard row as the
+    // destination. Otherwise use the exact owner only — never a heuristic.
+    const target = explicitTarget ?? targetRow(job, rows);
     // The workflow guard checks the TARGET session's project when the cwd
     // hint resolves (a run active in the target's .pi/workflows is the one
     // that would collide); the goal guard stays hub-scoped — the target
@@ -461,7 +443,7 @@ export class JobsPanel {
       return `A workflow run is active in ${target?.entry?.cwd ?? this.cwd} — wait for it or /workflow stop it before resuming.`;
     }
     if (!target?.entry?.tmuxName) {
-      return `Job ${clean(id)} not resumed — no tmux session to inject into. Open the panel and press enter to read the report.`;
+      return `Job ${clean(id)} not resumed — its owner has no verified tmux pane. Open that session, or select a dashboard session and resume explicitly.`;
     }
     // Marker content is UNTRUSTED data. The report is framed as data to
     // summarize and verify — never as instructions to follow. Fields are

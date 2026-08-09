@@ -120,65 +120,30 @@ test("isStalePending: pending older than window, never terminal", () => {
   assert.equal(isStalePending({ status: "pending", createdAt: "2026-08-05T00:00:00Z" }, now, 0), false); // disabled
 });
 
-test("targetRow: spawnerSessionId exact match wins over cwd/recency (the atlas-eval-supervisor case)", () => {
+test("targetRow: only the exact spawner session is authorized for automatic injection", () => {
   const mk = (marker) => ({ id: "x", file: "", stale: false, marker });
-  // Spawner's row cwd is unrelated to the marker's cwd hint (the atlas bug:
-  // process cwd /tmp/atlas-minoml vs row cwd ~/codebase/atlas) — the exact
-  // session-id tier must still send the ping home.
   const rows = [
     sessionRow("/proj/atlas", "t-atlas", 10, "sess-atlas"),
     sessionRow("/proj/hustle", "t-hustle", 999, "sess-hustle"),
   ];
-  const job = mk({ status: "done", cwd: "/tmp/atlas-minoml", spawnerSessionId: "sess-atlas" });
-  assert.equal(targetRow(job, rows)?.entry?.tmuxName, "t-atlas");
-  // No session-id tier match (spawner headless) → falls through to cwd/recency
-  const orphan = mk({ status: "done", cwd: "/tmp/atlas-minoml", spawnerSessionId: "sess-gone" });
-  assert.equal(targetRow(orphan, rows)?.entry?.tmuxName, "t-hustle");
-  // tmux-less row with matching sessionId is skipped (still needs a pane)
+  // The exact id beats unrelated cwd/recency (the atlas case).
+  assert.equal(targetRow(mk({ status: "done", cwd: "/tmp/atlas-minoml", spawnerSessionId: "sess-atlas" }), rows)?.entry?.tmuxName, "t-atlas");
+  // An absent or pane-less owner must NEVER fall through into another session.
+  assert.equal(targetRow(mk({ status: "done", cwd: "/proj/hustle", spawnerSessionId: "sess-gone" }), rows), undefined);
   const noTmux = [{ kind: "session", entry: { cwd: "/x", sessionId: "sess-atlas" } }, sessionRow("/y", "t-y", 3, "sess-y")];
-  assert.equal(targetRow(mk({ status: "done", spawnerSessionId: "sess-atlas" }), noTmux)?.entry?.tmuxName, "t-y");
-});
-
-test("targetRow: cwd hint > resultPath dirname > most-recently-active > none", () => {
-  const mk = (marker) => ({ id: "x", file: "", stale: false, marker });
-  const rows = [
-    sessionRow("/proj/beta", "t-beta"),
-    sessionRow("/proj/alpha", "t-alpha"),
-    sessionRow("/proj/alpha/sub", "t-alpha-sub"),
-    { kind: "orphan" },
-  ];
-  // cwd field beats resultPath dirname and recency
-  const cwdJob = mk({ status: "done", cwd: "/proj/alpha", resultPath: "/proj/beta/out.txt" });
-  assert.equal(targetRow(cwdJob, rows)?.entry?.tmuxName, "t-alpha");
-  // resultPath dirname matched when no cwd field (older markers)
-  const rpJob = mk({ status: "done", resultPath: "/proj/alpha/out.txt" });
-  assert.equal(targetRow(rpJob, rows)?.entry?.tmuxName, "t-alpha");
-  // session nested inside the hint matches too
-  const subRows = [sessionRow("/proj/beta", "t-beta"), sessionRow("/proj/alpha/sub", "t-alpha-sub")];
-  assert.equal(targetRow(cwdJob, subRows)?.entry?.tmuxName, "t-alpha-sub");
-  // no hints → most-recently-active tmux-backed session
-  const recencyRows = [sessionRow("/proj/beta", "t-beta", 100), sessionRow("/proj/gamma", "t-gamma", 999)];
-  const noHint = mk({ status: "done" });
-  assert.equal(targetRow(noHint, recencyRows)?.entry?.tmuxName, "t-gamma");
-  // hint match without tmuxName is skipped; recency still applies
-  const noTmux = [{ kind: "session", entry: { cwd: "/proj/alpha" } }, sessionRow("/proj/delta", "t-delta", 5)];
-  assert.equal(targetRow(rpJob, noTmux)?.entry?.tmuxName, "t-delta");
-  // nothing tmux-backed at all → none
-  assert.equal(targetRow(noHint, [{ kind: "session", entry: { cwd: "/proj/alpha" } }]), undefined);
-  assert.equal(targetRow(noHint, []), undefined);
-  // exact-cwd hit (not just prefix)
-  const exact = mk({ status: "done", resultPath: "/proj/alpha" });
-  assert.equal(targetRow(exact, rows)?.entry?.tmuxName, "t-alpha");
+  assert.equal(targetRow(mk({ status: "done", spawnerSessionId: "sess-atlas" }), noTmux), undefined);
+  // Legacy/cron markers without an owner are panel + banner only.
+  assert.equal(targetRow(mk({ status: "done", cwd: "/proj/hustle" }), rows), undefined);
 });
 
 test("claimInjected: first writer wins across watchers", async () => {
-  const rows = [sessionRow("/proj/alpha", "t-alpha", 1)];
+  const rows = [sessionRow("/proj/alpha", "t-alpha", 1, "sess-alpha")];
   // watcher A (e.g. hub daemon) and watcher B (dashboard / session-side
   // pi-jobs) BOTH construct before the marker lands, so neither has it in
   // its seen set — the .injected claim, not the seen set, is the dedup.
   const panelA = new JobsPanel(noSession, "/proj/alpha", undefined);
   const panelB = new JobsPanel(noSession, "/proj/alpha", undefined);
-  writeMarker("claim-1", { status: "done", summary: "claim test" });
+  writeMarker("claim-1", { status: "done", summary: "claim test", spawnerSessionId: "sess-alpha" });
   panelA.poll(Date.now(), rows);
   await settle();
   const logAfterA = readLog().trim().split("\n").filter(Boolean);
@@ -225,8 +190,8 @@ test("poll: exactly one injection per marker (single-fire seen set)", async () =
   // Panel first: construction seeds `seen` with pre-existing markers, so a
   // marker written after open is what injects (per-hub-run semantics).
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
-  writeMarker("fire-1", { status: "done", summary: "boom", resultPath: "/proj/alpha/out.txt" });
-  const rows = [sessionRow("/proj/alpha", "t-alpha")];
+  writeMarker("fire-1", { status: "done", summary: "boom", resultPath: "/proj/alpha/out.txt", spawnerSessionId: "sess-alpha" });
+  const rows = [sessionRow("/proj/alpha", "t-alpha", 0, "sess-alpha")];
 
   panel.poll(Date.now(), rows);
   await settle();
@@ -275,7 +240,7 @@ test("resume guards: pending, acked, active goal, active workflow", async () => 
   // with a target: inject then ack → second resume refused
   const ackRows = [sessionRow("/proj/alpha", "t-alpha")];
   resetLog();
-  assert.match(await panel.resume("g-ack", ackRows), /Resumed job g-ack/);
+  assert.match(await panel.resume("g-ack", ackRows, ackRows[0]), /Resumed job g-ack/);
   const ackFiles = readdirSync(ACKS_DIR);
   assert.equal(ackFiles.length, 1);
   assert.ok(readFileSync(join(ACKS_DIR, ackFiles[0]), "utf8").includes("ackedAt"));
@@ -316,7 +281,7 @@ test("resume happy path: ack + framed injection into the target session", async 
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined); // seeds ok-1 → no auto-inject
   const rows = [sessionRow("/proj/alpha", "t-alpha")];
   panel.poll(Date.now(), rows);
-  const msg = await panel.resume("ok-1", rows);
+  const msg = await panel.resume("ok-1", rows, rows[0]);
   assert.match(msg, /Resumed job ok-1/);
   const log = readFileSync(logFile, "utf8").trim();
   assert.match(log, /send-keys -t t-alpha/);
@@ -331,12 +296,12 @@ test("poll seeds seen with pre-existing markers (no re-inject on reopen)", async
   resetLog();
   writeMarker("old-1", { status: "done", summary: "from before" });
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined); // seeds old-1
-  const rows = [sessionRow("/proj/alpha", "t-alpha")];
+  const rows = [sessionRow("/proj/alpha", "t-alpha", 0, "sess-alpha")];
   panel.poll(Date.now(), rows);
   await settle();
   assert.equal(readLog().trim(), "", "pre-existing markers must not inject");
   // a marker written after open still injects exactly once
-  writeMarker("new-1", { status: "done", summary: "while open", resultPath: "/proj/alpha/x" });
+  writeMarker("new-1", { status: "done", summary: "while open", resultPath: "/proj/alpha/x", spawnerSessionId: "sess-alpha" });
   panel.poll(Date.now(), rows);
   await settle();
   panel.poll(Date.now(), rows);
@@ -368,31 +333,60 @@ test("resume injects before acking: failed injection keeps the job resumable", a
   writeFileSync(failMarker, "fail");
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
   panel.poll(Date.now(), rows);
-  const failed = await panel.resume("f-1", rows);
+  const failed = await panel.resume("f-1", rows, rows[0]);
   assert.match(failed, /not resumed/);
   assert.match(failed, /nothing was acked/);
   assert.equal(readdirSync(ACKS_DIR).length, 0, "failed injection must not burn the ack");
   // retry after the failure clears: succeeds and acks
   rmSync(failMarker, { force: true });
-  const msg = await panel.resume("f-1", rows);
+  const msg = await panel.resume("f-1", rows, rows[0]);
   assert.match(msg, /Resumed job f-1/);
   assert.equal(readdirSync(ACKS_DIR).length, 1);
 });
 
-test("auto-injection acks the marker: exactly one injection per marker", async () => {
+test("auto-injection acks an exact-owner delivery exactly once", async () => {
   resetJobsDir();
   resetLog();
   rmSync(ACKS_DIR, { recursive: true, force: true });
   mkdirSync(ACKS_DIR, { recursive: true });
-  const rows = [sessionRow("/proj/alpha", "t-alpha")];
+  const rows = [sessionRow("/proj/alpha", "t-alpha", 0, "sess-alpha")];
   const panel = new JobsPanel(noSession, "/proj/alpha", undefined); // seeds nothing yet
-  writeMarker("auto-1", { status: "done", summary: "auto" });
+  writeMarker("auto-1", { status: "done", summary: "auto", spawnerSessionId: "sess-alpha" });
   panel.poll(Date.now(), rows);
   await settle();
   const lines = readLog().trim().split("\n").filter(Boolean);
   assert.equal(lines.length, 1, "auto-injection fires exactly once");
   assert.equal(readdirSync(ACKS_DIR).length, 1, "successful auto-injection writes the ack");
   assert.match(await panel.resume("auto-1", rows), /already resumed/);
+});
+
+test("automatic injection never substitutes a foreign session and burns no claim", async () => {
+  resetJobsDir();
+  resetLog();
+  rmSync(ACKS_DIR, { recursive: true, force: true });
+  rmSync(INJECTED_DIR, { recursive: true, force: true });
+  mkdirSync(ACKS_DIR, { recursive: true });
+  const foreign = [sessionRow("/proj/foreign", "t-foreign", 999, "sess-foreign")];
+  const panel = new JobsPanel(noSession, "/proj/foreign", undefined);
+  writeMarker("owner-absent", { status: "failed", cwd: "/proj/foreign", spawnerSessionId: "sess-owner" });
+  panel.poll(Date.now(), foreign);
+  await settle();
+  assert.equal(readLog(), "", "foreign pane must receive zero send-keys");
+  assert.equal(readdirSync(ACKS_DIR).length, 0, "undelivered job must not be acked");
+  assert.equal(existsSync(INJECTED_DIR) ? readdirSync(INJECTED_DIR).length : 0, 0, "undelivered job must not burn a claim");
+});
+
+test("legacy unstamped marker is panel-only, never automatic conversation injection", async () => {
+  resetJobsDir();
+  resetLog();
+  rmSync(ACKS_DIR, { recursive: true, force: true });
+  rmSync(INJECTED_DIR, { recursive: true, force: true });
+  const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
+  writeMarker("legacy-1", { status: "done", cwd: "/proj/alpha", summary: "legacy" });
+  panel.poll(Date.now(), [sessionRow("/proj/alpha", "t-alpha", 1, "sess-alpha")]);
+  await settle();
+  assert.equal(readLog(), "");
+  assert.equal(existsSync(INJECTED_DIR) ? readdirSync(INJECTED_DIR).length : 0, 0);
 });
 
 test("isStalePending: pending older than the window is stale, done never", () => {
