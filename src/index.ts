@@ -1664,23 +1664,55 @@ class DashboardView implements Component {
    * returning user's second question after "what did it do" is "did it leave
    * work uncommitted", and the directory header is where that belongs. */
   private gitDrift = new Map<string, { n: number; at: number }>();
+  /** Directories with a check in flight, so a slow git process (cold FS
+   * cache, a monorepo) is never fired twice concurrently for the same dir
+   * while a previous refresh() tick is still waiting on it. */
+  private gitDriftInFlight = new Set<string>();
+  /**
+   * Async and fire-and-forget by design: this runs on the SAME timer as
+   * keystroke handling (one Node event loop for the whole process), so a
+   * synchronous git spawn here freezes typing and scrolling for as long as
+   * git takes to answer. Measured live on this fleet: 11 project dirs, ~95ms
+   * each, ~1.0s TOTAL for one serial spawnSync sweep -- and because every
+   * directory's 10s cache entry is stamped in the same cold sweep, they
+   * expire together, so that full-second freeze recurred roughly every 10s
+   * for as long as any session was mid-turn (refresh() runs every tick, not
+   * just the idle cadence, while anyActive). spawn() + a completion callback
+   * keeps every check off the input path; results land whenever git answers
+   * and requestRender() picks them up on the next paint, same as any other
+   * async update in this file. */
   private refreshGitDrift(): void {
     const dirs = new Set<string>();
     for (const r of this.rows) if (r.kind === "session") dirs.add(r.entry.cwd);
     for (const dir of dirs) {
       const hit = this.gitDrift.get(dir);
       if (hit && Date.now() - hit.at < 10_000) continue;
+      if (this.gitDriftInFlight.has(dir)) continue;
+      this.gitDriftInFlight.add(dir);
+      let out = "";
+      let settled = false;
+      const finish = (n: number) => {
+        if (settled) return; // 'close' then 'error', or a timeout race -- only the first result counts
+        settled = true;
+        this.gitDriftInFlight.delete(dir);
+        this.gitDrift.set(dir, { n, at: Date.now() });
+        this.tui.requestRender();
+      };
       try {
-        const r = spawnSync("git", ["-C", dir, "status", "--porcelain"], { encoding: "utf8", timeout: 1500 });
-        if (r.status === 0) {
-          const n = String(r.stdout || "").split("\n").filter((l) => l.trim().length > 0).length;
-          this.gitDrift.set(dir, { n, at: Date.now() });
-        } else {
+        const child = spawn("git", ["-C", dir, "status", "--porcelain"], { stdio: ["ignore", "pipe", "ignore"] });
+        // Same 1500ms budget as the old spawnSync timeout, just not blocking
+        // anything while it counts down.
+        const killer = setTimeout(() => { try { child.kill(); } catch { /* already gone */ } }, 1500);
+        child.stdout?.on("data", (d) => { out += d; });
+        child.on("error", () => { clearTimeout(killer); finish(-1); });
+        child.on("close", (code) => {
+          clearTimeout(killer);
           // Not a repo, or git unhappy: record the miss so it is not retried
           // every second, and render nothing rather than a guessed zero.
-          this.gitDrift.set(dir, { n: -1, at: Date.now() });
-        }
+          finish(code === 0 ? out.split("\n").filter((l) => l.trim().length > 0).length : -1);
+        });
       } catch {
+        this.gitDriftInFlight.delete(dir);
         this.gitDrift.set(dir, { n: -1, at: Date.now() });
       }
     }

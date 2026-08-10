@@ -221,6 +221,26 @@ grep -E "^import" ~/.pi/agent/extensions/pi-dashboard.ts | grep -vE "node:|@eare
 **PASS:** no output. pi-king must depend on stock Pi and the node standard
 library only.
 
+### F6. Git-drift refresh never blocks input (2026-08-10 fix)
+Background: `refreshGitDrift()` used to run `spawnSync("git", ["status",
+"--porcelain"])` serially per unique project directory, on the SAME event
+loop that handles keystrokes — measured live on an 11-directory fleet at
+~1.0s total, blocking, recurring roughly every 10s while any session was
+`working` (refresh() runs every tick under `anyActive`, and all 11 caches
+expire together since they were stamped in the same cold sweep). This is
+what "scrolling / going through sessions is laggy" traced back to.
+
+With many sessions across many project directories, and at least one
+`working`:
+```bash
+for i in 1 2 3 4 5 6 7 8; do echo -n .; done  # tap arrow keys during this window instead
+```
+**PASS:** `↑`/`↓` selection and typing stay responsive throughout — no
+multi-hundred-ms freeze, including right after opening the dashboard (cold
+cache, every directory's badge unknown until its async check resolves and
+the row repaints). Git-drift badges may lag a beat behind the row appearing;
+they must never make the row appear late.
+
 ---
 
 ## Phase G — Startup restart (`r`)
