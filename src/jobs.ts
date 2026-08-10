@@ -488,6 +488,17 @@ export class JobsPanel {
   }
 
   private async pollAsync(getRows: () => readonly JobsRowLike[]): Promise<void> {
+    // Memoized, not called eagerly: most ticks resolve nothing and must fork
+    // nothing (see poll()'s own doc comment). But it must be called AT MOST
+    // ONCE per tick, not once per marker considered — a fresh buildRows() per
+    // marker meant N simultaneously-unresolved markers cost N fleet scans in
+    // the same second. Live evidence: two markers whose owner session is
+    // invisible (visible:false, no tmux pane — exact-owner-only delivery
+    // correctly never resolves them, by design) drove the daemon from the
+    // measured 0.00% idle baseline back up to ~5%, because every tick called
+    // getRows() twice chasing targets that structurally can never exist.
+    let rows: readonly JobsRowLike[] | undefined;
+    const rowsOnce = (): readonly JobsRowLike[] => (rows ??= getRows());
     try {
       for (const job of this.jobs) {
         if (this.resolved.has(job.id)) continue; // confirmed delivered on a prior tick — never re-checked
@@ -524,7 +535,7 @@ export class JobsPanel {
             this.notifyFallback,
           );
         }
-        const target = targetRow(job, getRows());
+        const target = targetRow(job, rowsOnce());
         // Every skip below is `continue`, never `return`: these are facts
         // about ONE marker, and an undeliverable marker (no owner, owner
         // mid-turn) must not block delivery of every marker sorted behind

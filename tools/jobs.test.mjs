@@ -557,3 +557,24 @@ test("resolved markers are never re-checked after the first tick that confirms d
     "a resolved marker must stay resolved in-memory even if its ack/claim files vanish -- disk is never re-checked",
   );
 });
+
+test("multiple unresolved markers in one tick call the rows provider at most once", async () => {
+  resetJobsDir();
+  resetLog();
+  // Two markers whose owner is not in rows at all (e.g. invisible/headless
+  // spawner — exact-owner-only delivery correctly never resolves these) plus
+  // one deliverable marker. Before the fix, targetRow(job, getRows()) called
+  // getRows() fresh per marker considered, so N stuck markers cost N fleet
+  // scans in the same tick — live evidence: two permanently-unresolved
+  // markers (owner visible:false, no tmux pane) kept the daemon at ~5% CPU
+  // instead of the measured 0.00% idle baseline.
+  writeMarker("stuck-a", { status: "done", summary: "a", spawnerSessionId: "ghost-a" });
+  writeMarker("stuck-b", { status: "failed", summary: "b", spawnerSessionId: "ghost-b" });
+  const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
+  let calls = 0;
+  const provider = () => { calls++; return []; }; // neither ghost-a nor ghost-b ever matches
+  panel.poll(Date.now(), provider);
+  await settle();
+  assert.equal(calls, 1, `rows provider must be called at most once per tick regardless of how many markers are considered (got ${calls} calls)`);
+  assert.equal(readLog().trim(), "", "neither ghost owner resolves, so nothing is injected");
+});
