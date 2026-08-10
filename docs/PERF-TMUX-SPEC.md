@@ -293,6 +293,29 @@ do not touch GitHub.
   Proposal template; PR only if a maintainer grants `lgtm`. Draft at
   `docs/UPSTREAM-ISSUE-DRAFT.md`; Stanley personalizes (own-voice rule) and
   submits manually — never via automation (their blocking policy).
+- 2026-08-11: **Fix 3 applied to ~/.tmux.conf** (Stanley approved, agent
+  applied): (1) `terminal-overrides` RGB pattern corrected from
+  `xterm-256color` (never matched, dead config) to `tmux-256color` (what
+  `default-terminal` actually is); (2) `update-environment` gained
+  `COLORTERM TERM_PROGRAM GHOSTTY_RESOURCES_DIR` -- these were never
+  forwarded into panes at all before (found live: absent from every real
+  session's env), so nothing inside a session could detect it was really
+  running under Ghostty's true-color/feature set; (3) the originally-
+  proposed `terminal-features 'xterm-ghostty:sync'` line. All three
+  verified end-to-end in a sandbox (private socket, real attach, real new
+  pane) before touching the live server: COLORTERM=truecolor and
+  GHOSTTY_RESOURCES_DIR correctly propagate to newly spawned panes after a
+  real attach (TERM_PROGRAM does not -- tmux always stamps its own "tmux"
+  value for spawned panes, a tmux behavior with no config workaround; note
+  terminal-image.js's own Ghostty-detection already has a
+  GHOSTTY_RESOURCES_DIR fallback for exactly this reason). Live reload via
+  `tmux source-file`: 19 sessions before/after, zero broken cards.
+  Honest caveat: measured round-trip keystroke-echo latency through tmux
+  vs native is statistically identical (both <0.1ms p50, n=60) -- these are
+  real capability-signaling correctness fixes (color fidelity, feature
+  detection, atomic large-redraw passthrough), not a proven fix for
+  subjective "choppy typing"; that raw-transport measurement found no gap
+  to close there. Real-feel verification is Stanley's alone to judge.
 - 2026-08-10: diagnostic = **yes** (Stanley). `PI_DEBUG_REDRAW=1` staged via
   `tmux set-environment` on 'Alexandria (RAG Design)' — inert until the
   session's next natural respawn (NOT forced: the pane's pi currently
