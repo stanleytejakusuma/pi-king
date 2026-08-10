@@ -130,12 +130,14 @@ cd "$HUB_DIR" || exit 1
 while true; do
   : > "$ACTION_FILE"
 
-  # Load only this package's extension. The hub is a launcher: it lists
+  # Loads ONLY this package's extension. The hub is a launcher: it lists
   # sessions and hands the terminal to tmux, and it never calls a model, so
-  # every other extension is startup cost for nothing. On the machine this was
-  # written on that was 5.2s against 1.3s, almost all of it one router
-  # extension. Sessions STARTED from here are unaffected: they are separate
-  # processes and load the full configuration.
+  # every other extension is startup cost for nothing. Measured 2026-08-09 on
+  # this machine: bare boot 0.44s, full normal-session package set 1.60s, and
+  # almost all of that ~1.16s is two packages (@quintinshaw/pi-dynamic-workflows
+  # +0.91s, pi-hermes-memory +0.55s) — NOT a router extension, and not this
+  # extension, which costs +0.01s despite its size. Sessions STARTED from here
+  # are unaffected: they are separate processes and load the full configuration.
   if [ -f "$EXTENSION" ]; then
     pi --no-session --no-tools --no-context-files --no-skills        --no-extensions --extension "$EXTENSION" --agents-hub "$@"
   else

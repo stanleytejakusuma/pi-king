@@ -68,6 +68,10 @@ export interface JobMarker {
   /** Session id of the session that spawned the job (job_spawn writes it) —
    * the injector's first targeting tier is an exact session match. */
   spawnerSessionId?: string;
+  /** Worker pid, written by the wrapper's pending marker. Load-bearing for
+   * orphan detection: a pending marker whose worker is gone will never
+   * transition to a terminal status on its own. */
+  pid?: number;
   createdAt?: string;
   completedAt?: string;
 }
@@ -78,6 +82,24 @@ export interface Job {
   /** pending marker older than PI_JOBS_STALE_PENDING_HOURS (default 24h) —
    * likely orphaned. Rendered dim; never auto-deleted. */
   stale: boolean;
+  /** pending marker whose worker process is confirmably gone: the job died
+   * without ever writing a terminal status, so nothing will complete it.
+   * Stronger than `stale` (which is only an age heuristic). */
+  orphaned: boolean;
+}
+
+/** Is this pending marker's worker gone? Signal 0 probes liveness without
+ * forking and without touching the process. EPERM means the pid exists but
+ * belongs to someone else — alive as far as we are concerned. Fails SAFE:
+ * a recycled pid reads as alive, so a live job is never mislabelled dead. */
+export function workerDead(marker: JobMarker): boolean {
+  if (marker.status !== "pending" || !marker.pid) return false;
+  try {
+    process.kill(marker.pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "EPERM";
+  }
 }
 /** Marker content is DATA, never instructions: strip control chars, cap length. */
 export function sanitizeField(value: unknown, max: number): string | undefined {
@@ -103,6 +125,10 @@ export function validateMarker(raw: string): JobMarker | null {
   // cwd: the job's home project — the deterministic targeting hint. Absent
   // in older markers: targeting falls back to resultPath, then recency.
   marker.cwd = sanitizeField(m.cwd, MAX_CWD_CHARS);
+  // pid is a NUMBER, so it never goes through sanitizeField (which is for
+  // untrusted strings). Anything non-positive or non-finite is dropped
+  // rather than trusted — it is only ever used as a liveness probe target.
+  if (typeof m.pid === "number" && Number.isFinite(m.pid) && m.pid > 0) marker.pid = Math.floor(m.pid);
   marker.spawnerSessionId = sanitizeField(m.spawnerSessionId, 64);
   marker.createdAt = sanitizeField(m.createdAt, 64);
   marker.completedAt = sanitizeField(m.completedAt, 64);
@@ -134,6 +160,13 @@ export function sortJobs(jobs: Job[]): Job[] {
 // are re-read and re-validated. Marker dirs are small, but a hub that lives
 // for days re-reads every marker every second otherwise.
 const markerCache = new Map<string, { mtimeMs: number; marker: JobMarker | null }>();
+// Deliberately NOT short-circuited on the jobs directory's own mtime: the
+// wrapper rewrites a marker IN PLACE for pending -> terminal, which leaves
+// the dir mtime untouched, so a dir-level skip would miss the one transition
+// this whole system exists to notice. The per-file stat pass is syscall-only
+// (no forks, page-cached) and is not where the daemon's cost lives — that is
+// buildRows(), which the daemon now calls lazily (see JobsPanel.poll).
+let dirScanCache: { mtimeMs: number; size: number; jobs: Job[] } | undefined;
 /** Read + validate every marker in the jobs dir, newest first. Malformed or
  * unreadable markers are skipped (visible in the dir, ignorable in the UI). */
 export function scanJobs(dir: string = JOBS_DIR): Job[] {
@@ -163,7 +196,13 @@ export function scanJobs(dir: string = JOBS_DIR): Job[] {
       continue; // unreadable marker — ignored, visible in the dir
     }
     if (!marker) continue;
-    jobs.push({ id: f.slice(0, -5), marker, file, stale: isStalePending(marker, Date.now(), STALE_PENDING_MS) });
+    jobs.push({
+      id: f.slice(0, -5),
+      marker,
+      file,
+      stale: isStalePending(marker, Date.now(), STALE_PENDING_MS),
+      orphaned: workerDead(marker),
+    });
   }
   // Drop cache entries for markers that have since been deleted.
   for (const file of markerCache.keys()) if (!seenFiles.has(file)) markerCache.delete(file);
@@ -174,8 +213,32 @@ export function scanJobs(dir: string = JOBS_DIR): Job[] {
  * (index.ts imports jobs.ts — the arrow must point one way only). */
 export type JobsRowLike = {
   kind: string;
-  entry?: { cwd?: string; tmuxName?: string; state?: string; updatedAt?: number; sessionId?: string; name?: string };
+  entry?: {
+    cwd?: string;
+    tmuxName?: string;
+    state?: string;
+    updatedAt?: number;
+    sessionId?: string;
+    name?: string;
+    /** Mirrors DashboardEntry.subagents — needed for the mid-turn guard
+     * (see isSettledRow), which must agree with index.ts's isSettled. */
+    subagents?: readonly { status?: string }[];
+  };
 };
+
+/** Structural twin of index.ts's isSettled(entry), which every OTHER
+ * send-keys path in this project already respects: typing into a pane whose
+ * agent is mid-turn lands text inside an in-flight response, and subagents
+ * are checked directly rather than trusted to show up as "working".
+ * Duplicated structurally rather than imported because jobs.ts must not
+ * import index.ts (the dependency arrow points one way). A row with no
+ * entry is never settled — nothing to verify means nothing to type into. */
+export function isSettledRow(row: JobsRowLike | undefined): boolean {
+  const entry = row?.entry;
+  if (!entry) return false;
+  if (entry.state === "working") return false;
+  return !(entry.subagents ?? []).some((s) => s?.status === "running" || s?.status === "queued");
+}
 /** Structural view of the session manager, for the goal-mode execution guard.
  * getEntries() returns unknown[] because the real SessionEntry union's
  * `data` field is `unknown` — the pi-jobs code casts per-entry for the same
@@ -298,6 +361,15 @@ export function hashPathFor(id: string, dir: string): string | null {
   }
 }
 
+/** Has ANY watcher already claimed delivery of this marker? Because a failed
+ * send releases its claim (see releaseInjected), a surviving claim means
+ * "delivered, or being delivered right now" — which is exactly what manual
+ * resume must not duplicate. */
+export function claimed(id: string): boolean {
+  const claim = hashPathFor(id, INJECTED_DIR);
+  return claim !== null && existsSync(claim);
+}
+
 export function acked(id: string): boolean {
   const ack = hashPathFor(id, ACKS_DIR);
   return ack !== null && existsSync(ack);
@@ -335,9 +407,11 @@ export class JobsPanel {
   selected = 0;
   /** Job id armed for deletion (x arms, X fires) — cleared by any other key. */
   deleteArmedFor: string | null = null;
-  /** Marker ids already notified/injected this hub run: exactly one
-   * injection per marker per process, however many times poll runs. */
-  private seen = new Set<string>();
+  /** Marker ids already BANNERED by this process. Deliberately not a
+   * delivery record: delivery is tracked on disk (.injected claim + .acks),
+   * so a marker whose injection has to wait for the owner to finish its turn
+   * retries on later ticks WITHOUT re-notifying. */
+  private notified = new Set<string>();
   private lastPurge = 0;
   /** Serializes pollAsync: two overlapping polls must not both claim the
    * same unseen marker before either adds it to `seen`. */
@@ -353,14 +427,14 @@ export class JobsPanel {
     this.sessionManager = sessionManager;
     this.cwd = cwd;
     this.notifyFallback = notifyFallback;
-    // Seed the seen set with every marker that already exists: within one
-    // process (a hub run spans many dashboard opens across attach/detach
-    // cycles, each with its own panel instance), a marker injects exactly
-    // once, and only markers written while the dashboard is open inject at
-    // all. Markers that finished while the hub was closed stay visible in
-    // the list — /jobs resume is their recovery path, same as pi-jobs'
-    // session_start seeding.
-    for (const job of scanJobs()) this.seen.add(job.id);
+    // Seed the notified set with every marker that ALREADY reached a
+    // terminal status: those completions are old news, and bannering them
+    // at every hub start (or every dashboard open) would be noise. Pending
+    // markers are deliberately NOT seeded — a job that is still running when
+    // this process starts must still announce itself when it finishes, which
+    // is exactly the case the old "seed everything" seeding swallowed
+    // (a job spanning a daemon restart never notified at all).
+    for (const job of scanJobs()) if (job.marker.status !== "pending") this.notified.add(job.id);
   }
 
   get list(): Job[] {
@@ -370,10 +444,17 @@ export class JobsPanel {
   /**
    * The one poll cadence: called from the dashboard's existing tick (see
    * index.ts). Refreshes the list, sweeps retention at most hourly, and
-   * fires at most ONE newly-seen terminal completion per tick (notify +
-   * inject) — the next tick picks up the next one.
+   * fires at most ONE completion per tick (notify + inject) — the next tick
+   * picks up the next one.
+   *
+   * `getRows` is a PROVIDER, not an array, because the two callers have
+   * opposite costs: the dashboard already built its rows to render them
+   * (free), while the daemon would have to run buildRows() — ps, tmux
+   * list-sessions, git-status caches, i.e. real subprocesses — purely to
+   * have them on hand. In steady state there is nothing to deliver, so the
+   * provider is never called and an idle daemon tick forks NOTHING.
    */
-  poll(now: number, rows: readonly JobsRowLike[]): void {
+  poll(now: number, getRows: () => readonly JobsRowLike[]): void {
     this.jobs = scanJobs();
     // Selection must stay in bounds in BOTH directions: a marker arriving
     // into an empty list must select itself (first row), and a marker
@@ -382,33 +463,75 @@ export class JobsPanel {
     else this.selected = Math.min(this.jobs.length - 1, Math.max(0, this.selected));
     if (now - this.lastPurge >= RETENTION_POLL_MS) {
       this.lastPurge = now;
-      void this.purgeOld();
+      void this.purgeOld().catch(() => {}); // retention is best-effort, never fatal
     }
     if (this.polling) return;
     this.polling = true;
-    void this.pollAsync(rows);
+    // Floating promise by design (poll is called from a render tick), so its
+    // rejection must be swallowed HERE: unhandled, it reaches the daemon's
+    // process level, and launchd's KeepAlive turns one bad tick into a
+    // respawn — each of which re-runs boot restore and spawns sessions.
+    void this.pollAsync(getRows).catch((err) => {
+      console.error(`[pi-king] jobs poll failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
   }
 
-  private async pollAsync(rows: readonly JobsRowLike[]): Promise<void> {
+  private async pollAsync(getRows: () => readonly JobsRowLike[]): Promise<void> {
     try {
       for (const job of this.jobs) {
-        if (job.marker.status === "pending" || this.seen.has(job.id)) continue;
-        this.seen.add(job.id);
+        if (job.marker.status === "pending") {
+          // A pending job whose worker is gone will never complete itself.
+          // Say so once: silence here is how a killed job's work went
+          // missing with nothing on screen but a dimmed row.
+          if (job.orphaned && !this.notified.has(job.id)) {
+            this.notified.add(job.id);
+            notifyMacOS(
+              `pi-king: ${clean(job.id)} died`,
+              `worker pid ${job.marker.pid} is gone — no report was ever written`,
+              this.notifyFallback,
+            );
+          }
+          continue;
+        }
+        // Delivery state lives on disk so it is shared with every other
+        // watcher (daemon, dashboard, session-side pi-jobs). A surviving
+        // claim means delivered-or-in-flight, because a failed send
+        // releases its own claim below.
+        if (acked(job.id) || claimed(job.id)) {
+          this.notified.add(job.id);
+          continue;
+        }
         // Banner/panel are global observability. Conversation injection is an
         // ownership operation and is attempted only for the exact spawner.
-        notifyMacOS(
-          `pi-king: ${clean(job.id)} ${job.marker.status}`,
-          [job.marker.summary, job.marker.resultPath].filter(Boolean).join(" — ") || "job completed",
-          this.notifyFallback,
-        );
-        const target = targetRow(job, rows);
-        if (!target) return; // owner headless/invisible: panel + banner only; no claim burned
+        if (!this.notified.has(job.id)) {
+          this.notified.add(job.id);
+          notifyMacOS(
+            `pi-king: ${clean(job.id)} ${job.marker.status}`,
+            [job.marker.summary, job.marker.resultPath].filter(Boolean).join(" — ") || "job completed",
+            this.notifyFallback,
+          );
+        }
+        const target = targetRow(job, getRows());
+        // Every skip below is `continue`, never `return`: these are facts
+        // about ONE marker, and an undeliverable marker (no owner, owner
+        // mid-turn) must not block delivery of every marker sorted behind
+        // it. Only an actual delivery ends the tick.
+        if (!target) continue; // owner headless/invisible: panel + banner only; no claim burned
+        // Every other send-keys path in this project refuses to type into a
+        // pane mid-turn (see isSettled in index.ts) because the text lands
+        // inside an in-flight response. Injection is no different, and it is
+        // the one that fires unattended: wait for the owner to settle and
+        // retry on a later tick rather than claiming and corrupting a turn.
+        if (!isSettledRow(target)) continue;
+        // A workflow run owns its project's execution the same way a turn
+        // owns the pane; do not interrupt one to hand it a job report.
+        // ponytail: ceiling — a /goal active INSIDE the owner session is not
+        // visible cross-process (its state lives in that process), so the
+        // mid-turn guard above is what covers a running goal loop.
+        if (await this.activeWorkflowRun(target.entry?.cwd ?? this.cwd)) continue;
         if (claimInjected(job.id)) {
           if (injectOne(job, [target])) writeAck(job.id);
-          else {
-            releaseInjected(job.id);
-            this.seen.delete(job.id); // retry next tick; a failed send never loses the wake-up
-          }
+          else releaseInjected(job.id); // retry next tick; the banner is not repeated
         }
         return; // one completion per tick
       }
@@ -425,8 +548,16 @@ export class JobsPanel {
   async resume(id: string, rows: readonly JobsRowLike[]): Promise<string> {
     const job = this.jobs.find((j) => j.id === id);
     if (!job) return `No job named ${clean(id)}`;
-    if (job.marker.status === "pending") return `Job ${clean(id)} is still pending — nothing to resume yet.`;
+    if (job.marker.status === "pending") {
+      return job.orphaned
+        ? `Job ${clean(id)} died — its worker (pid ${job.marker.pid}) is gone and no report was ever written. Nothing to resume; x then X deletes the marker.`
+        : `Job ${clean(id)} is still pending — nothing to resume yet.`;
+    }
     if (acked(job.id)) return `Job ${clean(id)} was already resumed (same marker content).`;
+    // A surviving claim means another watcher already delivered this report
+    // (a failed send releases its claim), so resuming would hand the owner
+    // the same job twice.
+    if (claimed(job.id)) return `Job ${clean(id)} was already delivered to its owner session.`;
     if (await this.activeGoal()) return `A /goal is active — /goal pause first so the goal loop and this resume never run together.`;
     // Panel resume stays owner-bound too. To deliver an ownerless/headless
     // marker into a session explicitly, open that session and run
@@ -495,7 +626,7 @@ export class JobsPanel {
     const claim = hashPathFor(job.id, INJECTED_DIR);
     if (claim) rmSync(claim, { force: true });
     rmSync(job.file, { force: true });
-    this.seen.delete(job.id);
+    this.notified.delete(job.id);
   }
 
   /** Execution guard, ported verbatim from pi-jobs: refuse autonomous

@@ -292,16 +292,19 @@ shell.
 the marker again under a NEW id notifies again; re-writing the SAME file does
 not re-notify (seen set is per hub run).
 
-### H3. Exactly one injection across N live sessions
-With several backgrounded sessions listed, write a marker whose `resultPath`
-sits inside one of their project directories.
-**PASS:** exactly ONE session receives the framed line `` `Job <id> done —
-UNTRUSTED data, verify before acting` `` — the session whose `cwd` matches the
-`resultPath`, via `tmux send-keys`. No other session's pane receives input,
-and the marker's own fields never appear in the injected line. With the
-cursor on a different session and no `resultPath` match, the focused session
-is the target instead. When nothing matches and no tmux-backed row is
-focused, nothing is injected (panel + banner still surface it).
+### H3. Exactly one injection, and only to the owner
+With several backgrounded sessions listed, write a marker carrying the
+`spawnerSessionId` of ONE of them (this is what the job wrapper records).
+**PASS:** exactly that session receives the framed line `` `Job <id> done —
+UNTRUSTED data, verify before acting` `` via `tmux send-keys`. No other
+session's pane receives input, and the marker's own fields never appear in the
+injected line. Targeting is an identity match, NOT a relevance guess: a marker
+whose spawner is gone, headless, or not on this dashboard injects NOWHERE
+(panel + banner still surface it; `r` in the owner session is the recovery
+path). `cwd`, `resultPath`, "most recently active", and the cursor row are
+deliberately NOT fallbacks — those heuristics caused repeated cross-session
+interruptions and were removed in `a1e94cf`. Do not "fix" the code to match an
+older description of this test.
 
 ### H4. Stale-pending dim
 Write a pending marker with a `createdAt` older than 24h (e.g. yesterday's
@@ -353,9 +356,26 @@ While the daemon is live and sessions are attached, write one fake marker
 With the daemon installed: `tmux kill-server` (daemon restarts it via `start-server` on its next tick only if the daemon itself restarts — kill-server alone leaves the daemon's tick running, so instead: `bin/pi-king --daemon-uninstall` + `tmux kill-server` + `--daemon-install`).
 **PASS:** `~/.pi/king/hub.log` shows `restored N sessions` and the full fleet's tmux windows exist again within ~10s; exited/invisible cards are NOT recreated. (Automated logic equivalent: `tools/jobs.test.mjs` `selectRestoreCards`.)
 
-### I5. Deterministic targeting
-Write a marker with `"cwd":"/abs/path/to/project"` whose project session exists.
-**PASS:** the injection lands in that project's session, not the most-recently-active one. A marker without `cwd`/`resultPath` lands in the most-recently-active tmux-backed session (never the cursor row — the daemon has no cursor).
+### I5. Owner-only targeting, and the mid-turn hold
+Write a marker carrying the `spawnerSessionId` of a live tmux-backed session.
+**PASS:** the injection lands in that exact session. A marker with only
+`cwd`/`resultPath` and no resolvable owner lands NOWHERE by design (banner +
+panel only).
+
+Then repeat while that owner session is mid-turn (start a long turn in it, or
+leave a subagent running) and write a second marker for it.
+**PASS:** nothing is typed into the pane while it is working, and
+`~/.pi/jobs/.injected/` gains NO claim for that marker; once the turn
+finishes, the next 1s tick delivers it exactly once and writes the ack. This
+is the same `isSettled` rule the rename path uses — typing into a pane
+mid-turn lands text inside an in-flight response.
+
+### I6. Orphaned pending job (dead worker)
+With a `pending` marker whose recorded `pid` is gone (kill a wrapper mid-run):
+**PASS:** the row renders as `died` in error colour rather than a dim
+`pending`, one banner announces it, nothing is injected, and `r` explains that
+the worker is gone and no report was ever written (`x` then `X` deletes it).
+The marker file is never rewritten — its sha256 is the ack/claim identity.
 
 ---
 

@@ -1068,12 +1068,24 @@ async function runHubDaemon(ctx: ExtensionContext): Promise<void> {
   }
   console.log(`[pi-king-hub] started ${new Date().toISOString()}${restored > 0 ? ` — restored ${restored} sessions` : ""}`);
   const panel = new JobsPanel(ctx.sessionManager, ctx.cwd, undefined);
-  // Same 1s tick as the dashboard; one completion per tick; claims dedupe
-  // against every other watcher. Stale-pending reconciliation needs no code:
-  // dimming is render-side, and nothing auto-deletes.
+  // Same 1s tick as the dashboard, but buildRows() — ps, tmux list-sessions,
+  // git-status caches, i.e. real subprocesses — is passed as a PROVIDER and
+  // called only when a marker actually needs an owner resolved. In steady
+  // state (nothing to deliver) an idle tick is a readdir plus a stat per
+  // marker and forks nothing; the previous shape ran the full fleet scan
+  // every second forever, ~86k of them a day with no marker in sight.
+  // Stale-pending reconciliation needs no code: dimming is render-side and
+  // nothing auto-deletes.
   for (;;) {
-    const rows = buildRows();
-    panel.poll(Date.now(), rows);
+    try {
+      panel.poll(Date.now(), buildRows);
+    } catch (err) {
+      // One bad tick (tmux restarting, ps unavailable, an unreadable card)
+      // must not end the process: launchd would respawn it, and every
+      // respawn re-runs restoreMissingSessions(), which spawns sessions.
+      // Log and keep ticking.
+      console.error(`[pi-king-hub] tick failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     await new Promise((r) => setTimeout(r, 1000));
   }
 }
@@ -1569,7 +1581,7 @@ class DashboardView implements Component {
       // refresh below is throttled to every IDLE_REFRESH_TICKS. The scan is
       // a stat-cached readdir — cheap enough for 1s — and the panel's seen
       // set guarantees exactly one injection per marker per hub run.
-      this.jobs.poll(Date.now(), this.rows);
+      this.jobs.poll(Date.now(), () => this.rows);
       // Fast cadence (every tick) while a turn is actively streaming or a
       // subagent is running — the only states where a fresher read shows
       // something genuinely new. Everything else (idle, background,
@@ -1704,7 +1716,7 @@ class DashboardView implements Component {
   toggleJobsPanel(): void {
     this.jobs.open = !this.jobs.open;
     this.jobs.deleteArmedFor = null;
-    if (this.jobs.open) this.jobs.poll(Date.now(), this.rows);
+    if (this.jobs.open) this.jobs.poll(Date.now(), () => this.rows);
     this.tui.requestRender();
   }
 
@@ -2337,15 +2349,17 @@ class DashboardView implements Component {
           const sel = i === this.jobs.selected;
           if (sel) selectedLine = body.length;
           const marker = sel ? th.fg("accent", "\u276f") : " ";
-          const hue = j.stale ? "dim" : j.marker.status === "done" ? "success"
+          // A dead worker is a FAILURE, not a dim maybe: the job is never
+          // completing, so it reads as an error rather than a stale guess.
+          const hue = j.orphaned ? "error" : j.stale ? "dim" : j.marker.status === "done" ? "success"
             : j.marker.status === "failed" ? "error" : "accent";
           const id = pad(truncateToWidth(clean(j.id), idW, "\u2026", true), idW);
           // "pending (stale)" is 15 chars — must truncate or it overflows
-          // the status column and shoves the summary right.
-          const status = pad(
-            truncateToWidth(j.marker.status + (j.stale ? " (stale)" : ""), statusW, "\u2026", true),
-            statusW,
-          );
+          // the status column and shoves the summary right. "died" replaces
+          // the status outright: "pending" would be a lie about a job whose
+          // worker no longer exists.
+          const statusText = j.orphaned ? "died" : j.marker.status + (j.stale ? " (stale)" : "");
+          const status = pad(truncateToWidth(statusText, statusW, "\u2026", true), statusW);
           // Time elapsed: live count-up since createdAt while pending;
           // total runtime (completedAt − createdAt) once terminal. Ticks
           // with the panel's 1s refresh.

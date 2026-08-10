@@ -208,9 +208,20 @@ pi-king --daemon-uninstall    # stop + remove
   pi-jobs watchers: first writer of `~/.pi/jobs/.injected/<hash>.json` wins
   (wx claim, same hash identity as acks). Banner + panel always; injection
   once.
-- **Deterministic targeting**: marker `cwd` (or `resultPath` dirname) prefix-
-  matches the home session; else the most-recently-active tmux-backed session;
-  else none. Never the cursor row — a job can land while nobody is looking.
+- **Owner-only targeting**: a completion is delivered to the exact session
+  that spawned the job (`spawnerSessionId`), and to nothing else. No owner on
+  this dashboard (headless, exited, invisible) means no injection at all — the
+  banner and the panel still surface it, and `r` in the owner session is the
+  recovery path. `cwd`/`resultPath`/"most recent"/the cursor row are
+  deliberately not fallbacks: relevance guesses caused repeated cross-session
+  interruptions.
+- **Never mid-turn**: injection waits for the owner to finish its turn (and
+  for its subagents to stop), the same rule every other `send-keys` path here
+  follows, and holds off while a workflow run owns that project. Waiting burns
+  no claim, so the report is delivered on a later tick, exactly once.
+- **Idle is cheap**: the daemon resolves the fleet (`ps`, `tmux`, git status)
+  only when a marker actually needs an owner. With nothing to deliver, a tick
+  is a readdir plus a stat per marker and forks nothing.
 - **Boot restore**: `tmux start-server` if down, then every visible card whose
   process is gone and whose window is missing gets a fresh window (the fleet
   recovery from the 2026-08-07 kill-server accident, automated). A session
