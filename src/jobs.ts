@@ -412,6 +412,17 @@ export class JobsPanel {
    * so a marker whose injection has to wait for the owner to finish its turn
    * retries on later ticks WITHOUT re-notifying. */
   private notified = new Set<string>();
+  /** Marker ids whose delivery is CONFIRMED (acked or claimed) — permanent
+   * and on-disk, so once true it is true forever (acks/claims are never
+   * un-written). Distinct from `notified`: a marker can be notified (banner
+   * shown) while still undelivered (owner mid-turn), and THAT case must keep
+   * checking acked()/claimed() every tick to retry delivery and to notice a
+   * different watcher delivering it first. Without this set, a live fleet's
+   * steady-state markers — mostly already terminal and already delivered —
+   * paid two file-read-plus-sha256 hashes each, every second, forever
+   * (measured live: 5.45% CPU on 12 real markers, for work whose answer
+   * never changes once first observed true). */
+  private resolved = new Set<string>();
   private lastPurge = 0;
   /** Serializes pollAsync: two overlapping polls must not both claim the
    * same unseen marker before either adds it to `seen`. */
@@ -479,6 +490,7 @@ export class JobsPanel {
   private async pollAsync(getRows: () => readonly JobsRowLike[]): Promise<void> {
     try {
       for (const job of this.jobs) {
+        if (this.resolved.has(job.id)) continue; // confirmed delivered on a prior tick — never re-checked
         if (job.marker.status === "pending") {
           // A pending job whose worker is gone will never complete itself.
           // Say so once: silence here is how a killed job's work went
@@ -499,6 +511,7 @@ export class JobsPanel {
         // releases its own claim below.
         if (acked(job.id) || claimed(job.id)) {
           this.notified.add(job.id);
+          this.resolved.add(job.id);
           continue;
         }
         // Banner/panel are global observability. Conversation injection is an
@@ -530,7 +543,7 @@ export class JobsPanel {
         // mid-turn guard above is what covers a running goal loop.
         if (await this.activeWorkflowRun(target.entry?.cwd ?? this.cwd)) continue;
         if (claimInjected(job.id)) {
-          if (injectOne(job, [target])) writeAck(job.id);
+          if (injectOne(job, [target])) { writeAck(job.id); this.resolved.add(job.id); }
           else releaseInjected(job.id); // retry next tick; the banner is not repeated
         }
         return; // one completion per tick
@@ -627,6 +640,7 @@ export class JobsPanel {
     if (claim) rmSync(claim, { force: true });
     rmSync(job.file, { force: true });
     this.notified.delete(job.id);
+    this.resolved.delete(job.id);
   }
 
   /** Execution guard, ported verbatim from pi-jobs: refuse autonomous

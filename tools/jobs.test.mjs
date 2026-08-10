@@ -525,3 +525,35 @@ test("poll never calls the rows provider when there is nothing to deliver (idle 
   await settle();
   assert.equal(calls, 0, "a live pending marker must not trigger a fleet scan");
 });
+
+test("resolved markers are never re-checked after the first tick that confirms delivery (steady-state CPU)", async () => {
+  resetJobsDir();
+  resetLog();
+  writeMarker("steady-1", { status: "done", summary: "already delivered", spawnerSessionId: "sess-alpha" });
+  const rows = [sessionRow("/proj/alpha", "t-alpha", 1, "sess-alpha", { state: "idle", subagents: [] })];
+  const panel = new JobsPanel(noSession, "/proj/alpha", undefined);
+  panel.poll(Date.now(), () => rows);
+  await settle();
+  assert.equal(readdirSync(ACKS_DIR).length, 1, "delivered once");
+  assert.equal(readLog().trim().split("\n").filter(Boolean).length, 1);
+
+  // Behavioral proof, not an implementation spy: once a marker is resolved,
+  // the disk (ack + claim) must never be consulted again for it. Removing
+  // BOTH files out from under a panel that were still checking disk each
+  // tick would look exactly like "nobody has delivered this yet" and cause
+  // a SECOND injection -- the steady-state bug this fixes was invisible in
+  // a synthetic empty-jobs-dir test and only showed up against the live
+  // fleet's real markers (measured: 5.45% CPU re-reading+re-hashing every
+  // already-resolved marker's file every tick, forever).
+  for (const f of readdirSync(ACKS_DIR)) rmSync(join(ACKS_DIR, f), { force: true });
+  for (const f of existsSync(INJECTED_DIR) ? readdirSync(INJECTED_DIR) : []) rmSync(join(INJECTED_DIR, f), { force: true });
+  for (let i = 0; i < 5; i++) {
+    panel.poll(Date.now(), () => rows);
+    await settle();
+  }
+  assert.equal(
+    readLog().trim().split("\n").filter(Boolean).length,
+    1,
+    "a resolved marker must stay resolved in-memory even if its ack/claim files vanish -- disk is never re-checked",
+  );
+});
