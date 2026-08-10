@@ -399,6 +399,85 @@ The marker file is never rewritten — its sha256 is the ack/claim identity.
 
 ---
 
+## Phase J — tmux perf fixes (docs/PERF-TMUX-SPEC.md, Fix 1 + Fix 2)
+
+2026-08-10 tmux perf audit: pi-tui's fullRender replays the ENTIRE rendered
+transcript through the terminal on boot/resize/differential-bailout
+(measured: 67,555 lines / 10.9MB on a real 40MB session), and tmux drains
+those bursts ~6.5x slower than a fast pty — hundreds of ms of frozen UI per
+occurrence. pi-king spawning sessions at tmux's bare 80x24 default made it
+worse: the first attach forced a resize (80x24 -> real client size), which
+is itself a fullRender trigger, so the very moment you switch into a
+session it replayed the whole thing. Automated logic coverage:
+`tools/fleet.test.mjs` (resolveSpawnSize's 3-tier fallback, the persisted
+client-size.json round-trip, createTmuxSession actually emitting -x/-y).
+
+### J1. New sessions spawn near client size, not 80x24
+Open the dashboard at a known terminal size (e.g. resize Ghostty, confirm
+with `tmux display-message -p '#{client_width}x#{client_height}'` after
+attaching once), then create a new session (`n`).
+**PASS:** `tmux list-panes -t <name> -F '#{pane_width}x#{pane_height}'`
+shows the real client size immediately, detached — not 80x24. Repeat via
+`/bg`-style resume of an exited row (same createTmuxSession call, same
+expectation).
+
+### J2. Attach no longer forces a resize-triggered full render
+With `PI_DEBUG_REDRAW=1` set on a session (see docs/PERF-TMUX-SPEC.md's
+staged diagnostic), attach to it fresh right after J1's spawn.
+**PASS:** `~/.pi/agent/pi-debug.log` shows no `terminal width/height
+changed` fullRender line at attach — the window was already born at the
+right size, so there is nothing to resize. Before this fix, every fresh
+spawn logged exactly one such line at first attach.
+
+### J3. Daemon restore uses the persisted size, not tmux's default
+With the daemon installed and a dashboard having run at least once (so
+`~/.pi/king/client-size.json` exists): `bin/pi-king --daemon-uninstall` +
+`tmux kill-server` + `--daemon-install` (same drill as I4).
+**PASS:** restored sessions come up at the persisted size
+(`tmux list-panes -F '#{pane_width}x#{pane_height}'` matches
+`cat ~/.pi/king/client-size.json`), not 80x24. Delete that file first to
+confirm the tier-3 fallback: restored sessions then come up at 224x63
+(`DEFAULT_SPAWN_SIZE`), still never 80x24.
+
+### J4. patch-tui CLI: apply / check / revert / refuse-on-mismatch
+```bash
+bin/pi-king patch-tui --check    # unpatched: prints "unpatched", exit 1
+bin/pi-king patch-tui            # applies; prints target + .orig backup path
+bin/pi-king patch-tui --check    # now: prints "patched", exit 0
+bin/pi-king patch-tui            # idempotent: "Already patched", exit 0
+bin/pi-king patch-tui --revert   # restores from .orig
+bin/pi-king patch-tui --check    # back to "unpatched", exit 1
+```
+**PASS:** all six behave as printed above; `diff` the file against a fresh
+`npm install`/reinstall of the real package after `--revert` shows zero
+difference (byte-exact restore). Corrupting the patch site (edit one
+character inside the targeted block) makes `apply` refuse with exit 2 and a
+clear message instead of guessing — this is the pi-upgrade-changed-the-code
+case, and it must never silently misapply.
+
+### J5. Unpatched pi-tui is visible, not silent
+With pi-tui unpatched (`patch-tui --revert` first if needed): open the
+dashboard.
+**PASS:** a warning row reading "pi-tui unpatched — ... run: pi-king
+patch-tui" renders persistently (not a lingering `showMessage` — it stays
+until the dashboard is reopened after patching). Restart the daemon in the
+same unpatched state: `~/.pi/king/hub.log` gets one
+`pi-tui unpatched` line at startup. Patch, then repeat both — the warnings
+are gone next open/restart. Detection is content-based
+(`isPiTuiPatched()` in `src/fleet.ts`) — it must keep working even if
+`~/.pi/king/tui-patch.json` (the CLI's own audit record) is deleted or
+stale.
+
+### J6. The env knob is tmux-only and no-ops when unpatched
+`tmux show-environment -t <any pi-king-spawned session> PI_TUI_MAX_FULL_RENDER_LINES`
+**PASS:** set (default 3000) on every tmux-spawned session. A session run
+directly (not through pi-king, no tmux) never sees this var, and unpatched
+pi-tui ignores it silently either way (it's an env var pi-tui's own code
+doesn't read yet) — never a behavior change for anyone who hasn't run
+`patch-tui`.
+
+---
+
 ## Failure protocol
 
 On any failure: **stop, change nothing, capture the scene.**

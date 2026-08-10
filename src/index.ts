@@ -113,14 +113,17 @@ import {
   computeStartupFingerprint,
   createTmuxSession,
   isKnownState,
+  isPiTuiPatched,
   livePiPids,
   readLayout,
   readSessions,
   tmuxError,
   tmuxLaunchEnv,
   tmuxSessionExists,
+  writeClientSize,
   NORMAL_AGENT_DIR,
   LAYOUT_FILE,
+  type ClientSize,
   type DashboardEntry,
   type Layout,
   type OrphanRow,
@@ -151,7 +154,7 @@ const MESSAGE_LINGER_MS = 4000;
 
 type HubAction =
   | { type: "attach"; tmuxName: string; expectedPid?: number }
-  | { type: "create"; name: string; dir: string };
+  | { type: "create"; name: string; dir: string; size?: ClientSize };
 
 /**
  * Liveness verified by *identity*, not mere existence.
@@ -838,6 +841,10 @@ class DashboardView implements Component {
    * cadence, no second timer), the panel replaces the session body while
    * open, and /jobs parity in the hub routes through the same instance. */
   private jobs: JobsPanel;
+  /** Checked once at open, not per-render — a pi upgrade silently wiping the
+   * Fix 2 patch (docs/PERF-TMUX-SPEC.md) is a rare, deliberate event; the
+   * user just needs to notice on the next dashboard open, not mid-session. */
+  private piTuiUnpatched = false;
 
   constructor(
     private tui: TUI,
@@ -864,6 +871,7 @@ class DashboardView implements Component {
       if (idx >= 0) this.selected = idx;
     }
     if (initialMessage) this.showMessage(initialMessage);
+    this.piTuiUnpatched = !isPiTuiPatched();
     // Both are cheap and static for the lifetime of the overlay: an inventory
     // snapshot (readdir + stat) and a recent-projects scan that reads only the
     // first 512 bytes of one transcript per project.
@@ -893,11 +901,28 @@ class DashboardView implements Component {
     }, REFRESH_MS);
   }
 
-  /** Terminal rows, fed in by the overlay each render cycle. Zero means "not
-   * known yet", which renders everything unwindowed — the previous behaviour. */
+  /** Terminal size, fed in by the overlay each render cycle from the layout
+   * engine's own visible(w,h) hook — the one place both dimensions are
+   * known reliably, tmux or not (reading process.stdout.columns/rows
+   * directly misses resizes on a multiplexed or piped stdout). Zero height
+   * means "not known yet", which renders everything unwindowed — the
+   * previous behaviour. Persisted (deduped, best-effort) so the headless
+   * daemon and the next dashboard boot can spawn sessions close to this
+   * size instead of tmux's 80x24 default — see fleet.ts's
+   * resolveSpawnSize/CLIENT_SIZE_FILE. */
+  private termWidth = 0;
   private termHeight = 0;
-  setTermHeight(h: number): void {
+  setTermSize(w: number, h: number): void {
     if (Number.isFinite(h) && h > 0) this.termHeight = h;
+    if (Number.isFinite(w) && w > 0) this.termWidth = w;
+    if (this.termWidth > 0 && this.termHeight > 0) writeClientSize({ w: this.termWidth, h: this.termHeight });
+  }
+  /** The live client size this DashboardView is currently rendering at, for
+   * any createTmuxSession call made from here — more current than the
+   * persisted file within this same process. undefined before the first
+   * render (falls through to fleet.ts's persisted-or-default tiers). */
+  clientSize(): ClientSize | undefined {
+    return this.termWidth > 0 && this.termHeight > 0 ? { w: this.termWidth, h: this.termHeight } : undefined;
   }
 
   private refresh(): void {
@@ -1150,7 +1175,7 @@ class DashboardView implements Component {
       return;
     }
     if (step.kind === "new-dir") {
-      this.closeDashboard({ type: "create", name: step.name, dir: value });
+      this.closeDashboard({ type: "create", name: step.name, dir: value, size: this.clientSize() });
       return;
     }
     if (step.kind === "rename") {
@@ -1413,11 +1438,11 @@ class DashboardView implements Component {
         }
         const base = (e.name ?? e.project).trim() || e.shortId;
         let target = base;
-        let result = createTmuxSession(target, e.cwd, e.sessionId);
+        let result = createTmuxSession(target, e.cwd, e.sessionId, this.clientSize());
         // A live session may already hold this name; retry once, disambiguated.
         if (!result.ok) {
           target = `${base}-${e.shortId}`;
-          result = createTmuxSession(target, e.cwd, e.sessionId);
+          result = createTmuxSession(target, e.cwd, e.sessionId, this.clientSize());
         }
         if (!result.ok) {
           this.showMessage(result.message);
@@ -1497,6 +1522,9 @@ class DashboardView implements Component {
     lines.push("  " + rule);
     lines.push(split("  " + (ticker ?? th.fg("dim", "no router activity today")), th.fg("dim", clockText) + "  "));
     lines.push("  " + rule);
+    if (this.piTuiUnpatched) {
+      lines.push("  " + th.fg("warning", "pi-tui unpatched \u2014 monolith sessions replay full renders under tmux; run: pi-king patch-tui"));
+    }
     // A human-scale comparison for today's distinct tokens, on its own row
     // instead of competing with the ticker's other segments for width — it
     // used to live there and lost the room to things people check more often
@@ -2043,7 +2071,7 @@ async function showDashboardInner(ctx: ExtensionContext): Promise<HubAction | un
         anchor: "top-center",
         width: "100%",
         maxHeight: "100%",
-        visible: (_w, h) => { view?.setTermHeight(h); return true; },
+        visible: (w, h) => { view?.setTermSize(w, h); return true; },
       },
     },
   );
@@ -2092,7 +2120,7 @@ function goToSession(action: HubAction): boolean {
  * when neither route is available, so the caller can tell the user what to run. */
 function dispatchHubAction(action: HubAction): { deferred: boolean; message?: string } {
   if (action.type === "create") {
-    const created = createTmuxSession(action.name, action.dir);
+    const created = createTmuxSession(action.name, action.dir, undefined, action.size);
     if (!created.ok) return { deferred: false, message: created.message };
     return { deferred: goToSession({ type: "attach", tmuxName: action.name }), message: created.message };
   }

@@ -27,7 +27,7 @@
  * (wired through bin/pi-king --daemon; see there for the launchd plist).
  */
 import { spawnSync } from "node:child_process";
-import { TMUX, buildRows, restoreMissingSessions } from "../src/fleet.ts";
+import { TMUX, buildRows, isPiTuiPatched, restoreMissingSessions } from "../src/fleet.ts";
 import { JobsPanel, notifyMacOS, type SessionManagerLike } from "../src/jobs.ts";
 
 // The daemon never receives a keypress, so JobsPanel.resume() — the only
@@ -45,6 +45,14 @@ async function main(): Promise<void> {
     notifyMacOS("pi-king hub", `Restored ${restored} session window${restored === 1 ? "" : "s"} after a restart.`);
   }
   console.log(`[pi-king-hub] started ${new Date().toISOString()}${restored > 0 ? ` — restored ${restored} sessions` : ""}`);
+  // Content-checked every start (never trust an install-time record — a pi
+  // upgrade can silently wipe the patch without the daemon restarting).
+  // Fix 1 (client-size spawn) always applies; Fix 2 is opt-in tooling, so
+  // an unpatched pi-tui is expected on a fresh install, not an error — just
+  // worth a log line so it isn't a silent regression after an upgrade.
+  if (!isPiTuiPatched()) {
+    console.log("[pi-king-hub] pi-tui unpatched — monolithic sessions will replay full renders under tmux; run `pi-king patch-tui` (docs/PERF-TMUX-SPEC.md Fix 2)");
+  }
   const panel = new JobsPanel(noSession, process.env.HOME ?? "/", undefined);
   // Same 1s tick as the dashboard, but buildRows() — ps, tmux list-sessions,
   // git-status caches, i.e. real subprocesses — is passed as a PROVIDER and
