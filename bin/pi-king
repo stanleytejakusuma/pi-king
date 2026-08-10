@@ -33,16 +33,17 @@ EXTENSION="$(cd "$(dirname "$SELF")/.." && pwd)/src/index.ts"
 
 # Detached hub daemon (launchd KeepAlive agent com.stanz.pi-king-hub). Owns
 # marker polling, injection, banner, and session-window restore 24/7 — the
-# interactive hub exits on tmux attach, this one never does.
+# interactive hub exits on tmux attach, this one never does. Plain node, not
+# a pi process (2026-08-10): the daemon never renders a TUI or reads a
+# keypress, so the entire pi runtime -- model catalog, tool/extension
+# registration, pi-tui -- was pure overhead. Measured live: pi-process
+# daemon 3.57% CPU at rest after the lazy-rows fix (was 6.3-10.5% before
+# it); plain node daemon 0.00% at rest, same restore/poll/inject behavior.
 case "${1:-}" in
   --daemon)
     shift
-    if [ -f "$EXTENSION" ]; then
-      exec pi --no-session --no-tools --no-context-files --no-skills \
-        --no-extensions --extension "$EXTENSION" --agents-hub --agents-hub-daemon "$@"
-    fi
-    exec pi --no-session --no-tools --no-context-files --no-skills \
-      --agents-hub --agents-hub-daemon "$@"
+    DAEMON="$(cd "$(dirname "$SELF")/.." && pwd)/scripts/hub-daemon.ts"
+    exec node --experimental-strip-types "$DAEMON" "$@"
     ;;
   --daemon-install)
     PLIST="$HOME/Library/LaunchAgents/com.stanz.pi-king-hub.plist"

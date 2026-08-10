@@ -196,7 +196,9 @@ The interactive dashboard exits when you attach into tmux, which used to kill
 marker watching with it (a job landing mid-attach went silent). The detached
 hub daemon owns marker polling, injection, the macOS banner, and session-
 window restore as a launchd KeepAlive agent — it never dies. The dashboard is
-a view of the same state, attachable on demand.
+a view of the same state, attachable on demand. Plain node process, not `pi`
+(no TUI to render, no model to call — the whole pi runtime was pure overhead;
+measured 0.00% CPU at rest, vs 3.57% for the pi-process version it replaced).
 
 ```bash
 pi-king --daemon-install      # write plist + bootstrap com.stanz.pi-king-hub

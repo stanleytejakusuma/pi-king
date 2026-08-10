@@ -61,7 +61,6 @@ import { homedir } from "node:os";
 
 /* ---------------------------------------------------------------- state -- */
 /** Coarse session lifecycle. Owned here so pi-king depends on stock Pi only. */
-export type TitleState = "working" | "idle" | "background" | "attention" | "error" | "exited";
 
 // \u{...} with braces: a bare \u takes exactly four hex digits, so \u1f514
 // silently parsed as U+1F51 followed by a literal "4" and the attention icon
@@ -81,24 +80,6 @@ export const stateIcon: Record<TitleState, string> = {
  * "trust" state rendered as the literal text "undefined trust", and its
  * missing sort priority made the comparator return NaN, quietly scrambling
  * row order. Every lookup keyed by a status now goes through here. */
-const KNOWN_STATES = new Set<string>(["working", "idle", "background", "attention", "error", "exited"]);
-
-/** States this project used to emit, mapped to what they actually meant.
- *
- * A long-lived session keeps running the extension build it started with, so
- * after a state is retired its cards keep arriving for hours. Translating one
- * of OUR OWN former states is not the same as guessing at a stranger's: the
- * old writer's code is in this repo's history and its meaning is known.
- *
- * `trust` was only ever set from inside a working turn — the old code refused
- * to set it unless the state was already "working" — so every card still
- * carrying it is, by construction, a session mid-turn. It is shown as such.
- * The alternative was a row reading "unknown state: trust", which is honest
- * about the format and useless about the session. */
-const RETIRED_STATES: Record<string, TitleState> = { trust: "working" };
-export function isKnownState(s: string): s is TitleState {
-  return KNOWN_STATES.has(s);
-}
 /** Icon for any status, known or not. An unknown state keeps its own name on
  * screen — inventing a familiar one would be a worse lie than admitting the
  * dashboard does not recognise it. */
@@ -106,91 +87,6 @@ export function iconFor(s: string): string {
   return isKnownState(s) ? stateIcon[s] : "\u25cc";
 }
 
-export type SubagentStatus = {
-  id: string;
-  agentType?: string;
-  description: string;
-  status: "queued" | "running" | "completed" | "failed";
-  startedAt: number;
-  completedAt?: number;
-};
-
-export type SessionStatusFile = {
-  formatVersion: 1;
-  id: string;
-  name: string | undefined;
-  cwd: string;
-  project: string;
-  model: string | undefined;
-  pid: number;
-  startedAt: number;
-  lastActivity: number;
-  status: TitleState;
-  activity: string;
-  title: string;
-  sessionFile: string | undefined;
-  subagents: SubagentStatus[];
-  visible: boolean;
-  /** Context window usage, 0-100, when Pi can report it. A session near the
-   * top is about to compact away part of its memory, which is worth knowing
-   * before attaching, not after. Absent when unknown — never zero-filled. */
-  contextPct?: number;
-  /** Short fingerprint of ~/.pi/agent/settings.json's `packages` field,
-   * stamped once at session_start (which fires on process launch AND on
-   * every /reload). Compared against the dashboard's own fresh read of the
-   * same field to flag a session as needing a reload. Absent on a session
-   * that predates this field being written at all (an older pi-king build,
-   * or one that has not been through session_start since) — the dashboard
-   * treats that the same as a real mismatch, not as "unknown, assume fine":
-   * every session running right now falls into exactly that bucket until
-   * its first reload after this ships. */
-  /** Deterministic fingerprint of everything a fresh `pi` process start would
-   * load: the full canonical global settings.json (which covers enabledModels,
-   * provider/model defaults, AND the packages field), global trust.json and
-   * keybindings.json when present, the global resource roots (extensions,
-   * skills, prompts, themes), package markers for every settings.packages
-   * entry (npm lockfile / git HEAD / local package source), and the session's
-   * own project scope (.pi/settings.json + .pi resource roots).
-   *
-   * Stamped once when the sessionId is first served by THIS process — the one
-   * moment registerProvider and the model scope genuinely ran — and then
-   * PRESERVED across later /reloads of that same sessionId (a reload re-imports
-   * extensions/skills/prompts but does NOT re-run startup registration, so the
-   * process's effective startup inputs are still the launch-time ones; see the
-   * session_start stamp logic). Absent on a session that predates this field
-   * being written at all (an older pi-king build) — the dashboard treats that
-   * the same as a real mismatch, because every session running right now falls
-   * into exactly that bucket until its first full restart after this ships. */
-  startupFingerprint?: string;
-  /** True when this exact sessionId originated from Pi's own /fork ("Create a
-   * new fork from a previous user message") rather than a normal launch.
-   * Determined once when the sessionId is first seen (session_start's own
-   * `reason === "fork"`) and then restored unchanged on every later reload
-   * of that SAME sessionId, never re-derived from that later reload's own
-   * reason -- a naive "set isFork = reason === 'fork'" on every session_start
-   * would silently erase this the moment the forked session is itself
-   * reloaded (reload's reason is "reload", not "fork"). A fork shares its
-   * parent's process (same pid, same tmux pane) and, observed live, its
-   * parent's display name too -- two identically-labelled cards with no way
-   * to tell which is the long-running original and which just branched off
-   * is exactly the ambiguity this field exists to resolve on the card. */
-  isFork?: boolean;
-};
-
-/**
- * Where sessions advertise themselves.
- *
- * Deliberately NOT derived from PI_CODING_AGENT_DIR. That variable is
- * per-process: the supervisor may run against a minimal config dir while the
- * sessions it spawns use the user's normal one, and two participants computing
- * different paths simply never see each other. A rendezvous point must be the
- * same for everyone, so it is a fixed default with one explicit override.
- *
- * PI_KING_STATUS_DIR exists for sandboxes and tests; if you set it, set it for
- * every participant.
- */
-export const SESSION_STATUS_DIR =
-  process.env.PI_KING_STATUS_DIR?.trim() || join(homedir(), ".pi", "king", "session-status");
 import {
   clean,
   compactNum,
@@ -209,6 +105,32 @@ import {
   type DayTotal,
 } from "./data.ts";
 import { JobsPanel, notifyMacOS, scanJobs, selectRestoreCards, type SessionManagerLike } from "./jobs.ts";
+import {
+  RETIRED_STATES,
+  TMUX,
+  SESSION_STATUS_DIR,
+  buildRows,
+  computeStartupFingerprint,
+  createTmuxSession,
+  isKnownState,
+  livePiPids,
+  readLayout,
+  readSessions,
+  tmuxError,
+  tmuxLaunchEnv,
+  tmuxSessionExists,
+  NORMAL_AGENT_DIR,
+  LAYOUT_FILE,
+  type DashboardEntry,
+  type Layout,
+  type OrphanRow,
+  type Row,
+  type SessionRow,
+  type SessionStatusFile,
+  type SubagentStatus,
+  type TitleState,
+  type TmuxSession,
+} from "./fleet.ts";
 
 const REFRESH_MS = 1000;
 /** Ticks of REFRESH_MS between a full data refresh (ps, tmux list-sessions,
@@ -225,75 +147,7 @@ const REFRESH_MS = 1000;
  * longer to notice than before, which is a fine trade next to a 4x cut in
  * background churn during the (common) stretches when nothing is happening. */
 const IDLE_REFRESH_TICKS = 4;
-const STATE_PRIORITY: Record<TitleState, number> = { error: 0, attention: 0, working: 1, background: 1, idle: 2, exited: 3 };
-/** Unknown states sort with the working set rather than at an edge: they are
- * live sessions saying something this dashboard has not learned yet, not
- * emergencies and not corpses. */
-function priorityOf(s: string): number {
-  return isKnownState(s) ? STATE_PRIORITY[s] : 1;
-}
 const MESSAGE_LINGER_MS = 4000;
-/** Resolved once at load rather than hardcoded. tmux lives in different places
- * depending on how it was installed: /opt/homebrew/bin on Apple Silicon,
- * /usr/local/bin on Intel macOS, /usr/bin on most Linux distributions, and
- * elsewhere again under MacPorts or Nix. A fixed path meant every tmux query
- * returned nothing on any machine that differed, so the dashboard listed no
- * sessions and looked broken rather than misconfigured. Falls back to a bare
- * name so PATH lookup still gets a chance. */
-const TMUX = ((): string => {
-  // Test override, same contract as jobs.ts: PI_KING_TMUX points every
-  // tmux call at a fake binary that records invocations.
-  const forced = process.env.PI_KING_TMUX?.trim();
-  if (forced) return forced;
-  const which = spawnSync("/usr/bin/env", ["which", "tmux"], { encoding: "utf8", timeout: 3000 });
-  const found = which.status === 0 ? String(which.stdout || "").trim().split("\n")[0].trim() : "";
-  return found || "tmux";
-})();
-
-type DashboardEntry = {
-  sessionId: string;
-  /** The pid that wrote this status file. Load-bearing: a tmux session is
-   * matched to this session by comparing its pane pid against this. */
-  pid: number;
-  contextPct: number | undefined;
-  shortId: string;
-  cwd: string;
-  project: string;
-  name: string | undefined;
-  state: TitleState;
-  lastActivity: string;
-  updatedAt: number;
-  subagents: SubagentStatus[];
-  tmuxName: string | undefined; // resolved live tmux session name, if correlated
-  /** True when this session's stamped startupFingerprint disagrees with the
-   * dashboard's own fresh read of the same startup inputs — or when it has
-   * no stamped fingerprint at all, which is the same fact (needs a full
-   * restart to catch up) for a different reason: a reload does not re-run
-   * startup registration, so "stamped by a reload" and "never stamped"
-   * both mean the process is running against launch-time inputs while disk
-   * has moved on. Already false for an exited session: nothing to restart.
-   * Computed once per readSessions() call, not per render — the startup
-   * inputs are read at refresh cadence, not every tick. */
-  restartNeeded: boolean;
-  /** This sessionId originated from Pi's own /fork, not a normal launch. See
-   * the SessionStatusFile.isFork comment for why it is stamped once and
-   * preserved across later reloads rather than re-derived every time. The
-   * card this most needs to appear on is the one sitting in the SAME pane
-   * the user has been looking at the whole time -- /fork switches that
-   * pane's active session out from under whatever was previously there, so
-   * the thing left unmarked and unattended is the one that quietly stopped
-   * being current, not something that visibly moved away. */
-  isFork: boolean;
-};
-
-type TmuxSession = { name: string; attached: boolean; windows: number; createdAt: number; panePid: number };
-
-/** A row that's a bare tmux session with no matching pi-alerts status file — an
- * external/non-Pi process, or a Pi session that crashed without cleaning up its
- * tmux wrapper. Still attachable/killable, just with no Pi-side metadata. */
-type OrphanRow = { kind: "orphan"; tmux: TmuxSession };
-type SessionRow = { kind: "session"; entry: DashboardEntry };
-type Row = SessionRow | OrphanRow;
 
 type HubAction =
   | { type: "attach"; tmuxName: string; expectedPid?: number }
@@ -332,214 +186,6 @@ type HubAction =
  * simply left out of the query and therefore absent from the result, which is
  * the correct answer anyway: no real process has a pid shaped like that.
  */
-export function livePiPids(pids: number[]): Map<number, number> | undefined {
-  // 99999 is the real ceiling, not a round guess: binary-searched against this
-  // machine's own ps -p, which accepts pid 99999 but rejects 100000 outright
-  // ("process id too large", killing the whole query, not just that pid) --
-  // the traditional BSD/macOS PID_MAX. An earlier version of this filter used
-  // 99,999,999 on the theory that any generously-large number was safely
-  // "obviously not a real pid"; that bound was 1000x too permissive and the
-  // exact failure it was meant to prevent still reproduced live during
-  // verification, from nothing more exotic than "a real pid plus a few
-  // million" — a value a corrupted status file could plausibly contain.
-  const safe = [...new Set(pids)].filter((p) => Number.isInteger(p) && p > 0 && p <= 99_999);
-  if (safe.length === 0) return new Map();
-  const res = spawnSync("/bin/ps", ["-p", safe.join(","), "-o", "pid=,lstart=,command="], { encoding: "utf8", timeout: 3000 });
-  if (res.error || typeof res.stdout !== "string") return undefined; // ps itself did not run — unknown, do not prune
-  const pidsOut = new Map<number, number>();
-  for (const line of res.stdout.split("\n")) {
-    // pid, lstart, then command. lstart is FIXED-WIDTH, not single-spaced: ps
-    // pads the day to two columns, so the first nine days of any month print
-    // "Mon Aug  3" with TWO spaces. The original pattern allowed at most one,
-    // so on the 1st through the 9th every process started that day failed to
-    // parse and was reported as not running. The dashboard then showed live
-    // sessions as "exited" beside their own tmux sessions as orphans. It was
-    // correct on the 10th through the 31st, which is why it shipped. Accept a
-    // run of whitespace between every field.
-    const m = /^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/.exec(line);
-    if (!m) continue;
-    // Pi sets process.title, so ps reports the command as bare "pi" (or
-    // "pi-rpc") — never the node/cli.js command line. Verified empirically:
-    // matching on cli.js rejected every live session. Trailing space is
-    // significant: process.title pads the original argv buffer.
-    const cmd = m[3].trim();
-    if (cmd === "pi" || cmd.startsWith("pi-")) {
-      const started = Date.parse(m[2]);
-      if (Number.isFinite(started)) pidsOut.set(Number(m[1]), started);
-    }
-  }
-  return pidsOut;
-}
-
-/** Cache for last-reply lookups, keyed by transcript path. Reading a tail is
- * cheap but not free, and refresh runs every second; size+mtime make a exact
- * staleness key, so an idle fleet costs one stat per session per tick. */
-const lastReplyCache = new Map<string, { size: number; mtimeMs: number; reply: string | undefined }>();
-function lastReplyFor(sessionFile: string | undefined): string | undefined {
-  if (!sessionFile) return undefined;
-  try {
-    const st = statSync(sessionFile);
-    const hit = lastReplyCache.get(sessionFile);
-    if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.reply;
-    const reply = readLastReply(sessionFile);
-    lastReplyCache.set(sessionFile, { size: st.size, mtimeMs: st.mtimeMs, reply });
-    return reply;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Activity strings that say nothing. When one of these is all the tracker
- * has, the transcript's last assistant reply is strictly better — it is what
- * Claude Code's agent list shows, and it answers "what did this session last
- * say" instead of "a session exists". Meaningful activities (a prompt, an
- * error, Done:, Approval needed:) are kept; they carry intent the reply may
- * not. */
-const PLACEHOLDER_ACTIVITY = new Set(["Session started.", "Waiting for input.", "Session ended."]);
-
-/** Activity text produced by the retired approval heuristic. It is not merely
- * stale, it was measured wrong — a 25-second ungated bash reported this for 22
- * of those seconds — so a card still carrying it is repeating a claim this
- * project has already withdrawn. Treated as a placeholder, which means the
- * row falls back to the session's last reply. */
-const RETIRED_ACTIVITY = /^Approval needed: /;
-
-/** Reads every session-status file. A card whose writer process is gone is
- * not deleted: the transcript it points at survives, and the card is the only
- * thing that remembers how to resume it. It renders as "exited" instead. */
-function readSessions(): DashboardEntry[] {
-  let files: string[];
-  try {
-    files = readdirSync(SESSION_STATUS_DIR).filter((f) => f.endsWith(".json"));
-  } catch {
-    return [];
-  }
-  // Two passes: the pid list livePiPids() needs to target has to be known
-  // BEFORE it is called, so every status file is parsed once up front (cheap
-  // -- measured 0.2ms for this fleet's file count) and the identity check
-  // below runs against the already-parsed results, rather than parsing twice.
-  const parsed: SessionStatusFile[] = [];
-  for (const file of files) {
-    const full = join(SESSION_STATUS_DIR, file);
-    try {
-      const raw = JSON.parse(readFileSync(full, "utf8")) as SessionStatusFile;
-      // Nothing validates what is in a status file: the directory is writable by
-      // anything running as this user, and these fields are rendered straight
-      // into the terminal. Strip control sequences at the boundary rather than
-      // at each render site, where one missed call reopens it.
-      for (const k of ["name", "activity", "cwd", "project", "title", "model", "tmuxName"] as const) {
-        const v = (raw as Record<string, unknown>)[k];
-        if (typeof v === "string") (raw as Record<string, unknown>)[k] = clean(v);
-      }
-      parsed.push(raw);
-    } catch {
-      // Rare race with the writer's atomic tmp+rename, or a leftover .tmp file.
-      // Skip this cycle; it resolves itself on the next poll.
-    }
-  }
-  const live = livePiPids(parsed.map((raw) => raw.pid));
-  // Hoisted above the loop (was previously read once, further down, purely
-  // for the pin/order sort) so the same read also backs the name override
-  // below — one readLayout() call per refresh either way.
-  const layout = readLayout();
-  // One fingerprint per distinct cwd per readSessions() call: the global
-  // inputs (settings.json, resource roots, packages) are shared by every
-  // session and the project-scope inputs depend only on the session's own
-  // working dir, so memoizing by cwd avoids recomputing the shared part N
-  // times — 14 cards in the same handful of projects is a handful of
-  // computes, not 14.
-  const fpMemo = new Map<string, string | undefined>();
-  const fpFor = (cwd: string): string | undefined => {
-    if (!fpMemo.has(cwd)) fpMemo.set(cwd, computeStartupFingerprint(cwd));
-    return fpMemo.get(cwd);
-  };
-  const entries: DashboardEntry[] = [];
-  for (const raw of parsed) {
-    // Identity, not just existence. A pid alone is not proof: you have many Pi
-    // sessions open, so a dead session's leftover file can name a pid that now
-    // belongs to a *different* live Pi. Require the process start time to match
-    // what the session recorded for itself (60s tolerance covers the gap
-    // between process start and the first status write).
-    const procStart = live?.get(raw.pid);
-    const identityMismatch = procStart !== undefined && raw.startedAt > 0 &&
-      Math.abs(procStart - raw.startedAt) > 60_000;
-    // Same identity check as before — pid AND process start time — so a
-    // recycled pid cannot resurrect a dead card as live. What changed is only
-    // what death means: the card stays, marked exited, because deleting it
-    // would delete the one pointer that knows how to resume the transcript.
-    const dead = live !== undefined && (procStart === undefined || identityMismatch);
-    if (dead) raw.status = "exited";
-    else if (RETIRED_STATES[raw.status]) raw.status = RETIRED_STATES[raw.status];
-    // Only sessions that explicitly opted in — spawned through the dashboard
-    // or backgrounded via /bg — appear here. Being alive with a status file
-    // is not enough; every interactive session has one for pi-alerts' own
-    // notification purposes, most of which have nothing to do with this view.
-    if (!raw.visible) continue;
-    entries.push({
-      sessionId: raw.id,
-      // Load-bearing: this is what a tmux session is matched against.
-      pid: raw.pid,
-      shortId: raw.id.slice(0, 8),
-      cwd: raw.cwd,
-      project: raw.project,
-      // The dashboard's own rename wins over whatever Pi's status file says
-      // — see the Layout.names comment for why the status file's own name
-      // cannot be trusted to reflect a rename promptly. raw.name may
-      // legitimately be undefined (never named), which rowLabel() falls back
-      // to entry.project for — an empty override map entry must not turn
-      // that into "" and silently defeat the fallback, so this only touches
-      // name when an override actually exists. clean() again on the override
-      // even though raw.name was already cleaned above: layout.json is this
-      // process's own file, but the override value came from a composer
-      // typed by whatever ends up calling renameTmuxSession, and this is the
-      // one place it reaches the terminal.
-      name: layout.names[raw.id] ? clean(layout.names[raw.id]) : raw.name,
-      state: raw.status,
-      contextPct: typeof raw.contextPct === "number" && Number.isFinite(raw.contextPct)
-        ? Math.max(0, Math.min(999, Math.round(raw.contextPct))) : undefined,
-      lastActivity: PLACEHOLDER_ACTIVITY.has(raw.activity) || RETIRED_ACTIVITY.test(raw.activity)
-        ? (() => { const r = lastReplyFor(typeof raw.sessionFile === "string" ? raw.sessionFile : undefined); return r ? `\u203a ${r}` : raw.activity; })()
-        : raw.activity,
-      updatedAt: raw.lastActivity || Date.now(),
-      subagents: raw.subagents ?? [],
-      tmuxName: undefined,
-      // Exited already excludes it: nothing to restart. fp undefined means
-      // the dashboard could not read the startup inputs this cycle -- fail
-      // closed to "not restartNeeded" rather than flag a fleet on a read
-      // that did not happen. raw.startupFingerprint undefined (no stamp yet,
-      // an older build or a session that has not been through a real process
-      // start since) counts the same as a real mismatch, not as "unknown,
-      // assume fine" -- see the startupFingerprint field comment.
-      restartNeeded: raw.status !== "exited" && (() => {
-        const fp = fpFor(raw.cwd);
-        return fp !== undefined && (raw.startupFingerprint === undefined || raw.startupFingerprint !== fp);
-      })(),
-      isFork: raw.isFork === true,
-    });
-  }
-  // Pinned sessions leave their directory group and form one section at the
-  // top, in the order the user put them in. Everything else groups by
-  // directory, then by urgency, then by recency. (layout was already read
-  // above, before the entries loop, for the name override.)
-  const rank = (id: string) => {
-    const i = layout.order.indexOf(id);
-    return i === -1 ? Number.MAX_SAFE_INTEGER : i;
-  };
-  entries.sort((a, b) => {
-    const ap = layout.pinned.includes(a.sessionId);
-    const bp = layout.pinned.includes(b.sessionId);
-    if (ap !== bp) return ap ? -1 : 1;
-    if (ap && bp) return layout.pinned.indexOf(a.sessionId) - layout.pinned.indexOf(b.sessionId);
-    return a.cwd.localeCompare(b.cwd) ||
-      // A manual position, when one has been set, outranks urgency: the user
-      // moving a row is a stronger statement about what matters than the
-      // state machine's opinion.
-      rank(a.sessionId) - rank(b.sessionId) ||
-      priorityOf(a.state) - priorityOf(b.state) ||
-      b.updatedAt - a.updatedAt;
-  });
-  return entries;
-}
 
 /* -------------------------------------------------------------- layout -- */
 /** Pins and manual ordering. Deliberately NOT stored in the status files:
@@ -565,28 +211,10 @@ function readSessions(): DashboardEntry[] {
  * comment two sections up: trusting a second process's own timing for a
  * value this dashboard can just own outright. `/name` is still sent (kept
  * below in renameTmuxSession) so Pi's own UI stays in sync too, but it is
- * now a best-effort nicety, not the mechanism this label's correctness
- * depends on. */
-type Layout = { pinned: string[]; order: string[]; lastSelected?: string; names: Record<string, string> };
-const LAYOUT_FILE = join(SESSION_STATUS_DIR, "..", "layout.json");
 /** Records which boot generation reboot recovery has already run for, so a
  * second dashboard opened moments after the first does not race it into
  * resuming the same transcript twice — see restoreRebootOrphans. */
 const REBOOT_RECOVERY_FILE = join(SESSION_STATUS_DIR, "..", "reboot-recovery.json");
-
-function readLayout(): Layout {
-  try {
-    const raw = JSON.parse(readFileSync(LAYOUT_FILE, "utf8")) as Partial<Layout>;
-    const strs = (v: unknown) => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
-    const names: Record<string, string> = {};
-    if (raw.names && typeof raw.names === "object") {
-      for (const [k, v] of Object.entries(raw.names)) if (typeof v === "string") names[k] = v;
-    }
-    return { pinned: strs(raw.pinned), order: strs(raw.order), lastSelected: typeof raw.lastSelected === "string" ? raw.lastSelected : undefined, names };
-  } catch {
-    return { pinned: [], order: [], names: {} };
-  }
-}
 
 function writeLayout(l: Layout): void {
   try {
@@ -599,99 +227,6 @@ function writeLayout(l: Layout): void {
   }
 }
 
-/** Lists live tmux sessions. No server running is not an error — just zero sessions. */
-function listTmuxSessions(): TmuxSession[] {
-  const result = spawnSync(TMUX, ["list-sessions", "-F", "#{session_name}\t#{session_attached}\t#{session_windows}\t#{session_created}\t#{pane_pid}"], { encoding: "utf8", timeout: 3000 });
-  if (result.status !== 0 || !result.stdout) return [];
-  return result.stdout.trim().split("\n").filter(Boolean).flatMap((line) => {
-    // tmux rejects control characters in session names but NOT in user option
-    // values, so a value containing a newline splits into what looks like an
-    // extra session with attacker-chosen fields. Requiring the exact field
-    // count discards those fragments: a forged line cannot also carry the right
-    // number of tabs once the real value has consumed the line.
-    const parts = line.split("\t");
-    if (parts.length !== 5) return [];
-    const [name, attached, windows, created, panePid] = parts;
-    return [{
-      name,
-      attached: attached === "1",
-      windows: Number(windows) || 0,
-      createdAt: (Number(created) || 0) * 1000,
-      panePid: Number(panePid) || 0,
-    }];
-  });
-}
-
-/** Cross-references pi-alerts status entries with live tmux sessions by name. */
-function buildRows(): Row[] {
-  const entries = readSessions();
-  const tmuxSessions = listTmuxSessions();
-  // Correlation is by PROCESS, not by token.
-  //
-  // The token lived in a tmux user option, and a tmux option is a sticker
-  // rather than a lock: any process running as this user can read one session's
-  // token, write it onto a session it controls, and overwrite the original. The
-  // token then appears exactly once, on the wrong session, so counting
-  // duplicates does not detect it. Following that pairing would attach the user
-  // to a pane chosen by whoever moved the sticker.
-  //
-  // A pid cannot be moved. /bg execs pi as the pane command, so the pane's pid
-  // IS the Pi process, and the status file records the pid of the process that
-  // wrote it. Requiring those to agree makes the pairing unforgeable by anything
-  // that cannot already impersonate the process itself.
-  // A pane pid is unique by construction: one pane, one process. Two rows
-  // claiming the same one therefore cannot both be real, and the surplus row is
-  // a forgery smuggled in through a newline in a user option value. Map
-  // building would silently keep the last writer, handing the attacker the
-  // pairing. Drop every row involved instead: an unresolvable identity must
-  // fail closed, because the fallback is attaching the user to a pane chosen by
-  // whoever tampered.
-  const panePidCounts = new Map<number, number>();
-  for (const t of tmuxSessions) if (t.panePid > 0) panePidCounts.set(t.panePid, (panePidCounts.get(t.panePid) ?? 0) + 1);
-  const tmuxByPanePid = new Map<number, TmuxSession>();
-  for (const t of tmuxSessions) {
-    if (t.panePid > 0 && panePidCounts.get(t.panePid) === 1) tmuxByPanePid.set(t.panePid, t);
-  }
-  const matchedTmuxNames = new Set<string>();
-  const sessionRows: SessionRow[] = entries.map((entry) => {
-    // No name fallback. Matching on a name that merely looks right is the same
-    // class of mistake as trusting the token: it pairs on resemblance instead of
-    // identity, and it is exactly what an attacker gets to choose. An unmatched
-    // session renders as unmatched, which is honest and harmless.
-    // An exited card's pid belongs to nobody; the OS may hand it to any new
-    // process, including one that is a tmux pane. Matching it would attach a
-    // dead card to a random live session.
-    const match = entry.pid && entry.state !== "exited" ? tmuxByPanePid.get(entry.pid) : undefined;
-    if (match) {
-      matchedTmuxNames.add(match.name);
-      return { kind: "session", entry: { ...entry, tmuxName: match.name } };
-    }
-    return { kind: "session", entry };
-  });
-  const orphanRows: OrphanRow[] = tmuxSessions
-    .filter((t) => !matchedTmuxNames.has(t.name))
-    .map((t) => ({ kind: "orphan", tmux: t }));
-  return [...sessionRows, ...orphanRows];
-}
-
-function tmuxError(result: ReturnType<typeof spawnSync>): string {
-  if (result.error) return result.error.message;
-  return String(result.stderr || result.stdout || "tmux command failed").trim();
-}
-
-// Sessions created through the dashboard always get the normal, full
-// ~/.pi/agent config (skills, prompts, all extensions) regardless of what
-// env the tmux *server* itself inherited when it first started (which, if
-// started from the minimal pi-king hub process, would otherwise be
-// PI_CODING_AGENT_DIR=~/.pi/agent-hub — the hub's own lean config, wrong
-// for a real working session). `-e` on `new-session` sets the env for that
-// specific new session's process, independent of server-inherited env —
-// confirmed empirically, not assumed.
-/** The agent directory a newly created session should use: the one in force
- * here, not a fixed path. Hardcoding it meant a session created from the
- * dashboard silently ignored the user's PI_CODING_AGENT_DIR and started against
- * a configuration they had not chosen. */
-const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.env.HOME ?? ""}/.pi/agent`;
 
 /** Content-digest cache: path -> {mtimeMs, ctimeMs, size, digest}. A file is
  * only re-read when its mtime, ctime, or size changed; every other read of
@@ -706,173 +241,7 @@ const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.e
  * A file that disappears (or fails to stat) has no cache entry and
  * contributes nothing to the fingerprint — absent and unreadable are the
  * same "not loaded" fact. */
-const startupDigestCache = new Map<string, { mtimeMs: number; ctimeMs: number; size: number; digest: string }>();
 
-function digestFile(p: string): string | undefined {
-  try {
-    const st = statSync(p);
-    const hit = startupDigestCache.get(p);
-    if (hit && hit.mtimeMs === st.mtimeMs && hit.ctimeMs === st.ctimeMs && hit.size === st.size) return hit.digest;
-    const digest = createHash("sha256").update(readFileSync(p)).digest("hex");
-    startupDigestCache.set(p, { mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, digest });
-    return digest;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Recursively hashes every file under `root` that passes `filter`, paths
- * sorted for determinism, skipping .git and node_modules. Missing roots
- * contribute nothing. Used for the global and project resource roots (the
- * dirs a fresh process start actually loads) — NOT for transcripts, media,
- * or the rest of the agent dir, which startup never reads. */
-function hashTree(h: ReturnType<typeof createHash>, root: string, filter: (full: string) => boolean): void {
-  const files: string[] = [];
-  const walk = (dir: string): void => {
-    let entries;
-    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      if (e.name === ".git" || e.name === "node_modules") continue;
-      const full = join(dir, e.name);
-      if (e.isDirectory()) walk(full);
-      else if (e.isFile() && filter(full)) files.push(full);
-    }
-  };
-  walk(root);
-  files.sort();
-  for (const f of files) {
-    const d = digestFile(f);
-    if (d !== undefined) h.update(`${f}:${d}\n`);
-  }
-}
-
-/** Marker for one settings.packages entry: a digest of whatever changes when
- * that package is installed/updated, WITHOUT walking its whole tree.
- *  - npm: hash the single lockfile that covers every npm install — version
- *    bumps change it, one stat+read covers all npm packages.
- *  - git: hash the repo's .git/HEAD plus its package.json — `pi update`
- *    moves HEAD, so the ref change is caught even though settings.json's
- *    spec string is unchanged.
- *  - local path (relative to the agent dir, e.g. ../../codebase/pi-king):
- *    hash package.json + the source/resource dirs a fresh process start
- *    loads from it. This is how an edit to pi-king's own src/index.ts flags
- *    every session for restart — the package is a settings.packages entry. */
-function packageMarker(spec: string): string | undefined {
-  if (spec.startsWith("npm:")) {
-    const lock = join(NORMAL_AGENT_DIR, "npm", "package-lock.json");
-    return existsSync(lock) ? digestFile(lock) : undefined;
-  }
-  if (spec.startsWith("git:")) {
-    const repo = spec.slice(4).replace(/@[^/]+$/, ""); // strip @ref suffix
-    const dir = join(NORMAL_AGENT_DIR, "git", repo);
-    const h = createHash("sha256");
-    const head = join(dir, ".git", "HEAD");
-    if (existsSync(head)) h.update("head:" + (digestFile(head) ?? "") + "\n");
-    const pj = join(dir, "package.json");
-    if (existsSync(pj)) h.update("pkg:" + (digestFile(pj) ?? "") + "\n");
-    return h.digest("hex").slice(0, 12);
-  }
-  // Local path entry — resolve relative to the agent dir.
-  const dir = join(NORMAL_AGENT_DIR, spec);
-  if (!existsSync(dir)) return undefined;
-  const h = createHash("sha256");
-  const pj = join(dir, "package.json");
-  if (existsSync(pj)) h.update("pkg:" + (digestFile(pj) ?? "") + "\n");
-  hashTree(h, join(dir, "src"), (f) => /\.(ts|js|mjs|cjs)$/.test(f));
-  hashTree(h, join(dir, "extensions"), (f) => /\.(ts|js|mjs|cjs)$/.test(f));
-  hashTree(h, join(dir, "skills"), (f) => f.endsWith("/SKILL.md") || f.endsWith("\\SKILL.md"));
-  hashTree(h, join(dir, "prompts"), (f) => f.endsWith(".md"));
-  return h.digest("hex").slice(0, 12);
-}
-
-/** Deterministic fingerprint of everything a fresh `pi` process start in
- * `cwd` would load: the full canonical global settings.json (covers
- * enabledModels, provider/model defaults, packages, everything startup
- * reads), trust.json and keybindings.json when present, the global resource
- * roots, one marker per settings.packages entry, and the project scope
- * (.pi/settings.json + .pi resource roots) for this specific working dir.
- *
- * undefined means "could not read/parse a startup input right now", not "no
- * inputs" — callers must treat that as "cannot judge", never as a mismatch
- * against every session. Used identically on both sides of the comparison:
- * stamped by each session's own process at session_start (below), and read
- * fresh by the dashboard on every readSessions() call. */
-function computeStartupFingerprint(cwd: string): string | undefined {
-  try {
-    const h = createHash("sha256");
-    const agent = NORMAL_AGENT_DIR;
-    const settingsPath = join(agent, "settings.json");
-    // ONE parsed snapshot, used for both the settings hash and the packages
-    // loop below. Reading the file twice (once for each) could hash a hybrid
-    // if pi rewrites settings.json between the two reads (Red review, risk
-    // #4) — a false fingerprint from a moment of write-in-progress.
-    const settingsRaw = JSON.parse(readFileSync(settingsPath, "utf8")) as { packages?: unknown[] };
-    // Hash the parsed+stringified form, not the raw bytes: a format-only
-    // rewrite of settings.json must not flag a restart nothing needs.
-    h.update("settings:" + JSON.stringify(settingsRaw) + "\n");
-    for (const f of ["trust.json", "keybindings.json"]) {
-      const p = join(agent, f);
-      if (existsSync(p)) h.update(`${f}:${digestFile(p) ?? ""}\n`);
-    }
-    const isTsJs = (f: string) => /\.(ts|js|mjs|cjs)$/.test(f);
-    const isSkillMd = (f: string) => f.endsWith("/SKILL.md") || f.endsWith("\\SKILL.md");
-    hashTree(h, join(agent, "extensions"), isTsJs);
-    hashTree(h, join(agent, "skills"), isSkillMd);
-    hashTree(h, join(agent, "prompts"), (f) => f.endsWith(".md"));
-    hashTree(h, join(agent, "themes"), () => true);
-    for (const spec of settingsRaw.packages ?? []) {
-      const marker = packageMarker(String(spec));
-      if (marker !== undefined) h.update(`pkg:${spec}:${marker}\n`);
-    }
-    // Project scope: the same inputs a fresh process start in THIS directory
-    // would additionally load (project settings override global ones).
-    const projSettings = join(cwd, ".pi", "settings.json");
-    if (existsSync(projSettings)) h.update("proj-settings:" + (digestFile(projSettings) ?? "") + "\n");
-    hashTree(h, join(cwd, ".pi", "extensions"), isTsJs);
-    hashTree(h, join(cwd, ".pi", "skills"), isSkillMd);
-    hashTree(h, join(cwd, ".pi", "prompts"), (f) => f.endsWith(".md"));
-    hashTree(h, join(cwd, ".pi", "themes"), () => true);
-    return h.digest("hex").slice(0, 16);
-  } catch {
-    return undefined;
-  }
-}
-
-/** The -e environment arguments every tmux-spawned pi process needs, shared
- * by new-session (createTmuxSession) and respawn-pane (restartTmuxPane) so
- * the two launch paths cannot drift: a restart that forgot the status dir
- * would write its card where the dashboard never looks. */
-function tmuxLaunchEnv(): string[] {
-  return [
-    // A new process inherits the tmux SERVER's environment, which may lack
-    // our PATH entirely. Pin it so `pi` resolves regardless of how the
-    // server started.
-    "-e", `PATH=${process.env.PATH ?? ""}`,
-    // Dashboard-spawned sessions auto-opt-in to appearing on the dashboard
-    // (the session tracker below reads this at session_start) — an ad-hoc
-    // `pi` typed directly into a plain terminal does not set this, and stays
-    // invisible to the dashboard unless it runs /bg itself.
-    "-e", "PI_DASHBOARD_SPAWNED=1",
-    // Same class of bug /bg once had: a supervisor pointed at a non-default
-    // status dir must pass it on, or the session it starts writes its card
-    // where this dashboard will never look.
-    ...(process.env.PI_KING_STATUS_DIR ? ["-e", `PI_KING_STATUS_DIR=${process.env.PI_KING_STATUS_DIR}`] : []),
-  ];
-}
-
-export function createTmuxSession(name: string, dir: string, resumeSessionId?: string): { ok: boolean; message: string } {
-  const result = spawnSync(TMUX, [
-    "new-session", "-d", "-s", name,
-    "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
-    ...tmuxLaunchEnv(),
-    "-c", dir, "--", "pi", "--name", name,
-    // Resuming continues an existing transcript in place: same session id,
-    // same file. The new process overwrites the exited card with a live one.
-    ...(resumeSessionId ? ["--session", resumeSessionId] : []),
-  ], { encoding: "utf8", timeout: 5000 });
-  if (result.status !== 0) return { ok: false, message: `Failed to create session: ${tmuxError(result)}` };
-  return { ok: true, message: resumeSessionId ? `Resumed "${name}" in ${dir}.` : `Created "${name}" in ${dir}.` };
-}
 
 /** Full startup restart of the pi process inside an existing tmux pane, in
  * place: `tmux respawn-pane -k` kills the pane's current process and starts
@@ -1011,84 +380,10 @@ export function restoreRebootOrphans(): { restored: number; failed: number } {
   return { restored, failed };
 }
 
-/** The hub daemon's boot restore. Unlike restoreRebootOrphans it is NOT
- * gated on reboot proximity: the daemon starts with launchd at login (and
- * restarts on crash via KeepAlive), when the tmux server is down and every
- * window is gone — the user's intent on daemon start is "windows back".
- * Every visible card whose process is confirmably gone (dead, or a recycled
- * pid) and whose window does not already exist gets a fresh window, exactly
- * like the fleet recovery done by hand after the 2026-08-07 kill-server
- * accident. Deliberate: a session killed with X does come back — the card
- * is the only tombstone-free record; hit X again. */
-function restoreMissingSessions(): number {
-  let files: string[];
-  try {
-    files = readdirSync(SESSION_STATUS_DIR).filter((f) => f.endsWith(".json"));
-  } catch {
-    return 0;
-  }
-  const parsed: SessionStatusFile[] = [];
-  for (const file of files) {
-    try {
-      parsed.push(JSON.parse(readFileSync(join(SESSION_STATUS_DIR, file), "utf8")) as SessionStatusFile);
-    } catch {
-      // rare write race; skip, resolves next run
-    }
-  }
-  const live = livePiPids(parsed.map((raw) => raw.pid));
-  if (live === undefined) return 0; // ps unavailable: do not guess at liveness
-  let restored = 0;
-  for (const raw of selectRestoreCards(parsed, live)) {
-    if (!existsSync(raw.cwd)) continue;
-    const base = (raw.name ?? raw.project ?? "").trim() || raw.id.slice(0, 8);
-    const names = [base, `${base}-${raw.id.slice(0, 8)}`];
-    if (names.some((n) => tmuxSessionExists(TMUX, n))) continue; // window already there
-    let result = createTmuxSession(base, raw.cwd, raw.id);
-    if (!result.ok) result = createTmuxSession(names[1], raw.cwd, raw.id);
-    if (result.ok) restored++;
-  }
-  return restored;
-}
 
-/** The detached hub daemon (launchd KeepAlive agent com.stanz.pi-king-hub):
- * owns marker polling (1s tick), injection, macOS banner, and session-window
- * restore 24/7, so a job landing while the user is attached inside tmux
- * still pings — the E2E proved the interactive hub dies on attach and takes
- * the idle-wake loop with it. The TUI dashboard is a view of the same
- * state, attachable on demand; the .injected claim protocol dedupes
- * injections between daemon, dashboard, and session-side pi-jobs watchers.
- * Runs headless (no TUI): launchd wraps this in bin/pi-king --daemon. */
-async function runHubDaemon(ctx: ExtensionContext): Promise<void> {
-  // A tmux server with no sessions exits non-zero from has-session but is
-  // still "running" — start-server is a no-op when the server already exists.
-  spawnSync(TMUX, ["start-server"], { encoding: "utf8", timeout: 3000 });
-  const restored = restoreMissingSessions();
-  if (restored > 0) {
-    notifyMacOS(`pi-king hub`, `Restored ${restored} session window${restored === 1 ? "" : "s"} after a restart.`);
-  }
-  console.log(`[pi-king-hub] started ${new Date().toISOString()}${restored > 0 ? ` — restored ${restored} sessions` : ""}`);
-  const panel = new JobsPanel(ctx.sessionManager, ctx.cwd, undefined);
-  // Same 1s tick as the dashboard, but buildRows() — ps, tmux list-sessions,
-  // git-status caches, i.e. real subprocesses — is passed as a PROVIDER and
-  // called only when a marker actually needs an owner resolved. In steady
-  // state (nothing to deliver) an idle tick is a readdir plus a stat per
-  // marker and forks nothing; the previous shape ran the full fleet scan
-  // every second forever, ~86k of them a day with no marker in sight.
-  // Stale-pending reconciliation needs no code: dimming is render-side and
-  // nothing auto-deletes.
-  for (;;) {
-    try {
-      panel.poll(Date.now(), buildRows);
-    } catch (err) {
-      // One bad tick (tmux restarting, ps unavailable, an unreadable card)
-      // must not end the process: launchd would respawn it, and every
-      // respawn re-runs restoreMissingSessions(), which spawns sessions.
-      // Log and keep ticking.
-      console.error(`[pi-king-hub] tick failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-}
+/** The detached hub daemon moved out of this process entirely (2026-08-10):
+ * see scripts/hub-daemon.ts, wired through bin/pi-king --daemon. It shares
+ * fleet.ts and jobs.ts with the dashboard below; nothing here builds it. */
 
 /** True when it is safe to type text into this session's live pane right
  * now: the main agent is not mid-turn, AND no subagent behind it is running
@@ -2845,21 +2140,6 @@ function notifyDetached(ctx: ExtensionContext, body: string): void {
   } catch { /* notification is best-effort, never worth disturbing the session */ }
 }
 
-/** Exact-name existence check. `has-session -t <name>` does NOT do this:
- * tmux target resolution falls back to prefix and fnmatch matching, so
- * asking for "proj" returns success when only "proj-a1b2c3d4" exists —
- * verified against tmux 3.7b. On a machine running ten related session
- * names that reports a duplicate that is not there, which is exactly the
- * shape of an intermittent failure. Compare against the real list instead.
- * Module scope: shared by the dashboard, the /bg handoff, and the hub
- * daemon's boot restore. */
-function tmuxSessionExists(tmux: string, name: string): boolean {
-  const r = spawnSync(tmux, ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8", timeout: 3000 });
-  // A tmux server with no sessions exits non-zero; that is "no", not an error.
-  if (r.status !== 0) return false;
-  return String(r.stdout || "").split("\n").some((l) => l === name);
-}
-
 function installSessionTracker(pi: ExtensionAPI) {
   let state: TitleState = "idle";
   let activity = "Session started.";
@@ -3526,10 +2806,6 @@ export default function piDashboard(pi: ExtensionAPI) {
     description: "Launch directly into the cross-session tmux-backed dashboard hub, looping until quit",
     type: "boolean",
   });
-  pi.registerFlag("agents-hub-daemon", {
-    description: "Detached hub daemon (launchd KeepAlive agent): marker polling, injection, banner, and session-window restore with no TUI",
-    type: "boolean",
-  });
 
   // /jobs is registered inside the hub's session_start (see the agents-hub
   // branch below), never from the factory: the hub runs --no-tools
@@ -3592,16 +2868,9 @@ export default function piDashboard(pi: ExtensionAPI) {
         );
       },
     });
-    // Daemon mode: the launchd KeepAlive agent (com.stanz.pi-king-hub).
-    // Headless — no TUI, no terminal. Polls markers, injects, banners, and
-    // restores session windows until launchd takes it down; KeepAlive
-    // relaunches it if it ever dies. Everything it needs is already wired
-    // above (jobs command registration, tracker, subagent monitor).
-    if (pi.getFlag("agents-hub-daemon")) {
-      await runHubDaemon(ctx);
-      ctx.shutdown();
-      return;
-    }
+    // Daemon mode moved to scripts/hub-daemon.ts (plain node, not a pi
+    // process) — see bin/pi-king --daemon. This session_start no longer has
+    // a headless branch to dispatch to.
     if (ctx.mode !== "tui") {
       ctx.ui.notify("pi-king requires an interactive terminal.", "error");
       ctx.shutdown();
