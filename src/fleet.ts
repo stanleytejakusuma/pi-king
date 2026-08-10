@@ -26,7 +26,7 @@
  * below is unconditional instead), restartTmuxPane (respawn-in-place,
  * dashboard/ /bg only).
  */
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -535,6 +535,18 @@ export function tmuxError(result: ReturnType<typeof spawnSync>): string {
  * dashboard silently ignored the user's PI_CODING_AGENT_DIR and started against
  * a configuration they had not chosen. */
 export const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.env.HOME ?? ""}/.pi/agent`;
+/** Fix 2 of the 2026-08-10 tmux perf audit (docs/PERF-TMUX-SPEC.md): caps how
+ * many lines pi-tui's fullRender replays into the terminal, once
+ * tools/patch-pi-tui.mjs has been applied to the installed pi-tui dist
+ * (unpatched, this env var is simply inert — pi-tui ignores env vars it
+ * doesn't read). Only wired into tmux-spawned sessions: tmux is the slow
+ * drain path this exists for (measured ~6.5x slower than a fast pty), and
+ * native (non-tmux) pi sessions must stay byte-identical to upstream.
+ * Overridable via PI_KING_FULL_RENDER_CAP for experimentation; 3000 is the
+ * shipped default (Stanley, 2026-08-10: ~490KB/~16ms full-render bursts,
+ * ~48 screens of post-replay tmux scrollback). */
+const FULL_RENDER_CAP = process.env.PI_KING_FULL_RENDER_CAP?.trim() || "3000";
+
 /** The -e environment arguments every tmux-spawned pi process needs, shared
  * by new-session (createTmuxSession) and respawn-pane (restartTmuxPane) so
  * the two launch paths cannot drift: a restart that forgot the status dir
@@ -550,6 +562,7 @@ export function tmuxLaunchEnv(): string[] {
     // `pi` typed directly into a plain terminal does not set this, and stays
     // invisible to the dashboard unless it runs /bg itself.
     "-e", "PI_DASHBOARD_SPAWNED=1",
+    "-e", `PI_TUI_MAX_FULL_RENDER_LINES=${FULL_RENDER_CAP}`,
     // Same class of bug /bg once had: a supervisor pointed at a non-default
     // status dir must pass it on, or the session it starts writes its card
     // where this dashboard will never look.
@@ -557,9 +570,77 @@ export function tmuxLaunchEnv(): string[] {
   ];
 }
 
-export function createTmuxSession(name: string, dir: string, resumeSessionId?: string): { ok: boolean; message: string } {
+/** Terminal cell dimensions. Its own tiny type rather than reusing a
+ * DashboardEntry-adjacent shape: this is a *client* fact (what Ghostty is
+ * showing right now), unrelated to session state. */
+export type ClientSize = { w: number; h: number };
+
+function validSize(s: ClientSize | undefined): s is ClientSize {
+  return s !== undefined && Number.isFinite(s.w) && Number.isFinite(s.h) && s.w > 0 && s.h > 0;
+}
+
+/** Last-known real client size, persisted so the headless daemon (no
+ * attached terminal, no DashboardView to read a live number from) can still
+ * spawn sessions close to the right size instead of tmux's 80x24 default.
+ * Written by the dashboard whenever its tracked size changes (see
+ * DashboardView.setTermSize in index.ts); read by resolveSpawnSize below
+ * whenever a caller has no better, live number to hand it. */
+// Own override rather than deriving from SESSION_STATUS_DIR's parent: a test
+// pointing PI_KING_STATUS_DIR at an arbitrary scratch dir would otherwise
+// walk ".." into that scratch dir's real, unrelated, uncleaned-up parent
+// (e.g. the OS tmp root) instead of staying isolated.
+export const CLIENT_SIZE_FILE =
+  process.env.PI_KING_CLIENT_SIZE_FILE?.trim() || join(homedir(), ".pi", "king", "client-size.json");
+
+export function readClientSize(): ClientSize | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(CLIENT_SIZE_FILE, "utf8")) as Partial<ClientSize>;
+    const size = { w: Number(raw.w), h: Number(raw.h) };
+    return validSize(size) ? size : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeClientSize(size: ClientSize): void {
+  if (!validSize(size)) return;
+  try {
+    const prev = readClientSize();
+    if (prev && prev.w === size.w && prev.h === size.h) return; // unchanged: skip the write
+    mkdirSync(dirname(CLIENT_SIZE_FILE), { recursive: true });
+    writeFileSync(CLIENT_SIZE_FILE, JSON.stringify({ w: size.w, h: size.h, at: Date.now() }));
+  } catch {
+    // best-effort: a failed write here must not crash the dashboard
+  }
+}
+
+/** Sessions used to spawn at tmux's bare default (80x24, tmux's built-in
+ * fallback when nothing else is known) and only reach the real client size
+ * on first attach -- which under `window-size latest` forces a full
+ * rewrap-and-replay of the entire rendered transcript at exactly the
+ * moment a user switches into a session (measured: 10.9MB / 67,555 lines
+ * on a real 40MB session, ~350-550ms of frozen UI, 2026-08-10 tmux perf
+ * audit). Every caller of createTmuxSession should now start the window as
+ * close to the real client size as possible so that first attach has
+ * little or nothing left to resize. Three-tier fallback, in order: (1) a
+ * live size the caller already has in hand (DashboardView tracks its own
+ * from the layout engine's visible(w,h) hook -- more current than the
+ * persisted file within the same process); (2) the persisted last-known
+ * client size (the daemon's only option, since it has no attached
+ * terminal); (3) 224x63, this machine's normal full-screen Ghostty size,
+ * chosen over tmux's 80x24 as a strictly better first guess. */
+export const DEFAULT_SPAWN_SIZE: ClientSize = { w: 224, h: 63 };
+
+export function resolveSpawnSize(live?: ClientSize): ClientSize {
+  if (validSize(live)) return live;
+  return readClientSize() ?? DEFAULT_SPAWN_SIZE;
+}
+
+export function createTmuxSession(name: string, dir: string, resumeSessionId?: string, liveSize?: ClientSize): { ok: boolean; message: string } {
+  const size = resolveSpawnSize(liveSize);
   const result = spawnSync(TMUX, [
     "new-session", "-d", "-s", name,
+    "-x", String(size.w), "-y", String(size.h),
     "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
     ...tmuxLaunchEnv(),
     "-c", dir, "--", "pi", "--name", name,
@@ -617,6 +698,39 @@ export function tmuxSessionExists(tmux: string, name: string): boolean {
   // A tmux server with no sessions exits non-zero; that is "no", not an error.
   if (r.status !== 0) return false;
   return String(r.stdout || "").split("\n").some((l) => l === name);
+}
+
+/** Same marker string tools/patch-pi-tui.mjs writes on apply -- duplicated
+ * rather than imported (that script is deliberately standalone, runnable
+ * even if this module fails to load) but must never drift, since this is
+ * the ONLY thing that decides whether the daemon/dashboard warn. */
+const PI_TUI_PATCH_MARKER = "pi-king-tui-patch:v1";
+
+/** Best-effort yes/no: is the installed pi-tui's fullRender patched for
+ * Fix 2 (docs/PERF-TMUX-SPEC.md)? Always content-based -- scans the actual
+ * installed file, never trusts tools/patch-pi-tui.mjs's ~/.pi/king/
+ * tui-patch.json record, which a pi upgrade can silently invalidate without
+ * touching. Never throws: an unresolvable pi install, a missing file, or
+ * any other surprise all mean "can't confirm patched" -- treated the same
+ * as unpatched for warning purposes. The precise unpatched-vs-needs-review
+ * distinction lives in patch-pi-tui.mjs --check; this only answers the
+ * boolean the daemon and dashboard warnings need. */
+export function isPiTuiPatched(): boolean {
+  try {
+    const which = spawnSync("/usr/bin/env", ["which", "pi"], { encoding: "utf8", timeout: 3000 });
+    if (which.status !== 0) return false;
+    const piBin = String(which.stdout || "").trim().split("\n")[0];
+    if (!piBin) return false;
+    let dir = dirname(realpathSync(piBin));
+    for (let i = 0; i < 12 && dir !== "/" && dir !== "."; i++) {
+      const candidate = join(dir, "node_modules", "@earendil-works", "pi-tui", "dist", "tui-main-screen.js");
+      if (existsSync(candidate)) return readFileSync(candidate, "utf8").includes(PI_TUI_PATCH_MARKER);
+      dir = dirname(dir);
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 export const KNOWN_STATES = new Set<string>(["working", "idle", "background", "attention", "error", "exited"]);

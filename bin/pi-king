@@ -45,6 +45,11 @@ case "${1:-}" in
     DAEMON="$(cd "$(dirname "$SELF")/.." && pwd)/scripts/hub-daemon.ts"
     exec node --experimental-strip-types "$DAEMON" "$@"
     ;;
+  --patch-tui|patch-tui)
+    shift
+    PATCH_TOOL="$(cd "$(dirname "$SELF")/.." && pwd)/tools/patch-pi-tui.mjs"
+    exec node "$PATCH_TOOL" "$@"
+    ;;
   --daemon-install)
     PLIST="$HOME/Library/LaunchAgents/com.stanz.pi-king-hub.plist"
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.pi/king"
