@@ -50,18 +50,28 @@ const PATCHED = `            const __piKingRenderCap = Number(process.env.PI_TUI
                 if (i > __piKingRenderStart)
                     buffer += "\\r\\n";`;
 
-/** Finds the installed pi-tui dist by resolving through the real pi
- * install, never a hardcoded path — homebrew (Apple Silicon), /usr/local
- * (Intel), npm global, and per-user installs all put node_modules in
- * different places, but `pi`'s own realpath always sits inside the
- * package whose node_modules holds pi-tui as a dependency. */
+/** Test/CI escape hatch: an explicit path, bypassing `which` entirely.
+ * 2026-08-10 incident: a sandboxed test run intended to target a scratch
+ * copy under /tmp instead silently fell through to the REAL installed
+ * pi-tui and patched it (caught immediately, reverted byte-exact from the
+ * .orig backup this tool itself makes — see docs/PERF-TMUX-SPEC.md's
+ * changelog). Root mechanism confirmed: `which` silently skips a PATH
+ * entry whose target isn't executable and falls through to the next
+ * match — PATH-shadowing is fundamentally the wrong tool for isolating a
+ * program whose entire job is "find things via which". This override
+ * makes that class of mistake structurally impossible: any future sandbox
+ * test sets PI_KING_PI_TUI_TARGET instead of fighting PATH, so there is no
+ * `which` call in the loop to silently miss. */
 function findPiTuiFile() {
+  const forced = process.env.PI_KING_PI_TUI_TARGET?.trim();
+  if (forced) return forced;
   let piBin;
   try {
     piBin = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
   } catch {
     throw new Error("`pi` not found on PATH — is it installed?");
   }
+  if (!piBin) throw new Error("`pi` not found on PATH — is it installed?");
   let dir = dirname(realpathSync(piBin));
   const root = dirname(dir).split("/")[0] || "/";
   while (dir !== root && dir !== "/" && dir !== ".") {
