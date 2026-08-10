@@ -111,8 +111,16 @@ function status(target) {
     return "missing";
   }
   if (src.includes(PATCH_MARKER)) return "patched";
-  if (src.includes(ORIGINAL)) return "unpatched";
-  return "unknown"; // pi upgraded and changed this block — needs human re-review
+  // Exact-count, not just presence: `apply()` uses String.replace(ORIGINAL,
+  // ...), which only touches the FIRST match. A future pi-tui version that
+  // happens to contain a second, unrelated loop with this exact text would
+  // let replace() silently patch the wrong site while still reporting
+  // success -- the worst failure shape this tool has (found in review,
+  // 2026-08-10). Verified today's real dist has exactly one occurrence;
+  // treat anything other than exactly one as "needs a human", never guess.
+  const hits = src.split(ORIGINAL).length - 1;
+  if (hits === 1) return "unpatched";
+  return "unknown"; // 0 (pi changed the block) or 2+ (ambiguous) -- needs human re-review
 }
 
 function writeRecord(target, extra) {
