@@ -27,7 +27,7 @@
  * (wired through bin/pi-king --daemon; see there for the launchd plist).
  */
 import { spawnSync } from "node:child_process";
-import { TMUX, buildRows, isPiTuiPatched, restoreMissingSessions } from "../src/fleet.ts";
+import { TMUX, buildRows, isAcpCompactionGatePatched, isPiTuiPatched, restoreMissingSessions } from "../src/fleet.ts";
 import { JobsPanel, notifyMacOS, type SessionManagerLike } from "../src/jobs.ts";
 
 // The daemon never receives a keypress, so JobsPanel.resume() — the only
@@ -53,6 +53,18 @@ async function main(): Promise<void> {
   if (!isPiTuiPatched()) {
     console.log("[pi-king-hub] pi-tui unpatched — monolithic sessions will replay full renders under tmux; run `pi-king patch-tui` (docs/PERF-TMUX-SPEC.md Fix 2)");
   }
+  // ACP's compaction-gate hand-patch (~/.pi/agent/PATCHES.md) has been
+  // silently wiped twice in one evening by mechanisms never fully
+  // root-caused; Stanley chose npm-managed updates over an update-proof
+  // fork, so re-checking on every tick (not just at daemon start, unlike
+  // the pi-tui check above) is the accepted mitigation -- catches a wipe
+  // within ~1 minute of it happening instead of whenever someone next
+  // notices ACP behaving unsafely.
+  let acpPatched = isAcpCompactionGatePatched();
+  if (!acpPatched) {
+    console.log("[pi-king-hub] ACP compaction-gate patch missing at startup — session_before_compact may unconditionally cancel again; see ~/.pi/agent/PATCHES.md");
+  }
+  let acpCheckTick = 0;
   const panel = new JobsPanel(noSession, process.env.HOME ?? "/", undefined);
   // Same 1s tick as the dashboard, but buildRows() — ps, tmux list-sessions,
   // git-status caches, i.e. real subprocesses — is passed as a PROVIDER and
@@ -62,6 +74,20 @@ async function main(): Promise<void> {
   for (;;) {
     try {
       panel.poll(Date.now(), buildRows);
+      // Every ~60 ticks (~60s): re-check the ACP patch marker. A grep over
+      // one file every minute is negligible next to the 1s poll's own ps/
+      // tmux/git subprocess work; only alert on the true→false transition
+      // so a persistently-unpatched install doesn't spam a notification
+      // every minute forever.
+      if (++acpCheckTick >= 60) {
+        acpCheckTick = 0;
+        const nowPatched = isAcpCompactionGatePatched();
+        if (acpPatched && !nowPatched) {
+          console.error("[pi-king-hub] ACP compaction-gate patch just vanished — session_before_compact may unconditionally cancel again; see ~/.pi/agent/PATCHES.md");
+          notifyMacOS("pi-king hub — ACP patch reverted", "billion-context-pi's compaction-gate patch was silently wiped. Reapply per ~/.pi/agent/PATCHES.md.");
+        }
+        acpPatched = nowPatched;
+      }
     } catch (err) {
       // One bad tick (tmux restarting, ps unavailable, an unreadable card)
       // must not end the process: launchd would respawn it, and every

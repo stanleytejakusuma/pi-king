@@ -563,6 +563,16 @@ export function tmuxLaunchEnv(): string[] {
     // invisible to the dashboard unless it runs /bg itself.
     "-e", "PI_DASHBOARD_SPAWNED=1",
     "-e", `PI_TUI_MAX_FULL_RENDER_LINES=${FULL_RENDER_CAP}`,
+    // ACP (billion-context-pi) has its own internal self-updater that runs
+    // `npm install` independent of `pi update`/settings.json pins — it
+    // controls context-compaction safety logic, so silent unreviewed
+    // updates are a real risk (2026-08-11 incident: fired from a 2-day-old
+    // stale session despite acp.json's autoUpdate:false + a version pin).
+    // This documented env killswitch (checked before ACP's own config) is
+    // the only fix that reaches already-cached in-memory sessions' future
+    // respawns; `pi update --extension npm:billion-context-pi` remains the
+    // sole, reviewable update path.
+    "-e", "ACP_AUTO_UPDATE=0",
     // Same class of bug /bg once had: a supervisor pointed at a non-default
     // status dir must pass it on, or the session it starts writes its card
     // where this dashboard will never look.
@@ -700,11 +710,19 @@ export function tmuxSessionExists(tmux: string, name: string): boolean {
   return String(r.stdout || "").split("\n").some((l) => l === name);
 }
 
-/** Same marker string tools/patch-pi-tui.mjs writes on apply -- duplicated
+/** Same marker strings tools/patch-pi-tui.mjs writes on apply -- duplicated
  * rather than imported (that script is deliberately standalone, runnable
  * even if this module fails to load) but must never drift, since this is
- * the ONLY thing that decides whether the daemon/dashboard warn. */
-const PI_TUI_PATCH_MARKER = "pi-king-tui-patch:v1";
+ * the ONLY thing that decides whether the daemon/dashboard warn.
+ *
+ * BOTH must be present to count as patched: they are independent fixes to
+ * different files (tui-main-screen.js's full-render write cap, utils.js's
+ * width-cache size) and a pi upgrade can clobber one while leaving the
+ * other, so a partial state must warn rather than average out to healthy. */
+const PI_TUI_PATCH_SITES: ReadonlyArray<{ file: string; marker: string }> = [
+  { file: "tui-main-screen.js", marker: "pi-king-tui-patch:v1" },
+  { file: "utils.js", marker: "pi-king-tui-patch:widthcache-v1" },
+];
 
 /** Best-effort yes/no: is the installed pi-tui's fullRender patched for
  * Fix 2 (docs/PERF-TMUX-SPEC.md)? Always content-based -- scans the actual
@@ -723,11 +741,48 @@ export function isPiTuiPatched(): boolean {
     if (!piBin) return false;
     let dir = dirname(realpathSync(piBin));
     for (let i = 0; i < 12 && dir !== "/" && dir !== "."; i++) {
-      const candidate = join(dir, "node_modules", "@earendil-works", "pi-tui", "dist", "tui-main-screen.js");
-      if (existsSync(candidate)) return readFileSync(candidate, "utf8").includes(PI_TUI_PATCH_MARKER);
+      const dist = join(dir, "node_modules", "@earendil-works", "pi-tui", "dist");
+      if (existsSync(join(dist, "tui-main-screen.js"))) {
+        return PI_TUI_PATCH_SITES.every((site) => {
+          try {
+            return readFileSync(join(dist, site.file), "utf8").includes(site.marker);
+          } catch {
+            return false;
+          }
+        });
+      }
       dir = dirname(dir);
     }
     return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Same marker string ~/.pi/agent/PATCHES.md documents for the compaction-
+ * gate redesign -- duplicated (not imported) for the same reason as the
+ * pi-tui marker above: this must be able to detect the patch is gone even
+ * if something about the ACP package itself is broken. Content-based only,
+ * matching isPiTuiPatched()'s contract: this hand-patch has now been
+ * silently wiped twice in one evening (2026-08-11) by mechanisms never
+ * fully root-caused, and Stanley explicitly chose to keep npm-managed
+ * auto-updates over forking it immune -- so detecting a silent revert
+ * quickly is the accepted mitigation, not prevention. */
+const ACP_COMPACTION_PATCH_MARKER = "SAFETY_CEILING_PCT";
+
+/** Best-effort yes/no: is billion-context-pi's session_before_compact hook
+ * still patched with the safe escape hatches, or has it silently reverted
+ * to upstream's unconditional cancel:true? Always content-based, never
+ * trusts an install-time record -- same contract as isPiTuiPatched(). Path
+ * is fixed (not resolved via `which pi` like pi-tui) because ACP is
+ * installed into pi's own agent npm dir, not hoisted alongside the pi
+ * binary. Never throws: a missing/unreadable file means "can't confirm
+ * patched", treated as unpatched for warning purposes. */
+export function isAcpCompactionGatePatched(): boolean {
+  try {
+    const candidate = join(process.env.HOME ?? "/", ".pi", "agent", "npm", "node_modules", "billion-context-pi", "dist", "index.js");
+    if (!existsSync(candidate)) return false;
+    return readFileSync(candidate, "utf8").includes(ACP_COMPACTION_PATCH_MARKER);
   } catch {
     return false;
   }

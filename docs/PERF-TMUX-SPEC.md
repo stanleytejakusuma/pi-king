@@ -1,7 +1,14 @@
 # Spec: making pi-king sessions feel native (tmux perf fixes)
 
-Status: DRAFT — nothing implemented. Audit evidence gathered 2026-08-10,
-read-only, sandboxed tmux server only, live fleet untouched.
+Status: Fixes 1, 2 and 5 IMPLEMENTED (2026-08-10/11). Fix 3 is Stanley's
+config line; Fix 4 is upstream. Audit evidence originally gathered
+2026-08-10, read-only, sandboxed tmux server only, live fleet untouched.
+
+**Read Fix 5 first if you are here about typing lag.** The original audit
+below blamed the full-render WRITE path, and that is real but is NOT what
+caused the reported lag on the pinned session — a 2026-08-11 profile found
+the cost is in BUILDING each frame, not writing it. Fix 2 does not address
+it; Fix 5 does, and is a 328x measured win.
 
 ## Problem
 
@@ -208,6 +215,92 @@ replays. Removes tearing/flicker; does **not** shorten drains (that's Fix 2).
 2. pi-tui: honor terminal focus events (`CSI I/O`, tmux `focus-events on`) to
    pause spinner-driven renders while unfocused — with 19 panes, all but one
    render invisibly at full rate today.
+
+## Fix 5 — pi-tui width-cache thrash (the BUILD cost) — IMPLEMENTED 2026-08-11
+
+**This is the fix for the reported typing lag.** Fixes 1-2 target the cost of
+*writing* a frame; this targets the cost of *building* one, which turned out
+to dominate by orders of magnitude on a large session.
+
+**How the original diagnosis was falsified.** The pinned session
+'Alexandria (RAG Design)' (45MB transcript, 12,269 rendered lines) showed
+visible keystroke lag. A 15s screen recording gave a **166.7ms freeze**
+against an 8.3ms base frame cadence (two consecutive extracted frames were
+byte-identical while the user typed continuously). But `PI_DEBUG_REDRAW=1`
+was live on that session, and **every one of pi-tui's 8 fullRender call
+sites is preceded by a logRedraw** (verified by reading the source) — the
+log recorded **zero fullRender events during the entire recording**. The
+write path was not involved.
+
+**What a `sample`(1) profile of the live process actually showed** (4s,
+215 main-thread samples):
+
+| Cost centre | Share |
+|---|---|
+| `uv__run_timers` (the render tick) | 69% |
+| ICU (`icu_78::*`, mostly `RuleBasedBreakIterator::clone()`) | **33%** |
+| GC | 26% |
+| pty writes | **0%** |
+
+**Root cause.** `utils.js`'s `visibleWidth()` memoises grapheme-aware widths
+in a Map bounded by `WIDTH_CACHE_SIZE = 512` with FIFO eviction. It fast-
+paths pure-ASCII strings, but **100% of real rendered lines carry ANSI
+colour escapes** (measured directly off the live pane: 38/38 visible lines),
+so nothing takes that fast path and the working set is the entire document.
+512 entries against 12,269 lines is 24x over capacity, and under the
+renderer's sequential full-document scan a FIFO that small collapses to a
+~0% hit rate: every entry is evicted just before it is needed again. Every
+line then re-runs `Intl.Segmenter`, cloning an ICU BreakIterator per call.
+
+The differential renderer is what drives this: it receives `newLines` — the
+whole document, already rendered — and diffs it against `previousLines`. So
+even when the write is tiny, the **build is O(document) on every tick**.
+
+**This is a cliff, not a slope.** Under capacity is ~100% hits; one entry
+over is ~0%. That is why one session lags badly while a smaller one is
+perfectly smooth, with no gradual degradation in between to warn you.
+
+**Change:** `WIDTH_CACHE_SIZE` 512 -> 65536, in `utils.js`, applied by
+`tools/patch-pi-tui.mjs` as its second patch site (same content-verified,
+idempotent, revertible machinery as Fix 2; both sites apply and revert as
+one unit, and a partial state reports unpatched rather than healthy).
+
+Unconditional, unlike Fix 2's env gate: this is pure memoisation of a pure
+function, so there is no behaviour to opt into — only how often a width is
+recomputed. An env knob would just add a way to leave the bug switched on.
+
+**Measured on the real installed dist, 12,269 real ANSI-styled lines:**
+
+| | per full-document pass |
+|---|---|
+| 512 (shipped, from the `.orig` backup) | **983.7 ms** |
+| 65536 (patched) | **3.0 ms** |
+
+328x. That single number explains all three observed symptoms: the 166.7ms
+freeze, the sustained ~82% CPU on an idle-looking TUI, and why it presents
+as the UI locking rather than slowing.
+
+**Correctness:** 12,269 lines x {`visibleWidth`, `truncateToWidth`},
+**0 mismatches** against the unpatched module. A larger memo cache cannot
+change a result, only how often one is recomputed. Cost: ~0.6MB heap
+(against 941MB process RSS).
+
+**KNOWN CEILING — do not call this solved.** 65536 is flat, giving ~8x
+headroom over today's 12,269-line working set; the same cliff returns near
+~65k distinct rendered lines. LRU would NOT help: a sequential full-document
+scan is LRU's pathological case too, so only capacity > working set matters.
+Adaptive sizing was rejected as over-engineering for a one-number patch to
+someone else's dist. The real fix is upstream (Fix 4.1): layout must not be
+recomputed for every line of an unchanged document on every tick. This buys
+headroom; it does not fix the architecture. The boring mitigation for the
+ceiling is the same one that always applied: restart long-lived sessions.
+
+**Acceptance:** re-run `sample`(1) on the pinned session after it restarts;
+the ICU share should collapse from 33% toward ~0. Evidence before "fixed" —
+the patch is verified at rest, not yet observed on a live restarted session.
+
+**Rollback:** `pi-king patch-tui --revert` (restores both sites byte-exact
+from their `.orig` backups).
 
 ## Considered and rejected
 

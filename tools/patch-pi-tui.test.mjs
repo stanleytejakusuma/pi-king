@@ -25,9 +25,15 @@ const originalBlock = `            for (let i = 0; i < newLines.length; i++) {
                     buffer += "\\r\\n";
                 const line = newLines[i];`;
 
-function fixture(dir, body = originalBlock) {
+// Second patch site (Fix 5, utils.js). The tool applies both sites as one
+// unit, so every fixture must provide both files or apply() correctly
+// refuses on the missing one.
+const originalWidthCache = `const WIDTH_CACHE_SIZE = 512;`;
+
+function fixture(dir, body = originalBlock, widthBody = originalWidthCache) {
   const path = join(dir, "tui-main-screen.js");
   writeFileSync(path, `// fixture\n${body}\n// end fixture\n`);
+  writeFileSync(join(dir, "utils.js"), `// fixture\n${widthBody}\n// end fixture\n`);
   return path;
 }
 
@@ -142,6 +148,45 @@ test("missing target file: --check reports missing, exit 1 (not a crash)", () =>
   const r = run(["--check"], target);
   assert.equal(r.code, 1);
   assert.match(r.stdout, /missing/);
+  cleanup();
+});
+
+test("width-cache site: apply raises WIDTH_CACHE_SIZE and marks it, revert restores byte-exact", () => {
+  const target = fixture(fresh());
+  const utils = join(dir, "utils.js");
+  const before = readFileSync(utils, "utf8");
+  assert.equal(run([], target).code, 0);
+  const after = readFileSync(utils, "utf8");
+  assert.match(after, /const WIDTH_CACHE_SIZE = 65536;/);
+  assert.equal((after.match(/pi-king-tui-patch:widthcache-v1/g) ?? []).length, 1);
+  assert.equal(readFileSync(`${utils}.orig`, "utf8"), before, ".orig must be byte-identical to pre-patch content");
+  assert.equal(run(["--revert"], target).code, 0);
+  assert.equal(readFileSync(utils, "utf8"), before, "revert must restore byte-exact original");
+  cleanup();
+});
+
+test("partial patch state (one site clobbered by an upgrade) reports unpatched, never healthy", () => {
+  const target = fixture(fresh());
+  assert.equal(run([], target).code, 0);
+  // Simulate an upgrade that replaced utils.js but happened to leave
+  // tui-main-screen.js patched: the pair must not average out to "patched".
+  writeFileSync(join(dir, "utils.js"), `// fixture\n${originalWidthCache}\n// end fixture\n`);
+  const r = run(["--check"], target);
+  assert.equal(r.code, 1, "a half-patched install must not report healthy");
+  assert.match(r.stdout, /patched/);
+  assert.match(r.stdout, /unpatched/);
+  cleanup();
+});
+
+test("an unrecognised site refuses the WHOLE run, leaving the other site untouched", () => {
+  // utils.js mutated (unknown), tui-main-screen.js pristine (patchable).
+  // A half-applied pair is worse than none: the daemon warning would clear
+  // while a real regression stayed live.
+  const target = fixture(fresh(), originalBlock, "const WIDTH_CACHE_SIZE = 999;");
+  const before = readFileSync(target, "utf8");
+  const r = run([], target);
+  assert.equal(r.code, 2);
+  assert.equal(readFileSync(target, "utf8"), before, "the patchable site must be left untouched when a sibling site is unknown");
   cleanup();
 });
 
