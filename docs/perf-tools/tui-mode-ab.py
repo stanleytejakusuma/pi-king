@@ -34,7 +34,13 @@ touches the fleet's default socket.
 """
 import argparse, fcntl, json, os, pty, re, select, signal, struct, subprocess, sys, termios, time
 
-CLI = "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+# Overridable so the same harness can A/B two INSTALLS, not just two TUI modes:
+# `PI_PERF_CLI=~/.pi-lab/pi-coding-agent/dist/cli.js` runs the arm against a
+# patched clone while the default arm runs the untouched system install.
+CLI = os.environ.get(
+    "PI_PERF_CLI",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+)
 PROMPT = "List the numbers 1 through 300, one per line, nothing else. Do not use any tools."
 SOCKET = "pikingperf"
 TMUX_SESSION = "perf"
