@@ -511,14 +511,97 @@ export function findArc(idOrName: string): ArcRecord | undefined {
     ?? arcs.find((a) => a.id.startsWith(idOrName));
 }
 
+/** Exact names of the tmux sessions that exist right now. One list-sessions
+ * call for the whole listing rather than a has-session per arc, and exact
+ * because tmux target resolution falls back to prefix matching (see
+ * fleet.tmuxSessionExists). */
+function liveSessionNames(): Set<string> {
+  const r = spawnSync(TMUX, ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8", timeout: 3000 });
+  // A tmux server with no sessions exits non-zero; that is "none", not an error.
+  if (r.status !== 0) return new Set();
+  return new Set(String(r.stdout || "").split("\n").map((s) => s.trim()).filter(Boolean));
+}
+
+/** The arc's own status card, keyed by session id (the dashboard's file).
+ * undefined means NO CARD — a different thing from a card saying "exited". */
+function statusOf(id: string): string | undefined {
+  try {
+    const c = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${id}.json`), "utf8")) as { status?: string };
+    return typeof c.status === "string" ? c.status : "?";
+  } catch { return undefined; }
+}
+
+export type ArcState = ArcRecord & {
+  /** "closed", the card's own status, or "gone" when there is neither a card
+   * nor a window to ask. */
+  status: string;
+  /** Closed on purpose, or provably over. */
+  finished: boolean;
+};
+
+/** Decorate lineage records with what is actually true right now.
+ *
+ * lineage.json records the RELATIONSHIP and is only written when someone types
+ * /arc close, so it drifts: it read 6 arcs open while 4 were live. An arc with
+ * no status card AND no tmux session is finished whether or not anyone said
+ * so, and is reported as such — but NOT written back. Listing stays a read;
+ * a `/arc` that silently rewrote lineage would surprise the next reader. */
+export function arcStates(arcs: ArcRecord[]): ArcState[] {
+  const live = liveSessionNames();
+  return arcs.map((a) => {
+    const card = statusOf(a.id);
+    const gone = card === undefined && !live.has(a.name);
+    return {
+      ...a,
+      status: a.closedAt ? "closed" : card ?? (gone ? "gone" : "no card"),
+      finished: a.closedAt != null || gone,
+    };
+  });
+}
+
+/** What `/arc` lists: open arcs only, unless `all`. */
+export function listArcs(opts: { parentId?: string; all?: boolean } = {}): ArcState[] {
+  const states = arcStates(opts.parentId ? arcsOf(opts.parentId) : allArcs());
+  return opts.all ? states : states.filter((a) => !a.finished);
+}
+
+/**
+ * Close an arc: kill its tmux session, keep its transcript.
+ *
+ * Closing used to be bookkeeping only, so every closed arc left a live pi
+ * process idling in the fleet and the list only ever grew. The transcript is
+ * the artifact worth keeping (arc_digest reads it); the window is not.
+ */
 export function closeArc(idOrName: string): { ok: boolean; message: string } {
   const l = readLineage();
   const a = l.arcs.find((x) => x.id === idOrName || x.name === idOrName || x.id.startsWith(idOrName));
   if (!a) return { ok: false, message: `No arc matching "${idOrName}".` };
-  if (a.closedAt) return { ok: true, message: `Arc "${a.name}" was already closed.` };
-  a.closedAt = Date.now();
-  writeLineage(l);
-  return { ok: true, message: `Arc "${a.name}" marked closed. Its window and transcript are untouched — kill it yourself when you're done reading.` };
+  // Same rule /bg enforces before a handoff: killing mid-turn discards the
+  // in-flight response and any subagents it started. "attention" is NOT
+  // refused — nothing is running, the arc is parked on a question — but the
+  // picker labels it so choosing it is deliberate.
+  if (statusOf(a.id) === "working") {
+    return { ok: false, message: `Arc "${a.name}" is mid-turn — closing now would discard its in-flight response and kill its subagents. Let it finish, then close.` };
+  }
+  const running = liveSessionNames().has(a.name);
+  if (running) {
+    // "=name" is an EXACT target. Without the "=" tmux falls back to prefix and
+    // fnmatch matching, so closing "arc-fix" could kill "arc-fix-smoketest".
+    const r = spawnSync(TMUX, ["kill-session", "-t", `=${a.name}`], { encoding: "utf8", timeout: 5000 });
+    if (r.status !== 0) {
+      return { ok: false, message: `Could not kill tmux session "${a.name}": ${String(r.stderr || "").trim() || `tmux exited ${r.status}`}` };
+    }
+  } else if (a.closedAt) {
+    return { ok: true, message: `Arc "${a.name}" was already closed.` };
+  }
+  if (!a.closedAt) {
+    a.closedAt = Date.now();
+    writeLineage(l);
+  }
+  return {
+    ok: true,
+    message: `Arc "${a.name}" closed — ${running ? "tmux session killed" : "no tmux session was running"}. Transcript kept at ${a.sessionFile}; \`/arc all\` still lists it.`,
+  };
 }
 
 /**

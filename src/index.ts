@@ -105,7 +105,7 @@ import {
   type DayTotal,
 } from "./data.ts";
 import { Type } from "typebox";
-import { allArcs, arcsOf, closeArc, dispatchSession, extractConversation, findArc, slugForTask, spawnArc } from "./arc.ts";
+import { closeArc, dispatchSession, extractConversation, findArc, listArcs, slugForTask, spawnArc } from "./arc.ts";
 import { JobsPanel, notifyMacOS, scanJobs, selectRestoreCards, type SessionManagerLike } from "./jobs.ts";
 import {
   RETIRED_STATES,
@@ -2915,11 +2915,11 @@ function installSessionTracker(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("arc", {
-    description: "Jump to an arc spawned from this session (pi-king). `/arc close <name>` marks one done.",
+    description: "Jump to an arc spawned from this session (pi-king). `/arc all` includes closed ones; `/arc close <name>` kills one's window.",
     handler: async (args, ctx) => {
       if (!isInteractive(ctx)) return;
-      // Bookkeeping only: closing flags the arc in lineage.json so /arc stops
-      // offering it as live work. The window and transcript are left alone.
+      // Closing kills the arc's tmux session and keeps its transcript — the
+      // window is the disposable half. See closeArc.
       const closeTarget = args.trim().replace(/^close\s*/, "");
       if (args.trim().startsWith("close")) {
         if (!closeTarget) { ctx.ui.notify("Usage: /arc close <name>", "info"); return; }
@@ -2927,40 +2927,64 @@ function installSessionTracker(pi: ExtensionAPI) {
         ctx.ui.notify(r.message, r.ok ? "info" : "error");
         return;
       }
-      const mine = arcsOf(ctx.sessionManager.getSessionId());
-      const rows = mine.length > 0 ? mine : allArcs().slice(0, 10);
+      // Default view is open arcs only, so closing actually declutters; the
+      // closed ones stay one `/arc all` away.
+      const all = args.trim() === "all";
+      const mine = listArcs({ parentId: ctx.sessionManager.getSessionId(), all });
+      const rows = mine.length > 0 ? mine : listArcs({ all }).slice(0, 10);
       if (rows.length === 0) {
-        ctx.ui.notify("No arcs yet. Ask for one when work gets substantial, or call arc_spawn.", "info");
+        ctx.ui.notify(
+          all
+            ? "No arcs yet. Ask for one when work gets substantial, or call arc_spawn."
+            : "No open arcs. `/arc all` lists closed ones too.",
+          "info",
+        );
         return;
       }
-      // Live state per arc, read from the card rather than from lineage.json:
+      // Live state per arc comes from the card rather than lineage.json:
       // lineage records the RELATIONSHIP, the card records what the session is
       // doing right now. "attention" is the one that matters — it means the arc
       // is blocked waiting on the user, which is invisible from a plain list
       // and is exactly why this command needed to be more than a printout.
-      const state = (id: string): string => {
-        try {
-          const c = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${id}.json`), "utf8")) as { status?: string; pid?: number };
-          return c.status ?? "?";
-        } catch { return "gone"; }
-      };
       const pidOf = (id: string): number | undefined => {
         try {
           const c = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${id}.json`), "utf8")) as { pid?: number };
           return typeof c.pid === "number" ? c.pid : undefined;
         } catch { return undefined; }
       };
-      const labels = rows.map((a) => {
+      const label = (a: (typeof rows)[number]): string => {
         const age = Math.round((Date.now() - a.createdAt) / 60000);
-        const st = a.closedAt ? "closed" : state(a.id);
-        const mark = st === "attention" ? "⚠ waiting on you" : st;
-        return `${a.closedAt ? "○" : "●"} ${a.name} — ${mark} — ${age}m — ${a.cwd}`;
-      });
+        const mark = a.status === "attention" ? "⚠ waiting on you" : a.status;
+        return `${a.finished ? "○" : "●"} ${a.name} — ${mark} — ${age}m — ${a.cwd}`;
+      };
+      const labels = rows.map(label);
+      // A slash command is a guest in someone else's TUI: `select` and
+      // `confirm` are the whole UI budget, there is no key handler to bind an
+      // "x" to. A trailing row is the closest reachable thing — and it means
+      // nobody has to type a session name.
+      const CLOSE_ROW = "✂ Close a finished arc…";
       const picked = await ctx.ui.select(
         mine.length > 0 ? "Arcs from this session" : "Recent arcs (none from this session)",
-        labels,
+        [...labels, CLOSE_ROW],
       );
       if (!picked) return;
+      if (picked === CLOSE_ROW) {
+        const closable = rows.filter((a) => !a.closedAt);
+        if (closable.length === 0) { ctx.ui.notify("Every arc listed is already closed.", "info"); return; }
+        const closeLabels = closable.map(label);
+        const pick = await ctx.ui.select("Close which arc? (kills its window, keeps its transcript)", closeLabels);
+        if (!pick) return;
+        const target = closable[closeLabels.indexOf(pick)];
+        if (!target) return;
+        const yes = await ctx.ui.confirm(
+          `Close arc "${target.name}"?`,
+          `Kills its tmux session (currently ${target.status}). The transcript stays on disk and \`/arc all\` still lists it.`,
+        );
+        if (!yes) return;
+        const r = closeArc(target.id);
+        ctx.ui.notify(r.message, r.ok ? "info" : "error");
+        return;
+      }
       const arc = rows[labels.indexOf(picked)];
       if (!arc) return;
       // Reuse the dashboard's own attach path: inside tmux it relocates the

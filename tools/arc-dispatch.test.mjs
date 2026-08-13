@@ -39,6 +39,9 @@ writeFileSync(
     '  has-session) [ -f "$D/session_exists" ] && exit 0 || exit 1 ;;',
     '  new-session) [ -f "$D/new_session_fails" ] && exit 1 || exit 0 ;;',
     '  load-buffer) [ -f "$D/load_fails" ] && exit 1 || exit 0 ;;',
+    // The live session list, one name per line, driven by $D/sessions. Absent
+    // file = no sessions, which is what a bare scratch fleet should look like.
+    '  list-sessions) cat "$D/sessions" 2>/dev/null; exit 0 ;;',
     "  capture-pane)",
     '    n=$(cat "$D/frame" 2>/dev/null || echo 0)',
     '    echo $((n + 1)) > "$D/frame"',
@@ -82,7 +85,7 @@ process.env.HOME = HOME;
 process.env.PI_KING_TMUX = FAKE;
 process.env.PI_KING_STATUS_DIR = STATUS;
 process.env.PI_KING_POLL_SEC = "0";
-const { dispatchSession, sessionDirFor, slugForTask, spawnArc } = await import("../src/arc.ts");
+const { closeArc, dispatchSession, listArcs, sessionDirFor, slugForTask, spawnArc } = await import("../src/arc.ts");
 
 const READY = "escape interrupt";
 const TASK = "Fix the flaky retry test in the uploader";
@@ -259,4 +262,111 @@ test("sessionDirFor resolves symlinks so the seed lands where pi looks", () => {
 test("sessionDirFor falls back to the literal path when the dir does not exist", () => {
   const ghost = join(tmpdir(), "pi-king-absent-" + Date.now());
   assert.match(sessionDirFor(ghost), /pi-king-absent-\d+--$/);
+});
+
+// --- closing an arc ---------------------------------------------------------
+// Closing used to be bookkeeping: it set closedAt and left a live pi process
+// idling in the fleet forever. It now kills the window and keeps the
+// transcript, which is what "close" already implied.
+const LINEAGE = join(HOME, ".pi", "king", "lineage.json");
+/** One lineage record. sessionFile is real on disk so "transcript kept" is
+ * checkable rather than asserted. */
+const rec = (name, over = {}) => {
+  const file = join(scratch, `${name}.jsonl`);
+  writeFileSync(file, "{}\n");
+  return { id: `id-${name}`, parentId: "parent-9", name, cwd: scratch, brief: "b", sessionFile: file, createdAt: Date.now(), closedAt: null, ...over };
+};
+const setLineage = (arcs) => {
+  mkdirSync(join(HOME, ".pi", "king"), { recursive: true });
+  writeFileSync(LINEAGE, JSON.stringify({ arcs }, null, 1));
+};
+/** What the fake tmux reports as live. */
+const setSessions = (names) => writeFileSync(join(scratch, "sessions"), names.join("\n"));
+/** An arc's status card, keyed by session id like the dashboard writes it. */
+const writeArcCard = (id, status) =>
+  writeFileSync(join(STATUS, `${id}.json`), JSON.stringify({ status, lastActivity: Date.now() }));
+
+test("closing kills the tmux session by EXACT name and keeps the transcript", () => {
+  reset();
+  clearCards();
+  const arcs = [rec("arc-fix"), rec("arc-fix-smoketest")];
+  setLineage(arcs);
+  setSessions(["arc-fix", "arc-fix-smoketest"]);
+  writeArcCard("id-arc-fix", "idle");
+  const r = closeArc("arc-fix");
+  assert.equal(r.ok, true, r.message);
+  // The "=" is the whole point: without it tmux falls back to prefix matching
+  // and "arc-fix" would take "arc-fix-smoketest" down with it.
+  assert.deepEqual(log().filter((l) => l.startsWith("kill-session")), ["kill-session -t =arc-fix"]);
+  assert.ok(existsSync(arcs[0].sessionFile), "the transcript must survive the close");
+  const after = JSON.parse(readFileSync(LINEAGE, "utf8")).arcs;
+  assert.ok(after.find((a) => a.name === "arc-fix").closedAt > 0);
+  assert.equal(after.find((a) => a.name === "arc-fix-smoketest").closedAt, null, "the sibling is untouched");
+});
+
+test("an arc that is mid-turn refuses to close", () => {
+  reset();
+  clearCards();
+  setLineage([rec("arc-busy")]);
+  setSessions(["arc-busy"]);
+  writeArcCard("id-arc-busy", "working");
+  const r = closeArc("arc-busy");
+  assert.equal(r.ok, false);
+  assert.match(r.message, /mid-turn/);
+  assert.equal(log().some((l) => l.startsWith("kill-session")), false, "nothing may be killed while a turn is in flight");
+  assert.equal(JSON.parse(readFileSync(LINEAGE, "utf8")).arcs[0].closedAt, null);
+});
+
+// "attention" is deliberately NOT refused: nothing is running, the arc is
+// parked on a question, and the picker labels it so the choice is deliberate.
+test("an arc waiting on the user closes (only a live turn blocks)", () => {
+  reset();
+  clearCards();
+  setLineage([rec("arc-asking")]);
+  setSessions(["arc-asking"]);
+  writeArcCard("id-arc-asking", "attention");
+  const r = closeArc("arc-asking");
+  assert.equal(r.ok, true, r.message);
+  assert.deepEqual(log().filter((l) => l.startsWith("kill-session")), ["kill-session -t =arc-asking"]);
+});
+
+test("closed arcs drop out of the default list and stay in /arc all", () => {
+  reset();
+  clearCards();
+  setLineage([rec("arc-open", { createdAt: 2000 }), rec("arc-done", { createdAt: 1000, closedAt: 1500 })]);
+  setSessions(["arc-open"]);
+  writeArcCard("id-arc-open", "idle");
+  assert.deepEqual(listArcs().map((a) => a.name), ["arc-open"]);
+  assert.deepEqual(listArcs({ all: true }).map((a) => `${a.name}:${a.status}`), ["arc-open:idle", "arc-done:closed"]);
+  assert.deepEqual(listArcs({ parentId: "parent-9" }).map((a) => a.name), ["arc-open"]);
+  assert.deepEqual(listArcs({ parentId: "nobody" }), []);
+});
+
+test("an arc with no card and no window is finished, without rewriting lineage", () => {
+  reset();
+  clearCards();
+  setLineage([rec("arc-ghost", { createdAt: 3000 }), rec("arc-live", { createdAt: 2000 }), rec("arc-tombstone", { createdAt: 1000 })]);
+  setSessions(["arc-live"]);
+  writeArcCard("id-arc-live", "idle");
+  // A card saying "exited" is NOT the same as no card: something reported it,
+  // so it stays listed and closable rather than vanishing on its own.
+  writeArcCard("id-arc-tombstone", "exited");
+  const before = readFileSync(LINEAGE, "utf8");
+  assert.deepEqual(listArcs().map((a) => a.name), ["arc-live", "arc-tombstone"]);
+  const all = listArcs({ all: true });
+  assert.equal(all.find((a) => a.name === "arc-ghost").status, "gone");
+  assert.equal(all.find((a) => a.name === "arc-tombstone").status, "exited");
+  assert.equal(readFileSync(LINEAGE, "utf8"), before, "listing is a read: it must never write lineage.json");
+});
+
+test("closing an arc whose window is already gone still records the close", () => {
+  reset();
+  clearCards();
+  setLineage([rec("arc-ghost2")]);
+  setSessions([]);
+  const r = closeArc("arc-ghost2");
+  assert.equal(r.ok, true, r.message);
+  assert.match(r.message, /no tmux session was running/);
+  assert.equal(log().some((l) => l.startsWith("kill-session")), false, "never fire kill-session at a name that is not live");
+  assert.ok(JSON.parse(readFileSync(LINEAGE, "utf8")).arcs[0].closedAt > 0);
 });
