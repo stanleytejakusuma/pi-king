@@ -124,6 +124,7 @@ import {
   tmuxSessionExists,
   writeClientSize,
   NORMAL_AGENT_DIR,
+  PI_BIN,
   LAYOUT_FILE,
   type ClientSize,
   type DashboardEntry,
@@ -289,7 +290,7 @@ export function restartTmuxPane(name: string, dir: string, sessionId: string): {
     "-c", dir,
     "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
     ...tmuxLaunchEnv(),
-    "--", "pi", "--name", name, "--session", sessionId,
+    "--", PI_BIN, "--name", name, "--session", sessionId,
   ], { encoding: "utf8", timeout: 5000 });
   if (result.status !== 0) return { ok: false, message: `Failed to restart "${name}": ${tmuxError(result)}` };
   return { ok: true, message: `Restarted "${name}" in ${dir}.` };
@@ -2811,7 +2812,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       // different HOME resolves a different transcript root, which fails the
       // same way the agent dir did.
       ...(process.env.HOME ? ["-e", `HOME=${process.env.HOME}`] : []),
-      "-c", ctx.cwd, "--", "pi", "--session", sessionId, "--name", name,
+      "-c", ctx.cwd, "--", PI_BIN, "--session", sessionId, "--name", name,
     ], { encoding: "utf8", timeout: 8000 });
     if (created.status !== 0) {
       ctx.ui.notify(`Could not hand off to tmux: ${String(created.stderr || "unknown").trim()}`, "error");

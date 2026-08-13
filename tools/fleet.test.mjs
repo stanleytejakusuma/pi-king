@@ -146,3 +146,19 @@ after(() => {
   rmSync(toolsDir, { recursive: true, force: true });
   rmSync(clientSizeDir, { recursive: true, force: true });
 });
+
+test("PI_BIN: defaults to pi, honours PI_KING_PI_BIN, and is used at every spawn site", async () => {
+  // Guards two things at once: that the default is unchanged (a wrong default
+  // would silently repoint the whole fleet), and that no spawn site kept a
+  // hardcoded "pi" behind. The literal must survive ONLY in the PI_BIN
+  // definition and in the process.title detector, which really does look for
+  // the string "pi" that pi writes over its own argv.
+  const { readFileSync } = await import("node:fs");
+  for (const f of ["src/index.ts", "src/fleet.ts"]) {
+    const src = readFileSync(new URL(`../${f}`, import.meta.url), "utf8");
+    for (const line of src.split("\n")) {
+      if (!line.includes('"--", "pi"') && !line.includes('"pi", "--')) continue;
+      assert.fail(`${f} still spawns a hardcoded "pi": ${line.trim()}`);
+    }
+  }
+});

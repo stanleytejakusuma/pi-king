@@ -137,6 +137,36 @@ rm -rf ~/.pi-lab ~/.local/bin/pix
 
 Neither touches the system install.
 
+## Running the whole fleet on the lab
+
+`PI_KING_PI_BIN` selects the binary every pi-king spawn site launches
+(`src/fleet.ts:554`). Set it where the dashboard and daemon can see it:
+
+```sh
+export PI_KING_PI_BIN="$HOME/.local/bin/pix"   # absolute, see below
+```
+
+Then restart the dashboard. Use an **absolute path**: tmux resolves a bare name
+against the tmux *server's* PATH, inherited whenever that server started, which
+can predate a shim in `~/.local/bin`.
+
+Three things to know before doing this:
+
+- **It only affects newly spawned sessions.** Node caches modules at require
+  time, so every already-running session keeps the renderer it started with.
+  Migration is therefore gradual and happens as sessions restart.
+- **Liveness detection still works.** `fleet.ts:252` identifies pi processes as
+  `cmd === "pi" || cmd.startsWith("pi-")`. pi overwrites its own argv via
+  `process.title`, so a `pix`-launched session still reports as bare `pi`.
+  Verified empirically 2026-08-13 — worth re-verifying if the launch path
+  changes, because the failure mode is the dashboard marking the entire fleet
+  dead.
+- **`isPiTuiPatched()` follows `PI_BIN`**, so the dashboard's patch warning
+  describes the install the fleet actually runs rather than the system one.
+
+To roll back: unset the variable and restart the dashboard. Sessions return to
+the system install as they restart.
+
 ## Promoting the patch
 
 Once proven, `pi-king patch-tui` applies it system-wide. Running sessions keep

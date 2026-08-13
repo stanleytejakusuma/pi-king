@@ -535,6 +535,23 @@ export function tmuxError(result: ReturnType<typeof spawnSync>): string {
  * dashboard silently ignored the user's PI_CODING_AGENT_DIR and started against
  * a configuration they had not chosen. */
 export const NORMAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || `${process.env.HOME ?? ""}/.pi/agent`;
+
+/** The pi binary every spawn site launches. Override with PI_KING_PI_BIN to
+ * run the fleet on an alternate install -- e.g. the patched clone at
+ * ~/.pi-lab reachable as `pix` (docs/PI-LAB.md).
+ *
+ * Safe with liveness detection: pi overwrites its command line via
+ * process.title, so a `pix`-launched session still reports as bare "pi" to
+ * ps and matches the check at fleet.ts:252. Verified empirically 2026-08-13 --
+ * do not assume it, the detector would silently mark the whole fleet dead.
+ *
+ * Only affects NEWLY spawned sessions: Node caches modules at require time, so
+ * a running session keeps whichever renderer it started with until restarted.
+ *
+ * Prefer an absolute path. tmux resolves a bare name against the tmux SERVER's
+ * PATH, which was inherited whenever that server started and may predate a
+ * shim in ~/.local/bin. */
+export const PI_BIN = process.env.PI_KING_PI_BIN?.trim() || "pi";
 /** Fix 2 of the 2026-08-10 tmux perf audit (docs/PERF-TMUX-SPEC.md): caps how
  * many lines pi-tui's fullRender replays into the terminal, once
  * tools/patch-pi-tui.mjs has been applied to the installed pi-tui dist
@@ -653,7 +670,7 @@ export function createTmuxSession(name: string, dir: string, resumeSessionId?: s
     "-x", String(size.w), "-y", String(size.h),
     "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
     ...tmuxLaunchEnv(),
-    "-c", dir, "--", "pi", "--name", name,
+    "-c", dir, "--", PI_BIN, "--name", name,
     // Resuming continues an existing transcript in place: same session id,
     // same file. The new process overwrites the exited card with a live one.
     ...(resumeSessionId ? ["--session", resumeSessionId] : []),
@@ -735,7 +752,10 @@ const PI_TUI_PATCH_SITES: ReadonlyArray<{ file: string; marker: string }> = [
  * boolean the daemon and dashboard warnings need. */
 export function isPiTuiPatched(): boolean {
   try {
-    const which = spawnSync("/usr/bin/env", ["which", "pi"], { encoding: "utf8", timeout: 3000 });
+    // Follows PI_BIN so the warning describes the install the fleet actually
+    // runs. Pointing sessions at a patched clone while checking the system
+    // install would report the exact opposite of the truth.
+    const which = spawnSync("/usr/bin/env", ["which", PI_BIN], { encoding: "utf8", timeout: 3000 });
     if (which.status !== 0) return false;
     const piBin = String(which.stdout || "").trim().split("\n")[0];
     if (!piBin) return false;
