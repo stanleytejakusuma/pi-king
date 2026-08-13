@@ -642,6 +642,22 @@ transcript, inside pi's own status footer (`HIT 0.0%█ ACTIVE`).
 write positions the cursor immediately after each frame, so the stale-position
 window never spans a presented frame.
 
+**Byte-level A/B, reproducible (`docs/perf-tools/cursor-ab.sh`)** — measures what
+pi WRITES, so it needs no screen recording, and runs on a private tmux socket so
+the fleet is never touched. Same workload, same 8083 B of pane output both arms:
+
+| `showHardwareCursor` | `\x1b[?25h` (show) | `\x1b[?25l` (hide) | ghost |
+|---|---|---|---|
+| `true`  | **15** | 0  | POSSIBLE |
+| `false` | 0  | **15** | impossible |
+
+A clean inversion: with the setting off pi never asks for a visible cursor, so
+tmux has no cursor to park and the artifact cannot be painted at all.
+Gotcha that cost two runs: do NOT attach a `script`-wrapped capture client to the
+scratch session — `script` sends `^D` at stdin EOF, pi takes it as quit, and the
+session dies ~3s in looking like "pi never came up". pi writes to its pty with no
+client attached anyway, so `pipe-pane` alone is enough.
+
 **Verification path (do this before claiming it fixed):** re-record ~20s of
 typing in a large streaming session and re-run `ghost3.py` — expect 0 frames
 with a second cursor-shaped block, versus 23 in the baseline. A live per-session

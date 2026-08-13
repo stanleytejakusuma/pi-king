@@ -345,12 +345,30 @@ function revert() {
   return reverted > 0 ? 0 : 2;
 }
 
+// pi's `showHardwareCursor` setting (default false) makes every render end with
+// \x1b[?25h OUTSIDE pi's synchronized-output block. Under tmux that is the ghost
+// white-block artifact: tmux re-shows the cursor at its last write position and
+// the terminal paints it there for one frame. Measured 23 ghost frames in 19.6s.
+// Warning only — it is a user setting, not a patch, so it must not move the
+// exit code the daemon watchdog reads. See docs/PERF-TMUX-SPEC.md.
+function warnHardwareCursor() {
+  const p = join(homedir(), ".pi/agent/settings.json");
+  try {
+    if (JSON.parse(readFileSync(p, "utf8")).showHardwareCursor === true) {
+      console.log(`${p} [hardware-cursor]: ON — causes ghost cursor blips under tmux; set false`);
+    }
+  } catch {
+    // no settings file / unreadable: nothing to warn about
+  }
+}
+
 function check() {
   const dist = findPiTuiDist();
   const states = PATCHES.map((p) => ({ patch: p, st: statusOf(dist, p) }));
   for (const { patch, st } of states) {
     console.log(`${join(dist, patch.file)} [${patch.name}]: ${st}`);
   }
+  warnHardwareCursor();
   // Worst-status-wins: "patched" only when every site is patched, so a
   // partial state can never report healthy.
   if (states.some((s) => s.st === "unknown")) return 2;

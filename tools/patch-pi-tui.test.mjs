@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -227,5 +227,37 @@ test("no PI_KING_PI_TUI_TARGET and no real `pi` reachable: fails closed, never f
   }
   assert.equal(code, 2);
   assert.match(`${stdout}${stderr}`, /pi.*not found on PATH/i);
+  cleanup();
+});
+
+// The ghost-cursor guard: pi's showHardwareCursor:true is what paints stray
+// white blocks under tmux (docs/PERF-TMUX-SPEC.md). --check warns about it but
+// must NOT move the exit code, which the daemon watchdog reads as patch state.
+test("--check warns when showHardwareCursor is on, and only then", () => {
+  const target = fixture(fresh());
+  const home = mkdtempSync(join(tmpdir(), "pi-king-home-"));
+  mkdirSync(join(home, ".pi/agent"), { recursive: true });
+  const settings = join(home, ".pi/agent/settings.json");
+  const runHome = (args) => {
+    try {
+      return { code: 0, stdout: execFileSync("node", [TOOL, ...args], {
+        encoding: "utf8",
+        env: { ...process.env, PI_KING_PI_TUI_TARGET: target, HOME: home },
+      }) };
+    } catch (err) { return { code: err.status, stdout: err.stdout ?? "" }; }
+  };
+
+  writeFileSync(settings, JSON.stringify({ showHardwareCursor: true }));
+  const on = runHome(["--check"]);
+  assert.match(on.stdout, /hardware-cursor\]: ON/);
+  assert.equal(on.code, 1, "unpatched fixture still reports 1 — the warning must not change it");
+
+  writeFileSync(settings, JSON.stringify({ showHardwareCursor: false }));
+  assert.doesNotMatch(runHome(["--check"]).stdout, /hardware-cursor/);
+
+  rmSync(settings);
+  assert.doesNotMatch(runHome(["--check"]).stdout, /hardware-cursor/, "no settings file: silent");
+
+  rmSync(home, { recursive: true, force: true });
   cleanup();
 });
