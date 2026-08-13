@@ -386,6 +386,49 @@ do not touch GitHub.
   Proposal template; PR only if a maintainer grants `lgtm`. Draft at
   `docs/UPSTREAM-ISSUE-DRAFT.md`; Stanley personalizes (own-voice rule) and
   submits manually — never via automation (their blocking policy).
+## BIGGEST WIN — 1Hz unconditional repaints (2026-08-13)
+
+**Fleet idle CPU: 1.29 cores -> ~0.003 cores (>99% reduction).** Found by a
+research pass after the render work, in STANLEY'S OWN extension, not upstream.
+
+`~/.pi/agent/extensions/pi-alerts.ts` ran
+`setInterval(() => ctx.ui.setStatus("pi-alerts", formatAlertStatus(...)), 1000)`
+UNCONDITIONALLY for a session's whole life. `setStatus` -> `setExtensionStatus`
+-> footerDataProvider invalidation schedules a render, and a pi render walks the
+retained component tree (pi#6665: `Box.render()` renders every child BEFORE its
+cache comparison). So every session repainted its entire tree once per second,
+forever, with nothing on screen changing. Across 18 sessions that was 18
+whole-tree repaints per second at idle.
+
+Fix (6 lines): remember the last published string and skip `setStatus` when the
+newly formatted text is identical. `formatAlertStatus` is pure, so its output is
+a safe proxy for "would this repaint show anything different?". During an active
+run the embedded timer string changes each second so behaviour is unchanged;
+only the idle case goes quiet.
+
+Verified after a full fleet restart: 4 samples over 40s all read 0.2-0.4% total
+across 18 sessions; panes confirmed alive, rendering, status lines intact
+(`pi alert: idle ... ponytail: FULL`), resize still repaints.
+
+**Generalisable lesson:** any extension calling `setStatus`/`setWidget`/
+`setFooter` on a timer costs a FULL TREE REPAINT per tick in this TUI. Publish
+only on change. `pi-session-timer.ts` was initially suspected too but is
+innocent — its 1Hz `render()` only writes a string to
+`globalThis.__piSessionTimerLine` and never calls `requestRender()`.
+
+**Also evaluated and NOT installed** (research pass): `fan56/pi-turbo` targets
+startup + footer/context computation, not the streaming render path — low
+benefit here. `hisence999/pi-tool-renderer` caches tool-output rendering
+(moderate relevance) but declares three different scoped npm names, NONE of
+which resolve on the public registry, and pins pi-tui ^0.82.1 (unverified on
+0.84.1) — supply-chain smell, not installed. pi 0.84.1 ships NO config surface
+for render cost (no settings key for animations/thinking/highlighting/
+scrollback); the dist patches remain the only lever. Upstream PR #7921
+("avoid full transcript work during active renders") proposed exactly the
+stable/dynamic split our box.js finding implies and was auto-closed FOR PROCESS
+(maintainer wants a reproduced report + agreed solution on the issue first) --
+so filing our differential CPU profile on #6665/#7730 is the useful next move.
+
 ## STREAMING CPU — ROOT CAUSE IS UPSTREAM, PARTIAL FIX SHIPPED (2026-08-13)
 
 **It is pi's own render pipeline, not tmux.** Differential `node --cpu-prof`
