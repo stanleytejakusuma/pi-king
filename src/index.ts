@@ -1362,6 +1362,26 @@ class DashboardView implements Component {
       return;
     }
     const row = this.rows[this.selected];
+    // Collapse the selected row's arcs. Persisted rather than held in memory
+    // because bin/pi-king re-runs this extension after every detach -- an
+    // in-memory toggle would forget itself several times an hour. `right` is
+    // not available for this (already bound to attach), and space is the key
+    // people press to scroll.
+    if (data === "a" || data === "A") {
+      if (!row || row.kind !== "session") return;
+      if (!row.tree?.hasArcs) {
+        this.showMessage("That session has no arcs.");
+        this.tui.requestRender();
+        return;
+      }
+      const id = row.entry.sessionId;
+      const l = readLayout();
+      const now = l.collapsed.includes(id) ? l.collapsed.filter((x) => x !== id) : [...l.collapsed, id];
+      writeLayout({ ...l, collapsed: now });
+      this.refresh();
+      this.tui.requestRender();
+      return;
+    }
     if (data === "e" || data === "E") {
       if (!row) return;
       const tmuxName = this.rowTmuxName(row);
@@ -1816,9 +1836,16 @@ class DashboardView implements Component {
       let lastGroup: string | undefined;
       const pinnedIds = readLayout().pinned;
       this.rows.forEach((r, i) => {
-        const group = r.kind === "orphan" ? "tmux (no Pi session)"
+        // A nested arc never opens a section of its own: it belongs to
+        // whatever section its parent landed in, even when it was spawned in
+        // a different directory. Emitting a header for it would split the
+        // tree in half and claim the child lives somewhere its parent does
+        // not -- the row itself carries the project instead (below).
+        const nested = r.kind === "session" && (r.tree?.depth ?? 0) > 0;
+        const ownGroup = r.kind === "orphan" ? "tmux (no Pi session)"
           : pinnedIds.includes(r.entry.sessionId) ? "pinned"
           : r.entry.cwd.replace(process.env.HOME ?? "~", "~");
+        const group = nested && lastGroup !== undefined ? lastGroup : ownGroup;
         if (group !== lastGroup) {
           if (lastGroup !== undefined) body.push("");
           // A pinned row keeps its own project visible on the row itself,
@@ -1853,9 +1880,20 @@ class DashboardView implements Component {
         // just what the session happened to be created as, and only the
         // dashboard's own rename keeps the two in step. Preferring tmux meant a
         // rename typed inside a session never appeared here at all.
-        const label = (isPinned ? "\u2691 " : "") +
+        // Tree glyphs live INSIDE the name column so every column to the
+        // right stays aligned; see the nameW comment above. The twisty is
+        // drawn only for a row that actually has arcs, so an ordinary row is
+        // byte-for-byte what it was before this feature existed.
+        const tree = r.tree;
+        const twisty = tree?.hasArcs ? (tree.collapsed ? "\u25b8 " : "\u25be ") : "";
+        // Same reasoning as a pinned row keeping its project: once the
+        // section header no longer describes where this row lives, the row
+        // has to say so itself. Only when it actually differs -- an arc in
+        // its parent's own directory would just be repeating the header.
+        const strayCwd = nested && e.cwd.replace(process.env.HOME ?? "~", "~") !== group;
+        const label = (tree?.prefix ?? "") + twisty + (isPinned ? "\u2691 " : "") +
           (e.name ?? e.tmuxName ?? e.project) +
-          (isPinned ? ` \u00b7 ${e.project}` : "");
+          (isPinned || strayCwd ? ` \u00b7 ${e.project}` : "");
         const nm = pad(truncateToWidth(label, nameW, "\u2026", true), nameW);
         const status = pad(`${iconFor(e.state)} ${th.fg(hue, e.state)}`, statusW);
         const sub = subagentSummary(e.subagents);

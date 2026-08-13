@@ -216,7 +216,25 @@ export type TmuxSession = { name: string; attached: boolean; windows: number; cr
  * external/non-Pi process, or a Pi session that crashed without cleaning up its
  * tmux wrapper. Still attachable/killable, just with no Pi-side metadata. */
 export type OrphanRow = { kind: "orphan"; tmux: TmuxSession };
-export type SessionRow = { kind: "session"; entry: DashboardEntry };
+
+/** Where a row sits in the arc lineage, precomputed by orderByLineage so the
+ * renderer stays dumb: it prepends `prefix` and draws the affordance, and
+ * makes no decisions of its own. See docs/ARC-TREE-DESIGN.md. */
+export type TreeInfo = {
+  /** 0 for a top-level row. */
+  depth: number;
+  /** Box-drawing prefix, fully assembled ("", "\u251c\u2500 ", "\u2502  \u2514\u2500 "). Drawn INSIDE
+   * the name column, never before the row marker: src/index.ts fixes the
+   * name column width precisely so activity text lines up down the page,
+   * and indenting the whole row would rag every column to its right. */
+  prefix: string;
+  /** Has at least one child ON THE DASHBOARD. Gates the collapse affordance
+   * so ordinary rows are completely unchanged by this feature. */
+  hasArcs: boolean;
+  /** Children exist but are hidden by the user. */
+  collapsed: boolean;
+};
+export type SessionRow = { kind: "session"; entry: DashboardEntry; tree?: TreeInfo };
 export type Row = SessionRow | OrphanRow;
 export function livePiPids(pids: number[]): Map<number, number> | undefined {
   // 99999 is the real ceiling, not a round guess: binary-searched against this
@@ -426,7 +444,7 @@ export function readSessions(): DashboardEntry[] {
   });
   return entries;
 }
-export type Layout = { pinned: string[]; order: string[]; lastSelected?: string; names: Record<string, string> };
+export type Layout = { pinned: string[]; order: string[]; lastSelected?: string; names: Record<string, string>; collapsed: string[] };
 export const LAYOUT_FILE = join(SESSION_STATUS_DIR, "..", "layout.json");
 
 export function readLayout(): Layout {
@@ -437,10 +455,115 @@ export function readLayout(): Layout {
     if (raw.names && typeof raw.names === "object") {
       for (const [k, v] of Object.entries(raw.names)) if (typeof v === "string") names[k] = v;
     }
-    return { pinned: strs(raw.pinned), order: strs(raw.order), lastSelected: typeof raw.lastSelected === "string" ? raw.lastSelected : undefined, names };
+    return { pinned: strs(raw.pinned), order: strs(raw.order), lastSelected: typeof raw.lastSelected === "string" ? raw.lastSelected : undefined, names, collapsed: strs(raw.collapsed) };
   } catch {
-    return { pinned: [], order: [], names: {} };
+    return { pinned: [], order: [], names: {}, collapsed: [] };
   }
+}
+
+/** The arc ledger, keyed by session ID rather than by path: pi's own
+ * parentSession pointer is a filesystem PATH and paths rot -- that is
+ * literally why Alexandria's lineage was invisible until this file existed.
+ * Read here rather than imported from arc.ts, which already imports this
+ * module; the dependency runs arc -> fleet and must not become a cycle. */
+// Anchored to HOME, deliberately NOT derived from SESSION_STATUS_DIR the way
+// LAYOUT_FILE is: this is exactly where arc.ts wrote it before the constant
+// moved here, and a supervisor pointed at an alternate status dir must not
+// silently strand an existing ledger. HOME is what the arc tests sandbox.
+export const LINEAGE_FILE = join(homedir(), ".pi", "king", "lineage.json");
+
+/** child session id -> parent session id. A missing or unreadable ledger is
+ * not an error: it just means nothing has ever been spawned as an arc. */
+export function readParentMap(): Map<string, string> {
+  const m = new Map<string, string>();
+  try {
+    const raw = JSON.parse(readFileSync(LINEAGE_FILE, "utf8")) as { arcs?: unknown };
+    if (!Array.isArray(raw.arcs)) return m;
+    for (const a of raw.arcs) {
+      if (!a || typeof a !== "object") continue;
+      const rec = a as { id?: unknown; parentId?: unknown };
+      // An empty parentId is what dispatchSession writes for a session that
+      // is nobody's child; it must not become an edge to "".
+      if (typeof rec.id === "string" && typeof rec.parentId === "string" && rec.parentId) m.set(rec.id, rec.parentId);
+    }
+  } catch { /* no ledger yet */ }
+  return m;
+}
+
+/** Reorders rows so every arc sits directly beneath the session that spawned
+ * it, recursively, and annotates each with its TreeInfo.
+ *
+ * Pure on purpose -- all three inputs are passed in -- because the ordering
+ * is the part with edge cases worth testing (cycles, absent parents,
+ * collapse) and none of them need the filesystem to reproduce.
+ *
+ * Relative order within a level is preserved from the caller's sort, so
+ * pinned-first / cwd / manual-order / urgency / recency all still hold
+ * WITHIN a sibling group. This is deliberately a post-pass rather than a
+ * comparator rewrite: the existing comparator is load-bearing and this only
+ * needs to relocate descendants, not re-rank anything. */
+export function orderByLineage(
+  rows: SessionRow[],
+  parentOf: Map<string, string>,
+  collapsed: ReadonlySet<string>,
+): SessionRow[] {
+  const byId = new Map<string, SessionRow>();
+  for (const r of rows) byId.set(r.entry.sessionId, r);
+  const kids = new Map<string, SessionRow[]>();
+  const roots: SessionRow[] = [];
+  for (const r of rows) {
+    const p = parentOf.get(r.entry.sessionId);
+    // A parent that is not itself a row cannot be nested under. That is not
+    // a hole to patch with a placeholder: an arc inherits its parent's
+    // visibility at spawn, so the only rows landing here with an absent
+    // parent are ones whose parent card was dismissed after the fact. They
+    // degrade to top level rather than vanish.
+    if (p !== undefined && p !== r.entry.sessionId && byId.has(p)) {
+      const list = kids.get(p);
+      if (list) list.push(r); else kids.set(p, [r]);
+    } else roots.push(r);
+  }
+  const out: SessionRow[] = [];
+  const seen = new Set<string>();
+  //
+  // `hidden` walks a collapsed subtree without rendering it. Returning early
+  // instead would leave those rows unvisited, and the cycle sweep below
+  // would then "rescue" them straight back to top level -- a collapse that
+  // relocates its own children rather than hiding them. Found by test, not
+  // by reading.
+  const emit = (r: SessionRow, depth: number, base: string, isLast: boolean, hidden: boolean): void => {
+    const id = r.entry.sessionId;
+    if (seen.has(id)) return;
+    seen.add(id);
+    const children = kids.get(id) ?? [];
+    const isCollapsed = collapsed.has(id);
+    if (!hidden) {
+      out.push({
+        ...r,
+        tree: {
+          depth,
+          prefix: depth === 0 ? "" : base + (isLast ? "\u2514\u2500 " : "\u251c\u2500 "),
+          hasArcs: children.length > 0,
+          collapsed: isCollapsed,
+        },
+      });
+    }
+    // Depth 1 hangs off a root that draws no prefix of its own, so its
+    // children start from an empty base rather than inheriting indentation
+    // that was never rendered.
+    const childBase = depth === 0 ? "" : base + (isLast ? "   " : "\u2502  ");
+    const childHidden = hidden || isCollapsed;
+    children.forEach((c, i) => emit(c, depth + 1, childBase, i === children.length - 1, childHidden));
+  };
+  roots.forEach((r) => emit(r, 0, "", true, false));
+  // A cycle in the ledger (a -> b -> a) leaves both nodes parented and
+  // neither reachable from a root, which would silently delete live rows
+  // from the dashboard. Losing sight of a running session is far worse than
+  // rendering it flat, so anything the walk missed is appended.
+  for (const r of rows) {
+    if (!seen.has(r.entry.sessionId)) out.push({ ...r, tree: { depth: 0, prefix: "", hasArcs: false, collapsed: false } });
+  }
+  return out;
 }
 /** Lists live tmux sessions. No server running is not an error — just zero sessions. */
 export function listTmuxSessions(): TmuxSession[] {
@@ -514,7 +637,9 @@ export function buildRows(): Row[] {
   const orphanRows: OrphanRow[] = tmuxSessions
     .filter((t) => !matchedTmuxNames.has(t.name))
     .map((t) => ({ kind: "orphan", tmux: t }));
-  return [...sessionRows, ...orphanRows];
+  // Lineage is applied last, over the fully sorted list, so an arc keeps its
+  // parent's company no matter which section that parent ended up in.
+  return [...orderByLineage(sessionRows, readParentMap(), new Set(readLayout().collapsed)), ...orphanRows];
 }
 
 export function tmuxError(result: ReturnType<typeof spawnSync>): string {
@@ -568,7 +693,7 @@ const FULL_RENDER_CAP = process.env.PI_KING_FULL_RENDER_CAP?.trim() || "3000";
  * by new-session (createTmuxSession) and respawn-pane (restartTmuxPane) so
  * the two launch paths cannot drift: a restart that forgot the status dir
  * would write its card where the dashboard never looks. */
-export function tmuxLaunchEnv(): string[] {
+export function tmuxLaunchEnv(visible = true): string[] {
   return [
     // A new process inherits the tmux SERVER's environment, which may lack
     // our PATH entirely. Pin it so `pi` resolves regardless of how the
@@ -578,7 +703,13 @@ export function tmuxLaunchEnv(): string[] {
     // (the session tracker below reads this at session_start) — an ad-hoc
     // `pi` typed directly into a plain terminal does not set this, and stays
     // invisible to the dashboard unless it runs /bg itself.
-    "-e", "PI_DASHBOARD_SPAWNED=1",
+    //
+    // visible=false is how an arc inherits an unmanaged parent: a session
+    // the user never put on the dashboard is a one-off, and its children are
+    // one-offs too. Withholding the flag (rather than setting it to 0) is
+    // what makes them indistinguishable from an ad-hoc `pi`, which is
+    // exactly the intended meaning. /bg from inside still surfaces one.
+    ...(visible ? ["-e", "PI_DASHBOARD_SPAWNED=1"] : []),
     "-e", `PI_TUI_MAX_FULL_RENDER_LINES=${FULL_RENDER_CAP}`,
     // ACP (billion-context-pi) has its own internal self-updater that runs
     // `npm install` independent of `pi update`/settings.json pins — it
@@ -663,13 +794,13 @@ export function resolveSpawnSize(live?: ClientSize): ClientSize {
   return readClientSize() ?? DEFAULT_SPAWN_SIZE;
 }
 
-export function createTmuxSession(name: string, dir: string, resumeSessionId?: string, liveSize?: ClientSize): { ok: boolean; message: string } {
+export function createTmuxSession(name: string, dir: string, resumeSessionId?: string, liveSize?: ClientSize, visible = true): { ok: boolean; message: string } {
   const size = resolveSpawnSize(liveSize);
   const result = spawnSync(TMUX, [
     "new-session", "-d", "-s", name,
     "-x", String(size.w), "-y", String(size.h),
     "-e", `PI_CODING_AGENT_DIR=${NORMAL_AGENT_DIR}`,
-    ...tmuxLaunchEnv(),
+    ...tmuxLaunchEnv(visible),
     "-c", dir, "--", PI_BIN, "--name", name,
     // Resuming continues an existing transcript in place: same session id,
     // same file. The new process overwrites the exited card with a live one.

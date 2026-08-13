@@ -68,8 +68,11 @@ row would rag every column to its right — precisely what that geometry
 exists to prevent.
 
 Cost: each depth level consumes 3 characters of an 18–34 char name budget.
-Cap visible depth around 4 and collapse deeper, or names truncate to
-uselessness.
+
+**Built without a depth cap** (design said cap at 4). A cap silently flattens
+depth 5 into depth 4, which is more confusing than a name truncated with `…`
+— and truncation already works. Add one if real nesting ever reaches that
+depth; nothing here assumes it is absent.
 
 Glyphs are light box-drawing in `dim` so the tree recedes and session names
 stay the brightest thing in the column (per the `pi-tui-design` skill: one
@@ -120,14 +123,18 @@ so nothing changes for ordinary rows.
     Charon                    ● idle      watching mempool         31m ago
 ```
 
-## Known dependency
+## Known dependency — resolved, and it was overstated
 
-Sections emit when the group key changes (`src/index.ts:1819`), which
-requires rows to be **pre-sorted by that key**. Today `src/fleet.ts:415-425`
-sorts cwd first, then rank, then state priority. Tree ordering needs parents
-and their descendants kept adjacent and in depth order — the same sort
-rework that the long-standing "state-first grouping" gap needs, so the two
-should land together.
+The design claimed tree ordering required reworking the comparator at
+`src/fleet.ts:415-425`, coupling it to the "state-first grouping" gap.
+**It does not.** `orderByLineage()` is a **post-pass** over the fully sorted
+list: it only relocates descendants, so pinned-first / cwd / manual-order /
+urgency / recency all still hold within a sibling group, and the load-bearing
+comparator is untouched. The two features are independent after all.
+
+Nested rows do not emit a section header (`src/index.ts`), so an arc stays
+inside its parent's section even when its own cwd differs — which is what
+makes decision 4 necessary.
 
 Lineage source: `~/.pi/king/lineage.json`, shaped
 `{arcs:[{id,name,cwd,parentId,createdAt,closedAt}]}`. `parentId` is a
