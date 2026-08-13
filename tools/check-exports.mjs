@@ -20,6 +20,10 @@ const PAIRS = [
   { from: "index.ts", to: "data.ts" },
   { from: "index.ts", to: "jobs.ts" },
   { from: "index.ts", to: "fleet.ts" },
+  // Added 2026-08-13 with dispatch: index.ts now imports dispatchSession and
+  // slugForTask from arc.ts, so the same drift this check exists to catch
+  // applies to that edge too.
+  { from: "index.ts", to: "arc.ts" },
   { from: "fleet.ts", to: "jobs.ts" },
 ];
 

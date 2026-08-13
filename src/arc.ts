@@ -39,10 +39,18 @@
  * /resume. Losing the file never loses the relationship.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createTmuxSession, TMUX } from "./fleet.ts";
+import { createTmuxSession, SESSION_STATUS_DIR, TMUX, type ClientSize } from "./fleet.ts";
+
+/** Poll interval for the composer-ready and delivery-verification loops.
+ * Overridable only so tests need not sleep in real seconds; nothing in normal
+ * operation should set it. */
+const POLL_SEC = process.env.PI_KING_POLL_SEC?.trim() || "1";
+function nap(): void {
+  spawnSync("sleep", [POLL_SEC]);
+}
 
 const KING_DIR = join(homedir(), ".pi", "king");
 const LINEAGE_FILE = join(KING_DIR, "lineage.json");
@@ -137,26 +145,182 @@ function paneReady(sock: string[], target: string): boolean {
   return out.includes("escape interrupt") || out.includes("/ commands");
 }
 
-export type SpawnArcResult = { ok: boolean; message: string; id?: string; sessionFile?: string };
+/** The visible pane, whitespace-collapsed for comparison. The composer wraps
+ * and indents what it holds, so a raw substring test against the pasted text
+ * fails on anything longer than the pane is wide.
+ *
+ * Note for anyone tempted by `capture-pane -S -N` to get "the last N lines":
+ * it does not do that. -S is a SCROLLBACK offset, so -S -4 returns the whole
+ * visible pane PLUS 4 lines of history -- measured, 44 lines out of a 40-row
+ * pane. An earlier version of this file used it as a tail and consequently
+ * found the prompt on screen forever (it stays in the transcript after being
+ * submitted), reporting every successful delivery as a failure. */
+function paneText(target: string): string {
+  const r = spawnSync(TMUX, ["capture-pane", "-t", target, "-p"], { encoding: "utf8", timeout: 5000 });
+  if (r.status !== 0) return "";
+  return (r.stdout ?? "").replace(/\s+/g, " ");
+}
+
+/** The newest status card belonging to a tmux session of this name. This is
+ * the same file the dashboard renders from, so agreeing with it is the point:
+ * it reports what the user will actually see. */
+function cardForName(name: string): { activity?: string; status?: string } | undefined {
+  let best: { activity?: string; status?: string; lastActivity: number } | undefined;
+  try {
+    for (const f of readdirSync(SESSION_STATUS_DIR)) {
+      if (!f.endsWith(".json")) continue;
+      try {
+        const c = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, f), "utf8")) as
+          { name?: string; activity?: string; status?: string; lastActivity?: number };
+        if (c.name !== name) continue;
+        const at = Number(c.lastActivity ?? 0);
+        if (!best || at > best.lastActivity) best = { activity: c.activity, status: c.status, lastActivity: at };
+      } catch { /* a half-written card is not an error, just not yet readable */ }
+    }
+  } catch { return undefined; }
+  return best;
+}
+
+/** A short, distinctive fragment of the prompt to look for on screen. First
+ * non-empty line, because that is what the composer shows first and what
+ * survives wrapping most predictably. */
+function probeFor(prompt: string): string {
+  const first = prompt.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+  return first.replace(/\s+/g, " ").slice(0, 40).trim();
+}
+
+export type Delivery =
+  /** The session's own status card came back carrying this prompt: the turn
+   * demonstrably started. */
+  | { state: "submitted" }
+  /** The text reached the composer, Enter was sent, but no card ever
+   * confirmed a turn. Deliberately NOT called "unsubmitted": the negative is
+   * not provable from outside, and a session whose pi-king extension is
+   * missing would look identical to one that never submitted. */
+  | { state: "unconfirmed" }
+  /** Text never appeared on screen at all. */
+  | { state: "not-pasted" }
+  /** tmux refused a command outright. */
+  | { state: "failed"; step: string };
 
 /**
- * Spawn an arc: fresh child session in its own tmux window, first prompt sent
- * by the parent.
+ * Put `prompt` into a pane's composer and submit it, then VERIFY both halves
+ * actually happened by reading the pane back.
+ *
+ * Verification is not ceremony here. Dispatch hands a task to a session and
+ * returns you to the dashboard, so nobody is looking at the pane: a prompt
+ * that lands but is never submitted leaves a session sitting idle forever
+ * with its work still in the composer, and the dashboard card cannot tell
+ * that apart from a session that finished quickly. An arc at least drops you
+ * into the window where you would see it.
+ *
+ * Both halves are checked because they fail differently and are fixed
+ * differently -- "attach and press Enter" versus "attach and paste it
+ * yourself" -- and a caller that cannot say which one happened has to tell
+ * the user to go and look.
  */
-export function spawnArc(opts: {
+function deliverPrompt(target: string, sessionName: string, prompt: string, token: string): Delivery {
+  // load-buffer + paste-buffer rather than send-keys: prompts are multi-line
+  // and contain characters send-keys would interpret. paste-buffer delivers
+  // the text verbatim as one unit.
+  const tmp = join(KING_DIR, `prompt-${token}.txt`);
+  try {
+    mkdirSync(KING_DIR, { recursive: true });
+    writeFileSync(tmp, prompt);
+  } catch {
+    return { state: "failed", step: "write the prompt to a temp file" };
+  }
+  const buf = `piking-${token}`;
+  const load = spawnSync(TMUX, ["load-buffer", "-b", buf, tmp], { encoding: "utf8", timeout: 5000 });
+  if (load.status !== 0) return { state: "failed", step: "load the prompt into a tmux buffer" };
+
+  // -p AND -r are both required, not just -p. paste-buffer replaces every LF
+  // in the buffer with CR by default (a separate step from bracket-wrapping),
+  // and pi's composer treats CR as Enter/submit. -p wraps the (still
+  // CR-laden) stream in bracketed-paste codes, which pi's editor.js currently
+  // repairs by normalizing \r -> \n on paste -- but that is pi papering over
+  // tmux's mangling, not a guarantee. -r makes paste-buffer emit LF so the
+  // bytes are byte-faithful either way.
+  //
+  // Origin: measured by the fullscreen-perf arc, 2026-08-13, session
+  // 019ffa8f-6dd9-7e61-ae8b-ce3babd99baa -- a 43-line brief without both
+  // flags arrived as 43 SEPARATE submitted user turns. That fix and this
+  // extraction touch the same line on two branches; they are the same change.
+  // Dispatch is where it matters most: the shredding happens off-screen.
+  const paste = spawnSync(TMUX, ["paste-buffer", "-p", "-r", "-b", buf, "-t", target, "-d"], { encoding: "utf8", timeout: 5000 });
+  if (paste.status !== 0) return { state: "failed", step: "paste the prompt into the pane" };
+
+  const probe = probeFor(prompt);
+  // Did the text actually arrive? Polled, not assumed: paste-buffer exiting 0
+  // only means tmux accepted the command.
+  let pasted = false;
+  for (let i = 0; i < 10 && !pasted; i++) {
+    if (probe && paneText(target).includes(probe)) pasted = true;
+    else nap();
+  }
+  if (!pasted) return { state: "not-pasted" };
+
+  // Enter as a separate send-keys: paste-buffer alone leaves the text in the
+  // composer unsubmitted.
+  const enter = spawnSync(TMUX, ["send-keys", "-t", target, "Enter"], { encoding: "utf8", timeout: 5000 });
+  if (enter.status !== 0) return { state: "failed", step: "send Enter to submit the prompt" };
+
+  // Submission is confirmed from the session's own status card rather than
+  // from the screen. Screen position cannot answer this: the prompt is
+  // visible both before submission (in the composer) and after (as the user's
+  // message in the transcript), and which rows it occupies depends on how
+  // much the agent has since printed. The card's `activity` field is set from
+  // the prompt when the turn starts, so its appearance IS the turn starting.
+  // Measured 2026-08-13: activity came back as
+  // "Done: Create a file called done.txt in the current directory...".
+  for (let i = 0; i < 15; i++) {
+    nap();
+    const card = cardForName(sessionName);
+    if (card?.activity && card.activity.replace(/\s+/g, " ").includes(probe)) return { state: "submitted" };
+  }
+  return { state: "unconfirmed" };
+}
+
+export type SpawnResult = {
+  ok: boolean;
+  message: string;
+  id?: string;
+  sessionFile?: string;
+  tmuxName?: string;
+  delivery?: Delivery;
+};
+
+/**
+ * Create a fresh tmux-hosted pi session and give it a first prompt.
+ *
+ * The shared core of `spawnArc` and `dispatchSession`, which differ in only
+ * two things: an arc has a PARENT (so it seeds a session file carrying a
+ * parentSession pointer and records lineage), and dispatch comes from the
+ * dashboard (so it knows the client size to spawn at). Everything else --
+ * name sanitation, the duplicate check, waiting for the composer, delivery,
+ * verification -- is one implementation on purpose. The delivery half is
+ * fiddly enough that a second copy would drift, and the CR-shredding bug
+ * above is exactly what drift looks like.
+ */
+function spawnSessionWithPrompt(opts: {
   name: string;
-  brief: string;
+  prompt: string;
   cwd: string;
-  parentSessionFile?: string;
-  parentId?: string;
-  /** Seconds to wait for the child's composer before giving up on auto-sending
-   * the brief. The session still exists on timeout — only the auto-send is
-   * skipped, and the caller is told so it can paste by hand. */
+  /** Arc mode. Present: seed a session file pointing at this parent and
+   * record the relationship in lineage.json. Absent: let pi create its own
+   * session, and record nothing -- a dispatched session is not anyone's
+   * child. */
+  parent?: { sessionFile?: string; id?: string };
+  /** Spawn geometry. The dashboard knows the real client size and passes it
+   * (Fix 1 of the tmux perf audit); arcs keep tmux's default. */
+  liveSize?: ClientSize;
   readyTimeoutSec?: number;
-}): SpawnArcResult {
-  const { name, brief, cwd } = opts;
-  if (!name.trim()) return { ok: false, message: "Arc needs a name." };
-  if (!brief.trim()) return { ok: false, message: "Arc needs a brief — the child starts with no context but this." };
+  /** Word for this thing in user-facing messages: "Arc" or "Session". */
+  label: string;
+}): SpawnResult {
+  const { name, prompt, cwd, label } = opts;
+  if (!name.trim()) return { ok: false, message: `${label} needs a name.` };
+  if (!prompt.trim()) return { ok: false, message: `${label} needs a prompt \u2014 that is the whole point of dispatching one.` };
   if (!existsSync(cwd)) return { ok: false, message: `cwd does not exist: ${cwd}` };
   // tmux session names are the addressing key for every later operation; a
   // name with ':' or '.' would be parsed as window/pane coordinates.
@@ -165,57 +329,160 @@ export function spawnArc(opts: {
   const exists = spawnSync(TMUX, ["has-session", "-t", `=${safeName}`], { encoding: "utf8", timeout: 5000 });
   if (exists.status === 0) return { ok: false, message: `A tmux session named "${safeName}" already exists.` };
 
-  const seed = writeSeedSession(cwd, opts.parentSessionFile);
-  const created = createTmuxSession(safeName, cwd, seed.id);
+  // Seeding exists only to plant the parentSession pointer, so it is bound to
+  // parent mode. Without it pi picks its own id and writes its own file --
+  // which also avoids having to reproduce pi's cwd canonicalization, where
+  // sessionDirFor("/tmp/x") yields "--tmp-x--" but pi, resolving the symlink
+  // first, writes "--private-tmp-x--" (measured 2026-08-13; a seed in the
+  // wrong directory is ignored and the id then exists twice on disk).
+  const seed = opts.parent ? writeSeedSession(cwd, opts.parent.sessionFile) : undefined;
+  const created = createTmuxSession(safeName, cwd, seed?.id, opts.liveSize);
   if (!created.ok) return { ok: false, message: created.message };
 
-  // Record lineage BEFORE the brief is sent: if the paste fails, the arc still
-  // exists and must remain discoverable/attributable rather than becoming an
-  // untracked orphan window.
-  const l = readLineage();
-  l.arcs.push({
-    id: seed.id,
-    parentId: opts.parentId ?? "",
-    name: safeName,
-    cwd,
-    brief,
-    sessionFile: seed.file,
-    createdAt: Date.now(),
-    closedAt: null,
-  });
-  writeLineage(l);
+  // Record lineage BEFORE the prompt is sent: if delivery fails, the arc
+  // still exists and must remain discoverable/attributable rather than
+  // becoming an untracked orphan window.
+  if (seed && opts.parent) {
+    const l = readLineage();
+    l.arcs.push({
+      id: seed.id,
+      parentId: opts.parent.id ?? "",
+      name: safeName,
+      cwd,
+      brief: prompt,
+      sessionFile: seed.file,
+      createdAt: Date.now(),
+      closedAt: null,
+    });
+    writeLineage(l);
+  }
 
+  const base = { id: seed?.id, sessionFile: seed?.file, tmuxName: safeName };
   const target = `=${safeName}:0.0`;
   const deadline = Date.now() + (opts.readyTimeoutSec ?? 90) * 1000;
   let ready = false;
   while (Date.now() < deadline) {
     if (paneReady([], target)) { ready = true; break; }
-    spawnSync("sleep", ["1"]);
+    nap();
   }
   if (!ready) {
-    return { ok: true, id: seed.id, sessionFile: seed.file,
-      message: `Arc "${safeName}" created, but its composer never became ready — the brief was NOT sent. Attach and paste it yourself.` };
+    return { ...base, ok: true, delivery: { state: "not-pasted" },
+      message: `${label} "${safeName}" created, but its composer never became ready \u2014 the prompt was NOT sent. Attach and paste it yourself.` };
   }
 
-  // load-buffer + paste-buffer rather than send-keys: briefs are multi-line and
-  // contain characters send-keys would interpret. paste-buffer delivers the text
-  // verbatim as one unit.
-  const tmp = join(KING_DIR, `arc-brief-${seed.id}.txt`);
-  writeFileSync(tmp, brief);
-  const buf = `arcbrief-${seed.id}`;
-  const load = spawnSync(TMUX, ["load-buffer", "-b", buf, tmp], { encoding: "utf8", timeout: 5000 });
-  if (load.status !== 0) {
-    return { ok: true, id: seed.id, sessionFile: seed.file,
-      message: `Arc "${safeName}" created, but the brief could not be loaded into tmux. Attach and paste it yourself.` };
+  const delivery = deliverPrompt(target, safeName, prompt, seed?.id ?? `${safeName}-${Date.now()}`);
+  if (delivery.state === "submitted") {
+    return { ...base, ok: true, delivery,
+      message: `${label} "${safeName}" started in ${cwd} and the prompt was delivered.` };
   }
-  spawnSync(TMUX, ["paste-buffer", "-b", buf, "-t", target, "-d"], { encoding: "utf8", timeout: 5000 });
-  // Enter as a separate send-keys: paste-buffer alone leaves the text in the
-  // composer unsubmitted.
-  spawnSync("sleep", ["1"]);
-  spawnSync(TMUX, ["send-keys", "-t", target, "Enter"], { encoding: "utf8", timeout: 5000 });
+  if (delivery.state === "unconfirmed") {
+    return { ...base, ok: true, delivery,
+      message: `${label} "${safeName}" created and the prompt reached its composer, but no turn was confirmed. Attach and check \u2014 press Enter if it is still sitting there.` };
+  }
+  if (delivery.state === "not-pasted") {
+    return { ...base, ok: true, delivery,
+      message: `${label} "${safeName}" created, but the prompt never reached its composer. Attach and paste it yourself.` };
+  }
+  return { ...base, ok: true, delivery,
+    message: `${label} "${safeName}" created, but tmux failed to ${delivery.step}. Attach and paste it yourself.` };
+}
 
-  return { ok: true, id: seed.id, sessionFile: seed.file,
-    message: `Arc "${safeName}" spawned in ${cwd} and the brief was sent. Attach it from the dashboard to steer it.` };
+const STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could", "do", "does",
+  "for", "from", "get", "have", "how", "i", "if", "in", "into", "is", "it", "its", "make",
+  "me", "my", "of", "on", "or", "our", "please", "should", "so", "than", "that", "the",
+  "their", "then", "there", "this", "to", "up", "us", "use", "was", "we", "what", "when",
+  "which", "why", "will", "with", "would", "you", "your",
+]);
+
+/**
+ * A short name guessed from the task text \u2014 a DEFAULT for the dispatch name
+ * prompt, not a replacement for it. Stanley names sessions himself ("I prefer
+ * using `n` for a more clear directory naming and to avoid confusion"), so
+ * this only has to be a decent starting point he can type over.
+ *
+ * Deliberately a heuristic and never a model call: a dispatch must not wait
+ * on a round-trip \u2014 or fail \u2014 just to prefill a text field.
+ */
+export function slugForTask(task: string): string {
+  const words = task
+    .toLowerCase()
+    .replace(/[`'"]/g, "")
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  const kept: string[] = [];
+  for (const w of words) {
+    if (STOPWORDS.has(w)) continue;
+    kept.push(w);
+    if (kept.length === 3) break;
+  }
+  // Every word was a stopword ("do it for me"): fall back to the raw words
+  // rather than returning an empty name the caller has to special-case.
+  const use = kept.length > 0 ? kept : words.slice(0, 3);
+  return use.join("-").slice(0, 32).replace(/-+$/, "") || "task";
+}
+
+/**
+ * Dispatch: hand a task to a NEW tmux-hosted session and stay where you are.
+ *
+ * The dashboard's `n` creates an empty session and drops you into it; you
+ * then type the task yourself. This is the other half \u2014 you supply the task
+ * and the session goes and does it. Same substrate as every other pi-king
+ * session (tmux is the broker), so it attaches, detaches, renames, restarts
+ * and reports state exactly like one, because it IS one.
+ */
+export function dispatchSession(opts: {
+  name: string;
+  task: string;
+  cwd: string;
+  liveSize?: ClientSize;
+  readyTimeoutSec?: number;
+}): SpawnResult {
+  return spawnSessionWithPrompt({
+    name: opts.name,
+    prompt: opts.task,
+    cwd: opts.cwd,
+    liveSize: opts.liveSize,
+    readyTimeoutSec: opts.readyTimeoutSec,
+    label: "Session",
+  });
+}
+
+/** Kept as a distinct name because the arc tool and the /arc command are
+ * typed against it. Structurally a SpawnResult. */
+export type SpawnArcResult = SpawnResult;
+
+/**
+ * Spawn an arc: fresh child session in its own tmux window, first prompt sent
+ * by the parent.
+ *
+ * Thin wrapper over spawnSessionWithPrompt -- an arc IS a dispatch that
+ * records its parent. Keeping one implementation is deliberate: the delivery
+ * half is subtle (see the -p -r note in deliverPrompt) and a second copy is
+ * exactly where that subtlety would rot back out.
+ */
+export function spawnArc(opts: {
+  name: string;
+  brief: string;
+  cwd: string;
+  parentSessionFile?: string;
+  parentId?: string;
+  /** Seconds to wait for the child's composer before giving up on auto-sending
+   * the brief. The session still exists on timeout -- only the auto-send is
+   * skipped, and the caller is told so it can paste by hand. */
+  readyTimeoutSec?: number;
+}): SpawnArcResult {
+  if (!opts.brief.trim()) {
+    return { ok: false, message: "Arc needs a brief \u2014 the child starts with no context but this." };
+  }
+  return spawnSessionWithPrompt({
+    name: opts.name,
+    prompt: opts.brief,
+    cwd: opts.cwd,
+    parent: { sessionFile: opts.parentSessionFile, id: opts.parentId },
+    readyTimeoutSec: opts.readyTimeoutSec,
+    label: "Arc",
+  });
 }
 
 /** Arcs spawned by a given parent session id (open ones first, newest first). */
