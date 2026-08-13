@@ -105,7 +105,7 @@ import {
   type DayTotal,
 } from "./data.ts";
 import { Type } from "typebox";
-import { allArcs, arcsOf, closeArc, extractConversation, findArc, spawnArc } from "./arc.ts";
+import { allArcs, arcsOf, closeArc, dispatchSession, extractConversation, findArc, slugForTask, spawnArc } from "./arc.ts";
 import { JobsPanel, notifyMacOS, scanJobs, selectRestoreCards, type SessionManagerLike } from "./jobs.ts";
 import {
   RETIRED_STATES,
@@ -156,7 +156,11 @@ const MESSAGE_LINGER_MS = 4000;
 
 type HubAction =
   | { type: "attach"; tmuxName: string; expectedPid?: number }
-  | { type: "create"; name: string; dir: string; size?: ClientSize };
+  | { type: "create"; name: string; dir: string; size?: ClientSize }
+  // Dispatch differs from create in exactly one way that matters to the hub
+  // loop: it does NOT hand the terminal to tmux. The session is created and
+  // handed a task, and the user stays on the dashboard watching it work.
+  | { type: "dispatch"; name: string; dir: string; task: string; size?: ClientSize };
 
 /**
  * Liveness verified by *identity*, not mere existence.
@@ -815,6 +819,13 @@ class Composer {
 type ComposerStep =
   | { kind: "new-name" }
   | { kind: "new-dir"; name: string }
+  // Task first, so the name step can prefill a slug guessed from it. The name
+  // step is kept rather than auto-naming: Stanley names sessions himself for
+  // "a more clear directory naming and to avoid confusion", so the slug is a
+  // default to type over, not a decision.
+  | { kind: "dispatch-task" }
+  | { kind: "dispatch-name"; task: string }
+  | { kind: "dispatch-dir"; task: string; name: string }
   | { kind: "rename"; row: SessionRow | OrphanRow };
 
 class DashboardView implements Component {
@@ -1180,6 +1191,30 @@ class DashboardView implements Component {
       this.closeDashboard({ type: "create", name: step.name, dir: value, size: this.clientSize() });
       return;
     }
+    if (step.kind === "dispatch-task") {
+      this.startComposer({ kind: "dispatch-name", task: value }, slugForTask(value));
+      return;
+    }
+    if (step.kind === "dispatch-name") {
+      // The single-writer rule of src/index.ts:406 in its cheapest form: a
+      // session that already exists is one somebody may be attached to and
+      // mid-turn in, and dispatch would send-keys into it. Refuse by name
+      // BEFORE creating anything. (arc.ts re-checks with tmux has-session,
+      // which is the authority; this one exists to fail in the composer,
+      // where the user can just retype, rather than after the dashboard has
+      // closed.)
+      const taken = this.rows.some((r) => this.rowTmuxName(r) === value.replace(/[:.]/g, "-").trim());
+      if (taken) {
+        this.showMessage(`"${value}" already exists \u2014 dispatch only creates new sessions.`);
+        return;
+      }
+      this.startComposer({ kind: "dispatch-dir", task: step.task, name: value }, process.env.PI_KING_CWD?.trim() || this.invocationCwd);
+      return;
+    }
+    if (step.kind === "dispatch-dir") {
+      this.closeDashboard({ type: "dispatch", name: step.name, task: step.task, dir: value, size: this.clientSize() });
+      return;
+    }
     if (step.kind === "rename") {
       const tmuxName = this.rowTmuxName(step.row);
       if (!tmuxName) {
@@ -1316,6 +1351,13 @@ class DashboardView implements Component {
     }
     if (data === "n" || data === "N") {
       this.startComposer({ kind: "new-name" }, "");
+      return;
+    }
+    // `n` creates an empty session and drops you into it, and you type the
+    // task yourself. `d` is the other half: you supply the task up front and
+    // stay here while the session goes and does it.
+    if (data === "d" || data === "D") {
+      this.startComposer({ kind: "dispatch-task" }, "");
       return;
     }
     const row = this.rows[this.selected];
@@ -1862,7 +1904,10 @@ class DashboardView implements Component {
     foot.push("");
     if (this.composer) {
       const label = this.composerStep?.kind === "new-name" ? "New session name:"
-        : this.composerStep?.kind === "new-dir" ? "Directory:" : "Rename to:";
+        : this.composerStep?.kind === "new-dir" ? "Directory:"
+        : this.composerStep?.kind === "dispatch-task" ? "Task to dispatch:"
+        : this.composerStep?.kind === "dispatch-name" ? "Session name:"
+        : this.composerStep?.kind === "dispatch-dir" ? "Directory:" : "Rename to:";
       foot.push("  " + th.fg("accent", label) + " " + (this.composer.input.render(Math.max(10, MEASURE - visibleWidth(label) - 6))[0] ?? ""));
       foot.push("  " + th.fg("dim", "Enter confirm \u00b7 Esc cancel"));
     } else if (this.message) {
@@ -1876,7 +1921,7 @@ class DashboardView implements Component {
       foot.push("  " +
         `${k("\u2191\u2193")}${l(" select ")}${k("enter")}${l(` ${verb}`)}` + l("   \u2502   ") +
         `${k("\u21e7\u2191\u2193")}${l(" move ")}${k("^t")}${l(" pin")}` + l("   \u2502   ") +
-        `${k("n")}${l(" new ")}${k("e")}${l(" rename ")}${k("x")}${l(" detach ")}${th.fg("error", "X")}${l(" kill")}` + l("   \u2502   ") + `${k("s")}${l(" stats")}` + l("   \u2502   ") +
+        `${k("n")}${l(" new ")}${k("d")}${l(" dispatch ")}${k("e")}${l(" rename ")}${k("x")}${l(" detach ")}${th.fg("error", "X")}${l(" kill")}` + l("   \u2502   ") + `${k("s")}${l(" stats")}` + l("   \u2502   ") +
         `${k("r")}${l(" restart stale ")}${k("esc")}${l(" close")}`);
     }
 
@@ -2120,11 +2165,20 @@ function goToSession(action: HubAction): boolean {
 
 /** Creates the session if needed, then moves the caller into it. Returns false
  * when neither route is available, so the caller can tell the user what to run. */
-function dispatchHubAction(action: HubAction): { deferred: boolean; message?: string } {
+function dispatchHubAction(action: HubAction): { deferred: boolean; message?: string; level?: "info" | "error" } {
   if (action.type === "create") {
     const created = createTmuxSession(action.name, action.dir, undefined, action.size);
     if (!created.ok) return { deferred: false, message: created.message };
     return { deferred: goToSession({ type: "attach", tmuxName: action.name }), message: created.message };
+  }
+  if (action.type === "dispatch") {
+    // Runs with the dashboard overlay CLOSED, which is why it may block: it
+    // waits for the new session's composer to come up (tens of seconds on a
+    // cold start) and then verifies the prompt actually landed. Returning
+    // deferred:false sends the hub loop straight back to the dashboard, so
+    // the user's next sight is the fleet with the new session in it.
+    const r = dispatchSession({ name: action.name, task: action.task, cwd: action.dir, liveSize: action.size });
+    return { deferred: false, message: r.message, level: r.ok && r.delivery?.state === "submitted" ? "info" : "error" };
   }
   return { deferred: goToSession(action) };
 }
@@ -3063,7 +3117,11 @@ export default function piDashboard(pi: ExtensionAPI) {
       // Deferred to the wrapper: exit now so tmux gets the terminal to itself.
       // The wrapper relaunches this hub once the user detaches.
       if (result.deferred) break;
-      if (result.message) ctx.ui.notify(result.message, "error");
+      // Dispatch reports success here too, not just failure: the user is not
+      // going to see the session's pane, so this notification is the only
+      // confirmation that the task was actually delivered rather than left
+      // sitting in a composer nobody is watching.
+      if (result.message) ctx.ui.notify(result.message, result.level ?? "error");
     }
     ctx.shutdown();
   });
