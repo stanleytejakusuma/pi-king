@@ -30,9 +30,23 @@ const originalBlock = `            for (let i = 0; i < newLines.length; i++) {
 // refuses on the missing one.
 const originalWidthCache = `const WIDTH_CACHE_SIZE = 512;`;
 
-function fixture(dir, body = originalBlock, widthBody = originalWidthCache) {
+// Third patch site (Fix 6, 2026-08-13) lives in the SAME file as render-cap,
+// so the tui-main-screen.js fixture must carry it too or apply() correctly
+// refuses and the file never changes.
+const originalKittyCollect = `    collectKittyImageIds(lines) {
+        const ids = new Set();
+        for (const line of lines) {
+            for (const id of extractKittyImageIds(line)) {
+                ids.add(id);
+            }
+        }
+        return ids;
+    }`;
+
+function fixture(dir, body = originalBlock, widthBody = originalWidthCache, kitty = true) {
   const path = join(dir, "tui-main-screen.js");
-  writeFileSync(path, `// fixture\n${body}\n// end fixture\n`);
+  const kittyBody = kitty ? `${originalKittyCollect}\n` : "";
+  writeFileSync(path, `// fixture\n${kittyBody}${body}\n// end fixture\n`);
   writeFileSync(join(dir, "utils.js"), `// fixture\n${widthBody}\n// end fixture\n`);
   return path;
 }

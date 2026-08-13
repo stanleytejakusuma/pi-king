@@ -26,3 +26,20 @@ Recording from the CLI (no user paste needed):
   measure the KERNEL's pty echo, not the app's render, which invalidated all
   of this investigation's first-round numbers. The tmux branch of this script
   still misreads (returns pre-buffered output) and is NOT trustworthy.
+
+## Fix 6 tooling (2026-08-13)
+- `kitty-equiv-test.mjs` — proves the kitty-scan patch returns IDENTICAL image
+  id sets to upstream across 13 cases. Its adversarial in-place-mutation case
+  caught a real bug in the first draft (storing the caller's array instead of a
+  snapshot), which would have silently corrupted image tracking.
+- `kitty-bench.mjs` — micro-benchmark. **Read the caveat:** it uses 3,120-char
+  lines and 60k lines/render, which OVER-ESTIMATES the real win by ~an order of
+  magnitude. It predicted ~110ms/render saved; the real V8 profile showed the
+  scan is ~8% of active CPU, and applying the patch moved streaming CPU 57.8%
+  -> ~57%. Trust `--cpu-prof` over synthetic micro-benchmarks.
+- `styling-cpu.py` — heavy vs coalesced SGR through a real tmux server: heavy
+  costs 2.17x the tmux CPU for identical visible text.
+- `contention-test.py` — 2x2 {native,tmux} x {idle,loaded}. tmux relays a
+  steady 30ms styled stream cleanly (p99 31ms, 0% >100ms); native barely
+  degrades under 10 CPU hogs. NOTE: its tmux+loaded cell fails to START tmux
+  (spawn_rc=1) rather than measuring a stall — do not read that cell as data.

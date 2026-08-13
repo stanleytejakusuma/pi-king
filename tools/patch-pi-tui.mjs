@@ -105,6 +105,91 @@ const PATCHES = [
     // knob here would only add a way to leave the bug switched on.
     patched: `const WIDTH_CACHE_SIZE = 65536; // pi-king-tui-patch:widthcache-v1 — 512 thrashed to ~0% hits on a 12k-line doc (666ms -> 2.3ms/pass); cliff returns near ~65k lines`,
   },
+  {
+    // [kitty-scan] (Fix 6, 2026-08-13) — the SCAN cost, found by V8 CPU
+    // profile of a real 21,371-entry session (node --cpu-prof): 13.5% of all
+    // ACTIVE cpu went to parseKittyImageHeader + isImageLine, in a session
+    // containing zero images. collectKittyImageIds() calls
+    // extractKittyImageIds() -> parseKittyImageHeader() -> line.indexOf() on
+    // EVERY rendered line on EVERY render. At ~60k rendered lines of ~3.1KB
+    // each (real lines are ~84% SGR bytes), that is a full scan of ~180MB of
+    // string per render. Benchmarked on realistic lines: 110.8ms per render,
+    // vs 0.41ms with this patch (272x). Node tty writes are blocking, so that
+    // 110ms is a hard event-loop stall every render — which matches both the
+    // observed 77% CPU while streaming and the measured p90 keystroke stall
+    // (starve-test: a 60ms block yields ~54ms p90 echo delay; 110ms predicts
+    // ~110ms, and tmux measured p90 116.7ms).
+    //
+    // The patch is pure memoisation keyed on STRING REFERENCE IDENTITY, not
+    // content: comparing prev[i] === line is O(1) (pointer compare) whereas
+    // hashing the line for a content-keyed Map would cost the same O(len)
+    // scan we are trying to avoid. Unchanged lines keep the same string
+    // reference across renders because render() rebuilds the array but reuses
+    // the memoised child line strings, so the hit rate is ~100% for the
+    // scrollback and misses only where content actually changed. A miss just
+    // recomputes, so a reference-inequality false negative costs nothing but
+    // the original work — it can never return a WRONG id set.
+    //
+    // We snapshot with .slice() rather than storing the caller's array. Today
+    // upstream never mutates newLines in place (every newLines[i] site is a
+    // read; compositeOverlays/applyLineResets return NEW arrays), so a bare
+    // reference would work — but if a future upstream ever DID mutate in
+    // place, storing the reference makes prev[i] === lines[i] trivially true
+    // at every index (same object), returning the ENTIRE stale id set. That
+    // exact failure was caught by the adversarial case in
+    // docs/perf-tools/kitty-equiv-test.mjs, and it would stay invisible until
+    // someone actually displayed an image (stale/undeleted images) — a silent
+    // corruption introduced by a pi upgrade. The snapshot is ~60k pointer
+    // copies (<0.3ms) against ~110ms saved, so correctness is nearly free.
+    //
+    // The shared frozen empty array is an INSTANCE field (this.__pkKittyNoIds)
+    // rather than a module-level const so this stays ONE patch site. Two
+    // patches against the same file would each write the same .orig backup,
+    // and the second would capture the first's already-patched bytes — revert
+    // would then restore to a half-patched state (caught by the existing
+    // byte-exact revert test). Without the shared array, every image-free line
+    // memoises its own distinct [], trading the scan cost for 60k+ live
+    // allocations — the profile already showed 9.5% of active cpu in GC.
+    //
+    // Unconditional, like width-cache: memoisation of a pure function has no
+    // behaviour to opt into.
+    name: "kitty-scan",
+    file: "tui-main-screen.js",
+    marker: "pi-king-tui-patch:kittyscan-v1",
+    original: `    collectKittyImageIds(lines) {
+        const ids = new Set();
+        for (const line of lines) {
+            for (const id of extractKittyImageIds(line)) {
+                ids.add(id);
+            }
+        }
+        return ids;
+    }`,
+    patched: `    collectKittyImageIds(lines) { // pi-king-tui-patch:kittyscan-v1
+        const ids = new Set();
+        const __pkPrevLines = this.__pkKittyLines;
+        const __pkPrevIds = this.__pkKittyIds;
+        const __pkNextIds = new Array(lines.length);
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            let lineIds;
+            if (__pkPrevLines !== undefined && __pkPrevLines[i] === line) {
+                lineIds = __pkPrevIds[i];
+            }
+            else {
+                const found = extractKittyImageIds(line);
+                lineIds = found.length === 0 ? (this.__pkKittyNoIds ??= Object.freeze([])) : found;
+            }
+            __pkNextIds[i] = lineIds;
+            for (const id of lineIds) {
+                ids.add(id);
+            }
+        }
+        this.__pkKittyLines = lines.slice();
+        this.__pkKittyIds = __pkNextIds;
+        return ids;
+    }`,
+  },
 ];
 
 /** Test/CI escape hatch: an explicit path to pi-tui's dist directory,
@@ -216,10 +301,17 @@ function apply() {
       continue;
     }
     const src = readFileSync(target, "utf8");
-    writeFileSync(`${target}.orig`, src);
+    // Write the backup ONLY on first touch of this file. Since 2026-08-13
+    // more than one patch targets tui-main-screen.js (render-cap and
+    // kitty-scan), and re-backing-up before the second patch would capture
+    // the FIRST patch's already-modified bytes — revert would then restore a
+    // half-patched file that still contains render-cap while reporting
+    // success. The byte-exact revert test catches exactly this.
+    const backup = `${target}.orig`;
+    if (!existsSync(backup)) writeFileSync(backup, src);
     writeFileSync(target, src.replace(patch.original, patch.patched));
     applied.push(patch.name);
-    console.log(`Patched: ${target} [${patch.name}]\nBackup:  ${target}.orig`);
+    console.log(`Patched: ${target} [${patch.name}]\nBackup:  ${backup}`);
   }
   writeRecord(dist, { signatures: PATCHES.map((p) => p.marker) });
   if (applied.includes("render-cap")) {
@@ -234,15 +326,20 @@ function apply() {
 function revert() {
   const dist = findPiTuiDist();
   let reverted = 0;
-  for (const patch of PATCHES) {
-    const target = join(dist, patch.file);
+  // Restore per FILE, not per patch: several patches can share one file, and
+  // restoring the same backup once per patch would be redundant work that
+  // also reports one "Reverted" line per patch for a single file.
+  const files = [...new Set(PATCHES.map((p) => p.file))];
+  for (const file of files) {
+    const target = join(dist, file);
     const backup = `${target}.orig`;
+    const names = PATCHES.filter((p) => p.file === file).map((p) => p.name).join(", ");
     if (!existsSync(backup)) {
-      console.error(`No backup at ${backup} — nothing to revert for [${patch.name}] (or it was never patched by this tool).`);
+      console.error(`No backup at ${backup} — nothing to revert for [${names}] (or it was never patched by this tool).`);
       continue;
     }
     writeFileSync(target, readFileSync(backup, "utf8"));
-    console.log(`Reverted: ${target} restored from ${backup} [${patch.name}]`);
+    console.log(`Reverted: ${target} restored from ${backup} [${names}]`);
     reverted++;
   }
   return reverted > 0 ? 0 : 2;
