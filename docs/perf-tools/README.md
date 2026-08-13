@@ -18,3 +18,11 @@ DISPROVEN (do not re-run those).
 
 Recording from the CLI (no user paste needed):
     screencapture -v -V 20 /tmp/out.mov
+
+- `eventloop-starve.mjs` + `starve-test.py` — PROVES that synchronous CPU work
+  starves keystroke echo (native, raw-mode pty): a 60ms work burst every 100ms
+  pushes echo p90 from 0.50ms to 54.63ms. NOTE `starve-test.py` contains the
+  `raw()` helper every future latency test must use — without raw mode you
+  measure the KERNEL's pty echo, not the app's render, which invalidated all
+  of this investigation's first-round numbers. The tmux branch of this script
+  still misreads (returns pre-buffered output) and is NOT trustworthy.

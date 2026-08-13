@@ -386,6 +386,69 @@ do not touch GitHub.
   Proposal template; PR only if a maintainer grants `lgtm`. Draft at
   `docs/UPSTREAM-ISSUE-DRAFT.md`; Stanley personalizes (own-voice rule) and
   submits manually — never via automation (their blocking policy).
+## STRONGEST LEAD (2026-08-13): unthrottled per-keystroke render in big sessions
+
+**This supersedes the tmux-transport framing.** Evidence chain:
+
+1. **Live capture while the pane "looked frozen"** (Alexandria, agent running):
+   `tmux capture-pane` twice 4s apart showed tmux's screen model WAS updating
+   (spinner advancing, timer 112.7s→116.8s, tokens 166.5k→196.0k). So the pane
+   is NOT frozen at the tmux layer — tmux has correct fresh content while the
+   user sees stale pixels. Byte volume was trivial: **13.5 KB/s** (vs 10 B/s
+   for a small idle session), 22 sync-output frames in 5s, p50 frame 338 B.
+   13 KB/s cannot congest tmux (it handles MB/s). Transport is NOT the problem.
+2. **CPU correlates with ACTIVITY, not with tmux**: Alexandria 77%, Charon
+   41.8% (both actively streaming with running sub-agents); every idle session
+   1-6%. pi burns most of a core while streaming.
+3. **PROVEN by controlled experiment** (`/tmp/pi-audit/eventloop-starve.mjs` +
+   `starve-test.py`, native pty, raw mode): a 60 ms synchronous work burst
+   every 100 ms raises keystroke→echo latency from p50 0.15 ms / p90 0.50 ms
+   to **p50 13.50 ms / p90 54.63 ms / max 55.54 ms** — i.e. echo is delayed by
+   almost exactly the blocking-work duration. Node is single-threaded, so
+   synchronous render work starves input handling. This needs NO tmux.
+4. **Code confirms the amplifier** (`pi-tui/dist/tui.js`): normal renders are
+   throttled to 60fps (`static MIN_RENDER_INTERVAL_MS = 16`, line 110), BUT
+   keyboard input calls `requestImmediateRender()` (line ~620) which cancels
+   the render timer and renders synchronously on `process.nextTick`,
+   deliberately bypassing the throttle — comment: *"Keyboard input is
+   latency-sensitive. Avoid the throttled timer path."*
+   So while typing during a streaming turn: streaming renders fire at up to
+   60fps AND every keystroke forces an ADDITIONAL unthrottled full render.
+   The responsiveness optimization removes the only rate limit on the most
+   expensive operation, exactly when the event loop is already saturated.
+   Cost per render scales with document size (Container.render, tui.js:58,
+   walks every child).
+
+**Why the native A/B was CONFOUNDED (important):** Stanley reported native
+Ghostty on the same huge Alexandria session felt perfectly smooth — but he
+explicitly never typed into it ("I haven't attempted conversing with the long
+ass Alexandria session on the native Ghostty", to avoid concurrent writes to
+the session JSONL). He only SCROLLED an IDLE session. So the comparison was
+tmux+big+STREAMING+typing vs native+big+IDLE+scrolling. Streaming/CPU load was
+never controlled for. **Prediction to test: typing in a large session natively
+WHILE it streams should also be choppy.** If true, removing tmux does NOT fix
+this, matching the workflow synthesis's warning.
+
+**Proposed fix (NOT yet implemented, needs the prediction tested first):**
+make the immediate-render bypass adaptive — keep it for small/cheap documents,
+but fall back to the 16 ms throttle (or coalesce) when the previous render
+exceeded some budget (e.g. >8 ms). Bounded, reversible, same shape as the
+existing `PI_TUI_MAX_FULL_RENDER_LINES` cap, so it can ship through
+`pi-king patch-tui`. Note pi-tui exposes NO render-throttle env knob today
+(only PI_CLEAR_ON_SHRINK, PI_DEBUG_REDRAW, PI_HARDWARE_CURSOR, PI_TUI_DEBUG,
+PI_TUI_WRITE_LOG, PI_TUI_MAX_FULL_RENDER_LINES — the last one added by us).
+
+**MEASUREMENT LESSON — earlier latency numbers were invalid.** The first
+"tmux and native are identical, sub-millisecond" results measured the KERNEL
+PTY ECHO, not the application's render: the test pty was left in canonical
+mode with ECHO on, so the terminal driver echoed the byte before the app ever
+saw it. Any future keystroke-latency test MUST put the pty in raw mode
+(clear ECHO|ICANON, set VMIN=0/VTIME=0) — see `raw()` in
+`docs/perf-tools/starve-test.py`. Under tmux the same test still misreads
+(it returns pre-buffered tmux output; tmux+busy measured "faster" than
+tmux+idle, which is impossible) — tmux-side echo timing remains UNSOLVED and
+those numbers must not be trusted.
+
 ## OPEN — ghost white-block artifact (2026-08-13, unresolved)
 
 **Symptom (Stanley, reproducible in daily use, screenshot captured):** while
