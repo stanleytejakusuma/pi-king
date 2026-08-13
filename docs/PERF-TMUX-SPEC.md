@@ -386,6 +386,63 @@ do not touch GitHub.
   Proposal template; PR only if a maintainer grants `lgtm`. Draft at
   `docs/UPSTREAM-ISSUE-DRAFT.md`; Stanley personalizes (own-voice rule) and
   submits manually — never via automation (their blocking policy).
+## STREAMING CPU — ROOT CAUSE IS UPSTREAM, PARTIAL FIX SHIPPED (2026-08-13)
+
+**It is pi's own render pipeline, not tmux.** Differential `node --cpu-prof`
+(load-only run vs load+stream run of the SAME 21,371-entry session, on a raw
+pty with NO tmux) isolated streaming cost with no idle dilution:
+
+- streaming added **20.0s of active CPU**; measured **62% CPU median, 112%
+  peak** — over a full core, tmux absent.
+- Where that 20s went: box.js cache-compare **16.6%**, GC **13.2%**,
+  `truncateToWidth` **11.3%**, `parseKittyImageHeader` **8.1%**, `isImageLine`
+  **7.8%**, `doRender` **6.6%**, tui `render` **6.1%** → **~65% render
+  pipeline + 13% GC churn from it = ~78%**.
+
+**Mechanism (read from the installed source):** `Box.render()` renders ALL
+children FIRST, then calls `matchCache()`, which compares every child line
+(`cache.childLines.every((line, i) => line === childLines[i])` — box.js:44, the
+single hottest frame). The cache is checked AFTER the expensive work, so it only
+saves the padding/background step; children re-render every frame regardless.
+
+**This is a known, still-open upstream bug: earendil-works/pi#6665** — "TUI pins
+a full core while streaming: uncached Intl.Segmenter + per-chunk Markdown
+rebuild". Same hot path (render timer → Markdown.render → wrap →
+Intl.Segmenter), reported at ~105% of a core. Causes named there: (1) grapheme
+segmentation uncached in wrap/truncate, (2) `AssistantMessageComponent
+.updateContent()` does `clear()` + `new Markdown(...)` per `message_update`, so
+pi-tui's `cachedLines` never hits while streaming — cost grows with answer
+length. **We are on 0.84.1 which IS latest**, so the CLOSED perf issues' fixes
+are already in (#7385 tool-result-renderer cache bypass, #5014 per-keystroke
+full re-render, #6478 per-frame cost vs transcript length, #7332 streaming
+slowdown, #7541 input latency, #7769 idle redraws); #6665 + #7730 (High CPU on
+macOS with long session) + #8029 (slow prompt editor) remain open.
+
+**SHIPPED: `~/.pi/agent/extensions/static-working-indicator.ts`** — replaces the
+default ~80ms animated "Working" spinner with one static frame, so no
+timer-driven render fires merely to advance an animation (each such frame
+traverses the retained TUI/history tree, so animating costs more the longer the
+session). Verified by **A/B/A** on the real session:
+
+| run | condition | CPU p50 |
+|---|---|---|
+| B | no extension | 62.0% |
+| C | extension ACTIVE | **41.5%** |
+| D | extension present, disabled via `PI_STATIC_WORKING_INDICATOR=0` | 62.4% |
+
+**33% reduction, cleanly attributed** (the control reproduces baseline). Takes
+effect on a session's NEXT START. Upstream's commenter reported a larger win
+(89-101% → ~15%); ours is smaller because this fleet also runs status-line
+extensions (voidfang-footer, pi-alerts, pi-session-timer) that schedule their
+own renders, and because the per-chunk Markdown rebuild (#6665 cause 2) is
+untouched — extensions cannot reach it.
+
+**NOT fixed by this, needs an upstream core fix:** typing latency in long
+sessions. Per #6665's closing comment, every editor update still schedules a
+render that traverses the whole retained tree; the fix needs render coalescing
+plus editor-only invalidation or history virtualization, which "extensions
+cannot implement".
+
 ## SETTLED (2026-08-13): controlled A/B proves tmux is the amplifier
 
 **THE ANSWER. Everything below this section is superseded where it conflicts.**

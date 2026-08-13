@@ -43,3 +43,11 @@ Recording from the CLI (no user paste needed):
   steady 30ms styled stream cleanly (p99 31ms, 0% >100ms); native barely
   degrades under 10 CPU hogs. NOTE: its tmux+loaded cell fails to START tmux
   (spawn_rc=1) rather than measuring a stall — do not read that cell as data.
+
+## Streaming CPU (2026-08-13)
+- `run-profile.py <load|stream> <session.jsonl> <outdir>` — differential CPU
+  profiling on a raw pty (no tmux). Run it twice (load-only, then load+stream)
+  and subtract per-function self time: that isolates streaming cost without
+  idle dilution and without guessing where the streaming window starts inside a
+  single whole-lifetime profile (the mistake that made the first profile
+  useless — 72% of it was idle).
