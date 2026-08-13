@@ -2920,11 +2920,26 @@ function installSessionTracker(pi: ExtensionAPI) {
       // moving the user, which a hand-rolled `tmux attach` here would not.
       const r = dispatchHubAction({ type: "attach", tmuxName: arc.name, expectedPid: pidOf(arc.id) });
       if (!r.deferred) {
-        ctx.ui.notify(
-          `${r.message ? `${r.message}\n` : ""}Could not switch automatically (this session is not inside tmux). ` +
-          `Attach it from the pi-king dashboard, or run: tmux attach-session -t ${arc.name}`,
-          "info",
-        );
+        // Outside tmux, try opening a new tab in the current Ghostty window via
+        // AppleScript + System Events. This is the only way to get a tab in the
+        // same window on macOS — Ghostty's +new-window action is unsupported on
+        // macOS and `open -na` opens a new application instance, not a window.
+        // The Cmd+T keystroke is fragile (focus-dependent) but works in practice.
+        const asA = spawnSync("osascript", ["-e", `
+          tell application "Ghostty" to activate
+          delay 0.3
+          tell application "System Events" to keystroke "t" using command down
+          delay 0.5
+          tell application "System Events" to keystroke "tmux attach-session -t ${arc.name}"
+          delay 0.1
+          tell application "System Events" to keystroke return
+        `], { encoding: "utf8", timeout: 8000 });
+        if (asA.status !== 0) {
+          ctx.ui.notify(
+            `Could not open a new tab automatically. Run: tmux attach-session -t ${arc.name}`,
+            "info",
+          );
+        }
       }
     },
   });
