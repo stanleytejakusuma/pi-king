@@ -788,3 +788,156 @@ detach/reattach, but NO server-side scrollback — a regression vs tmux's
   bytes (3 sandbox entries from this audit — offset past them when
   analyzing). Passive pipe-pane byte-tap remains the zero-touch fallback
   whenever a monolith streams.
+
+---
+
+## Fix 7 — `[box-child-memo]`: stop rebuilding unchanged messages every frame (2026-08-13)
+
+**Status: IMPLEMENTED**, branch `perf/box-child-memo`. Fourth patch site in
+`tools/patch-pi-tui.mjs`, target `components/box.js`. Complementary to
+`--tui-mode fullscreen`, not competing with it: fullscreen changes the *write*
+path, this changes the *build* path. `tui-alt-screen.js:157` still calls
+`this.render(width)` for the whole document under fullscreen, so both land.
+
+### Mechanism
+
+The brief for this work suggested memoising each child's rendered lines in a
+`WeakMap` and "freezing" a child after its output had been byte-identical for
+N frames. **Reading the real code showed that design is both unnecessary and
+strictly worse than what the code already makes possible**, so it was not
+built. The reason:
+
+`Text`, `Markdown` and `Image` — the only three components in pi-tui 0.84.1
+that cache at all — already memoise internally and return **the same array
+object** while their text and width are unchanged:
+
+```js
+// components/text.js
+render(width) {
+    if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width)
+        return this.cachedLines;   // ← same array object, every time
+```
+
+So the leaf re-render was never the expensive part, and a frame-counting
+freeze heuristic would have been guessing at something the components already
+report exactly. What actually costs is what `Box.render()` does *with* those
+lines, at `components/box.js:53`:
+
+```js
+const leftPad = " ".repeat(this.paddingX);
+const childLines = [];
+for (const child of this.children) {
+    const lines = child.render(contentWidth);
+    for (const line of lines) childLines.push(leftPad + line);  // fresh string per line, per frame
+}
+...
+if (this.matchCache(width, childLines, bgSample)) return this.cache.lines;  // then compares them all
+```
+
+Every frame, for every message that ever scrolled by, `Box` allocates a new
+string for every line (`leftPad + line`), pushes it into a fresh array, and
+then `matchCache` (`box.js:39`) walks the whole array with
+`cache.childLines.every((line, i) => line === childLines[i])` only to conclude
+nothing changed. **The cache is consulted after the expensive work has already
+been done.** That is the 16.6% box.js cache-compare and a large share of the
+13.2% GC in the differential profile.
+
+The patch checks reference identity of the child line-arrays *before* doing any
+per-line work. If every child handed back the same array object as last frame,
+and width, `bgSample` and `paddingX` are unchanged, the flattened padded
+document is provably identical and the cached frame is returned untouched.
+Per-frame cost per Box goes from O(lines) to O(children).
+
+Correctness argument: on a fast-path hit, upstream would have built
+`childLines` from the same arrays with the same `leftPad`, so `matchCache`
+would have returned true and upstream would have returned `this.cache.lines`
+— exactly what the patch returns, without building or comparing anything.
+
+### Topology note (this is why the win is large)
+
+Verified against `dist/modes/interactive/interactive-mode.js:350-352`: the
+transcript is a **`Container`** (`tui.js:57`) holding one entry per message,
+and each entry (`user-message.js`, `tool-execution.js`, `custom-message.js`)
+wraps its own small **`Box`**. So there are *thousands* of Boxes, each cheap
+individually — the cost is the multiplication. In a transcript every message
+except the last is immutable, so essentially every Box takes the fast path on
+every frame while streaming.
+
+### Measured effect
+
+Wall-clock timing was deliberately **not** used: the `fullscreen-perf` arc was
+measuring streaming CPU on this machine throughout, and a benchmark would have
+poisoned its numbers. Instead the patch is measured by *work done* — the count
+of line-operations (the `leftPad + line` concat loop plus the `matchCache`
+line compare), which is deterministic and immune to CPU contention.
+
+Simulated on the real topology — 2,000 messages × ~15 lines, 200 streamed
+frames, last message growing by a token per frame, everything else immutable:
+
+|                                   | slow-path entries | line-operations |            |
+|-----------------------------------|------------------:|----------------:|------------|
+| upstream                          |           400,000 |       6,754,828 | —          |
+| `box-child-memo`                  |             8,196 |         139,436 | **48.4x**  |
+| (same, revalidation removed)      |             2,199 |          38,180 | 176.9x     |
+
+**97.94% of per-frame line work removed.** The third row is not shippable — it
+is there to price the safety net: forcing a revalidation costs 48.4x instead of
+176.9x, i.e. the guarantee below is bought for ~1.5 percentage points.
+
+### The hazard, and how the test proves it is handled
+
+Reference identity proves "unchanged" only while no component **mutates its
+cached array in place**. A component that kept its array object and rewrote its
+contents would keep passing the identity check while its content changed — and
+unlike the other three patches, whose failure mode is slowness, this one's
+failure mode is **wrong text on the user's screen**.
+
+Grepped across the whole 0.84.1 dist: no shipped component does this (`text`,
+`markdown` and `image` all build a fresh `result` array and reassign). But this
+file is re-applied *blindly* after every pi upgrade, so the patch does not rely
+on that holding forever. `cache.hits < 60` forces a full content re-verify at
+least every 61st render, bounding staleness to 60 frames instead of infinity.
+
+Tests in `tools/patch-pi-tui.test.mjs` (63 total, was 57):
+
+- **Differential equivalence**: patched vs unpatched `Box` rendered
+  side-by-side across **60,000 randomised frames** — random padding, widths,
+  `bgFn`, add/remove/invalidate, caching and non-caching children — asserted
+  byte-identical. **0 divergences.**
+- **`box-child-memo ADVERSARIAL: in-place child mutation cannot pin stale text
+  forever`** — a Box whose only child keeps its array and mutates it in place,
+  with no sibling churn to break the reference match by accident. This is the
+  case that fails without the invalidation logic: with `hits < 60` stripped out
+  of the patch, the box **never** picks up the mutation (verified stale for 500
+  frames, i.e. permanently) and the test fails with `STALE FOREVER`. With the
+  counter, it recovers in 60 frames. Verified failing-then-passing, not assumed.
+- Non-caching child (fresh array every render) must never be served from the
+  reference cache; `addChild`/`removeChild`/width changes must be picked up
+  immediately, not after the window.
+- The `original` match target is the **entire** `render()` method, so any
+  upstream edit anywhere inside it drops the patch to `unknown` and asks a
+  human rather than half-rewriting a method whose bug shape is stale text.
+
+### On the profile attribution in the brief
+
+The attribution given (box.js cache-compare 16.6%, GC 13.2%, truncateToWidth
+11.3%, doRender 6.6%, render 6.1%) is **consistent with what the code does**,
+and the mechanism above explains it: `matchCache`'s full-document string
+compare is the cache-compare entry, the per-line `leftPad + line` allocation
+feeds GC, and `applyBg`→`visibleWidth` per line feeds the width functions. One
+correction of emphasis, not of measurement: the brief framed the cost as
+"recursive re-render of every child", but the recursion into `Text`/`Markdown`
+is already memoised upstream and is nearly free. The cost is in `Box`'s own
+per-line flatten-and-compare, which is why the fix is a reference check in
+`Box` rather than a freeze applied to children.
+
+### Known ceiling / not done
+
+- `Container.render()` (`tui.js:57`) has the **same pathology and no cache at
+  all** — it rebuilds a full-document array every frame from its children's
+  lines. It is untouched here. It is the obvious next patch, and the reference
+  trick applies to it unchanged now that `Box` returns a stable array on the
+  fast path. Left out to keep this patch's review surface to one file.
+- Real-world CPU effect on a live session is **not yet measured** (deliberately
+  deferred so as not to contaminate the `fullscreen-perf` arc). The numbers
+  above are operation counts on a simulated transcript, not a live profile.
