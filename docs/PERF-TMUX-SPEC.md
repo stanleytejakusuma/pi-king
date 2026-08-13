@@ -941,3 +941,269 @@ per-line flatten-and-compare, which is why the fix is a reference check in
 - Real-world CPU effect on a live session is **not yet measured** (deliberately
   deferred so as not to contaminate the `fullscreen-perf` arc). The numbers
   above are operation counts on a simulated transcript, not a live profile.
+---
+## MEASURED (2026-08-13): `--tui-mode fullscreen` is a NULL RESULT on CPU
+
+**VERDICT: fullscreen does NOT fix the streaming render cost.** It is a null
+result on CPU — **103.8% vs 103.5%** (fullscreen vs regular, native pty, p50
+over a 60s load). It removes up to **424x** of the write bytes and buys a real
+latency-tail win **under tmux only**, at the cost of the mouse and of all
+tmux-side scrollback. The cost that matters is **BUILD, not WRITE**, and
+fullscreen does not touch build.
+
+This was run as a falsification test of the hypothesis "fullscreen removes the
+WRITE cost but may NOT remove the BUILD cost". **The hypothesis is confirmed on
+its pessimistic branch.**
+
+Context: pi already ships the architectural equivalent of Claude Code's
+agent-view (render an attached session into an application-owned viewport
+instead of appending to scrollback). `--tui-mode fullscreen` (`dist/cli/args.js:280`,
+also a `/settings` item labelled experimental) selects `TuiAltScreen` instead of
+`TuiMainScreen` at `dist/modes/interactive/interactive-mode.js:171-177`. Nobody
+had measured it. Now it is measured.
+
+### The one number that settles it
+
+Native pty, one 1-row resize (the full-render path), same 54MB / 21,547-line
+monolith:
+
+| | regular, no cap | regular, cap=3000 (what pi-king ships) | fullscreen |
+|---|---|---|---|
+| bytes per resize | **10.177 MB** | 0.686 MB | **0.024 MB** |
+| wall time per resize (p50) | 638.1 ms | 220.2 ms | **188.6 ms** |
+| freezes >500ms (of 28) | **27** | 0 | 0 |
+
+Bytes fall **424x**. Wall time falls only **3.4x** — and only **1.17x** against
+what pi-king already ships today. The 10.177 MB/resize independently reproduces
+this spec's earlier "10.9MB full render" figure from a completely different
+method, which is a good cross-check on both.
+
+**The residual ~189ms is build cost that fullscreen cannot remove.**
+
+### Condition matrix — TYPING (immediate-render path)
+
+60s of continuous keystrokes into the monolith, 196x58, macOS/Ghostty, pi 0.84.1.
+`ev` = keystrokes delivered (offered load was near-identical across arms, so the
+arms are comparable). CPU from `ps -o cputime` deltas. `settle` = keystroke ->
+last byte of the resulting burst, ms.
+
+| condition | ev | CPU p50 | p90 | max | settle p50 | p90 | **p99** | max | **>100ms** | **>500ms** | MB out |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| regular · native · cap3000 | 433 | 103.5% | 114.8 | 179.6 | 94.7 | 179.0 | **226.5** | 265.9 | **44.9%** | **0** | 0.09 |
+| fullscreen · native | 439 | **103.8%** | 178.4 | 202.7 | 59.3 | 148.1 | **281.3** | 526.3 | **27.9%** | **2** | 0.14 |
+| regular · tmux · cap3000 | 433 | 117.1% | 180.1 | 214.5 | 65.3 | 136.7 | **272.8** | 317.2 | **22.4%** | **0** | 2.38 |
+| fullscreen · tmux | 453 | **105.3%** | 178.5 | 202.9 | **26.0** | 63.5 | **132.9** | 204.7 | **2.5%** | **0** | 3.11 |
+| *ref:* regular · native · **no cap** | 422 | 103.3% | 118.2 | 191.9 | 81.6 | 167.3 | 210.6 | 274.0 | 36.3% | 0 | 0.09 |
+| *ref:* regular · tmux · **no cap** | 446 | 105.8% | 124.7 | 216.6 | 76.0 | 140.9 | 217.4 | 314.3 | 28.1% | 0 | 2.13 |
+
+Readings:
+
+1. **CPU is flat across all four arms (103–117%).** fullscreen·native 103.8 vs
+   regular·native 103.5 is a null result, not a win. This is the headline.
+2. **fullscreen wins the tail under tmux, decisively**: p99 272.8 -> 132.9ms
+   (2.0x), stutters >100ms 22.4% -> 2.5% (9x). This is fullscreen's only real win.
+3. **Under native, fullscreen is a wash or worse**: better p50 (94.7->59.3) and
+   fewer stutters (44.9%->27.9%), but *worse* p99 (226.5->281.3) and it
+   introduces **2 freezes >500ms where regular had none**.
+4. **fullscreen writes MORE bytes than regular on the typing path** (0.14 vs
+   0.09 MB native; 3.11 vs 2.38 MB tmux). Alt-screen rewrites each changed
+   viewport row with explicit cursor addressing + erase (`\x1b[N;1H\x1b[2K`),
+   whereas capped main-screen just appends a short tail. Fullscreen is *not*
+   universally cheaper to write — only on the full-render path.
+5. **The render cap is irrelevant on the typing path** (capnone 103.3% vs
+   cap3000 103.5%): incremental renders never hit it. Fix 2 buys nothing here;
+   it only pays on full renders, where it is worth 15x.
+
+### Condition matrix — RESIZE (full-render path)
+
+60s, one 1-row resize per ~2s, 28-29 resizes per run. **Read the native rows
+only** — see distrust flag D1.
+
+| condition | ev | CPU p90 | max | settle p50 | p99 | >500ms | MB out | **MB/resize** |
+|---|---|---|---|---|---|---|---|---|
+| regular · native · cap3000 | 28 | 87.5% | 135.8 | 220.2 | 278.3 | 0 | 19.21 | 0.686 |
+| fullscreen · native | 29 | 35.0% | 110.8 | **188.6** | 223.8 | 0 | 0.69 | **0.024** |
+| regular · native · **no cap** | 28 | 80.0% | 172.0 | **638.1** | 722.2 | **27** | **284.97** | **10.177** |
+| ~~regular · tmux · cap3000~~ | 28 | 48.4% | 136.5 | 3.3 | 5.8 | 0 | 0.48 | 0.017 |
+| ~~fullscreen · tmux~~ | 28 | 35.3% | 118.1 | 3.2 | 3.7 | 0 | 0.39 | 0.014 |
+| ~~regular · tmux · no cap~~ | 28 | 78.8% | 149.9 | 3.3 | 5.5 | 0 | 0.48 | 0.017 |
+
+CPU p50 is 0.0 in this matrix — a sampling artifact (resizes 2s apart, samples
+0.5s apart). Use p90/max here.
+
+### What fullscreen costs (UX regressions — these gate adoption)
+
+- **It grabs the mouse.** `pi-tui/dist/tui-alt-screen.js:74`:
+  `this.mouseEnabled = options.mouse ?? true`, and line 135 emits
+  `\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h` on entry (`\x1b[?1003h` too
+  when not under tmux). **`tui-main-screen.js` contains ZERO mouse sequences**
+  — regular mode never grabs the mouse, which is why terminal drag-select
+  works today. This is precisely the regression that got a previous change
+  reverted (selection snapping to the composer instead of highlighting text).
+  Fullscreen substitutes its own app-owned selection (selectionFocus,
+  selectionGranularity, scrollbar drag, clickable URLs) and copies via OSC 52
+  at `tui-alt-screen.js:752`; the fleet has `set-clipboard on`, so clipboard
+  itself does survive.
+- **It destroys tmux-side scrollback.** Verified live:
+  `tmux display -p '#{alternate_on}'` returns **1** for fullscreen, **0** for
+  regular. Alternate-screen content never enters tmux's history, so the
+  `history-limit 50000` buffer, tmux copy-mode and terminal scrollback all stop
+  applying to the transcript. All scrolling becomes app-owned. Fullscreen does
+  provide a richer scroll model than copy-mode (`tui.altScreen.pageUp`/
+  `pageDown`/`halfPageUp`/`halfPageDown`/`top`/`bottom`, plus
+  `previousPrompt`/`nextPrompt` bound to ctrl+shift+up/down — semantic
+  jump-to-prompt, which tmux has no equivalent for), but it is a different
+  model that every muscle-memory habit would have to migrate to.
+- **Detach/reattach is fine.** Viewport state survived detach and reattach
+  intact under tmux.
+- **Inline images: unchanged, as expected.** `pi-tui/dist/terminal-image.js`
+  gates on `process.env.TMUX` regardless of TUI mode, so images stay disabled
+  under tmux in both modes. Fullscreen neither fixes nor worsens this.
+
+### THE LOAD PROXY CAVEAT — read this before quoting any number above
+
+**Neither load is streaming.** No provider will accept the monolith, so a real
+model-driven stream on a session this size is not obtainable at all:
+
+- omni gateway: `413 ... "Chat history exceeds the 2000-message limit"` —
+  a gateway rule, so *every* `omni-*` route is out, including the session's own
+  `omni-claude-opus-5`. Reproduced on omni-deepseek-v4-flash,
+  omni-gemini-3.6-flash, omni-qwen3.7-max.
+- deepseek direct: `400 ... maximum context length is 1048576 tokens. However,
+  you requested 1542330 tokens`.
+- openai direct: key on this machine is invalid (401).
+- pi has no context-truncation knob (only autoCompaction*).
+- The 24MB session *did* complete on direct deepseek-v4-flash (954,838 input
+  tokens) but took **3m50s** per round trip and costs real money — unusable for
+  a 12-run matrix.
+
+So two model-free deterministic loads were used as bounds:
+
+- **typing** — pi-tui deliberately bypasses its 16ms render throttle for
+  keyboard input (`requestImmediateRender`), so each keystroke forces one
+  synchronous whole-document render. This is pi's *documented worst* path and
+  the same variable the 2026-08-13 A/B manipulated.
+- **resize** — triggers fullRender, rewriting the entire transcript. pi-king
+  hits this on every attach (Fix 1).
+
+They bracket the behaviour; neither *is* a token stream. **This is the largest
+caveat on the whole exercise.** The CPU null result is robust to it (both loads
+agree, and the effect size is zero, not marginal), but any specific latency
+figure should be read as "this class of load", not "streaming".
+
+### Distrust flags — as valuable as the numbers
+
+- **D1. The four tmux RESIZE cells are measuring the wrong thing. Do not use
+  them.** settle 3.2–3.3ms and ~0.017 MB/resize, *identical* for cap=3000 and
+  cap=none — a cap that changes native output 15x cannot be invisible if pi's
+  work were being observed. tmux absorbs pi's multi-MB burst into its own screen
+  model and forwards only ~7KB of final screen state to the client, so the
+  harness times tmux's ack, not pi's completion. SIGWINCH *does* reach the pane
+  (verified: client 58<->57 drives pane 57<->56, and the pane process logged
+  every SIGWINCH), so the resize is real — the cost is simply hidden inside the
+  tmux server. The native resize column is the trustworthy one.
+- **D2. All tmux byte counts are tmux->client, not pi->tmux.** Fine for
+  comparing arms; wrong as a measure of pi's own output.
+- **D3. The harness drains the pty instantly, so it under-measures what a real
+  GPU terminal pays.** This specifically flatters fullscreen·tmux, which ships
+  *more* bytes than regular·tmux (3.11 vs 2.38 MB) — a cost this method cannot
+  see. The `screencapture` VFR arm would have closed this and was deliberately
+  skipped: it would refine precision on an option already settled against.
+- **D4. These numbers are NOT comparable to the 2026-08-13 VFR baselines**
+  (native p99 100ms / 0.9% / 0 freezes; tmux p99 425ms / 14.1% / 3 freezes).
+  Those are screen-recording frame gaps from a real Ghostty window; these are
+  pty-side byte timings. Direction agrees (tmux tail >> native tail); magnitudes
+  are not comparable. Do not put them in the same table.
+- **D5. CPU p50 = 0.0 in the resize matrix is a sampling artifact**, not idleness.
+- **D6. A whole 25-minute pass was discarded.** The readiness regex `CTX ` also
+  matches transcript *text*, which regular mode dumps to scrollback on boot;
+  two runs declared ready ~20s early (9s vs 28s boot) and were measured while
+  still booting. Fixed to `CTX\s+[\d.]+[kKmMgG]?/[\d.]+[kKmMgG]?` (matches the
+  real status bar, `CTX 175k/1.0M (17.5%)`). **Every number in this section is
+  from after that fix.** Same failure shape as the seven 2026-08-11 bugs: a step
+  reported success while doing nothing.
+- **D7. An entire resize matrix first came back as 0 bytes / 0% CPU** — which
+  looked exactly like "resize is free". Cause: `TIOCSWINSZ` on the pty master
+  delivers **no SIGWINCH** unless the child has made the slave its controlling
+  terminal. Fixed with a `preexec_fn` doing `os.setsid()` +
+  `ioctl(0, TIOCSCTTY)`. The harness now probes the first resize and warns if it
+  produced no output. (Typing results predate and are unaffected — they need no
+  ctty.)
+
+### THE REAL TARGET: the ~189ms build floor
+
+Fullscreen writes 0.024 MB per full render and *still* takes 188.6ms. That
+residual is layout/width computation over the whole document, and it is the
+next thing worth patching:
+
+- `pi-tui/dist/tui-alt-screen.js:157` still does
+  `const documentLines = this.render(width)`.
+- `pi-tui/dist/layout.js:89`: `scrollContentLines: renderCached(context,
+  node.component, contentWidth)` renders the **whole** scroll content every
+  frame, and `renderLayoutFrame` (`layout.js:259`) allocates a fresh
+  `renderCache: new Map()` **per frame** — so there is no cross-frame caching at
+  all. The entire document is laid out every frame even though only 58 rows are
+  written.
+
+**Patch candidates, in order:**
+1. Persist `renderCache` across frames in `renderLayoutFrame` (`layout.js:259`)
+   — the whole-document relayout is pure waste when the document above the
+   viewport has not changed.
+2. `Container.render()` at `tui.js:57` (already on the list).
+3. `Box.render()` / `matchCache()` at `box.js:44` — still renders all children
+   *before* comparing the cache, i.e. the cache is checked after the expensive
+   work (see the 2026-08-13 profile: box.js cache-compare 16.6%).
+
+These are build-cost fixes, and build cost is what both TUI modes share. **A
+build-cost fix helps regular mode and fullscreen mode equally** — which is
+exactly why fullscreen is not a substitute for one.
+
+### RECOMMENDATION FOR PI-KING
+
+**Do not adopt fullscreen as a performance fix — the CPU null result (103.8% vs
+103.5%) means it does not address upstream #6665 at all, and pi-king's existing
+`PI_TUI_MAX_FULL_RENDER_LINES=3000` cap already captures most of the write-cost
+win it offers (0.686 vs 0.024 MB/resize translates to only 220ms vs 189ms of
+actual wall time, a 14% improvement, because build cost dominates).** Its one
+genuine benefit — the tmux latency tail (p99 272.8->132.9ms, stutters
+22.4%->2.5%) — is real but is paid for with the mouse
+(`tui-alt-screen.js:74` grabs it; `tui-main-screen.js` never does) and with all
+tmux-side scrollback and copy-mode (`alternate_on=1`), the former being the
+exact regression that forced a revert once already. **Fleet-wide adoption: no.
+Attach-only adoption: also no** — a mode that changes mouse and scrollback
+behaviour on attach but not on spawn is a worse experience than either mode
+consistently. The correct next move is to attack the ~189ms build floor
+(`layout.js:259` per-frame `renderCache`, `tui.js:57`, `box.js:44`), which
+benefits the mode the fleet already runs and does not cost the mouse.
+**Revisit fullscreen only if upstream lands app-level selection that
+interoperates with tmux, or if the build floor is fixed and the write cost
+becomes the dominant term again.**
+
+### Reproducing
+
+`docs/perf-tools/`:
+- `tui-mode-ab.py` — one condition: `--mode regular|fullscreen --transport
+  native|tmux --load typing|resize|stream|none --cap 3000|none`. Boots pi on a
+  scratch socket, polls for readiness, waits for measured CPU quiescence (not a
+  fixed sleep), samples `ps cputime` deltas, records a merged keystroke/output
+  timeline, and proves the load landed (`keystrokes_landed_on_screen`).
+- `run-tui-mode-matrix.sh <src.jsonl> <outdir> <typing|resize> [pass]` — the
+  6-run matrix. Fresh sessionId per run, mandatory.
+- `summarize-tui-mode.py <outdir>...` — the comparison table.
+- `mk-scratch-session.mjs <src> <dest>` — copies a transcript with a fresh
+  UUIDv7 sessionId, rewriting **all** occurrences (90 in the 54MB monolith) and
+  verifying zero remain. Required: two processes sharing a sessionId fight over
+  one status card and whichever exits last deletes it.
+
+Safety as run: scratch tmux socket `-L pikingperf` only (the harness refuses to
+clean a socket holding unexpected sessions), never the fleet's default socket;
+the live pi-tui install was read but never patched; the global `tuiMode` setting
+was never written (CLI flag only, so the 18 live fleet sessions were never
+touched); verify-before-kill on every process stopped.
+
+Operational note for anyone extending this: **pi rewrites its process title to
+bare `pi`**, so `ps -o command=` shows no argv and neither `pgrep -f <session
+path>` nor `pgrep -f cli.js` can find it. Identify it structurally (the pid you
+spawned, or descend from `tmux list-panes -F '#{pane_pid}'`). Also: macOS
+`ps -o pcpu` is a decaying lifetime average and is useless for a 60s window —
+use `ps -o cputime=` deltas.

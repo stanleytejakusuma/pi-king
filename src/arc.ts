@@ -200,6 +200,17 @@ export function spawnArc(opts: {
   // load-buffer + paste-buffer rather than send-keys: briefs are multi-line and
   // contain characters send-keys would interpret. paste-buffer delivers the text
   // verbatim as one unit.
+  //
+  // -p -r are both required, not just -p: tmux's paste-buffer replaces every LF
+  // in the buffer with CR by default (a separate step from bracket-wrapping),
+  // and pi's composer treats CR as Enter/submit. -p wraps the (still CR-laden)
+  // stream in bracketed-paste codes, which pi's editor.js currently repairs by
+  // normalizing \r -> \n on paste -- but that's pi papering over tmux's mangling,
+  // not a guarantee. -r makes paste-buffer emit LF (not CR) so the bytes are
+  // byte-faithful regardless of whether pi's paste handler keeps doing that
+  // normalization. Without both flags, a multi-paragraph brief gets shredded
+  // into one submitted message per line (confirmed 2026-08-13, session
+  // 019ffa8f-6dd9-7e61-ae8b-ce3babd99baa: 43 lines -> 43 separate user turns).
   const tmp = join(KING_DIR, `arc-brief-${seed.id}.txt`);
   writeFileSync(tmp, brief);
   const buf = `arcbrief-${seed.id}`;
@@ -208,11 +219,19 @@ export function spawnArc(opts: {
     return { ok: true, id: seed.id, sessionFile: seed.file,
       message: `Arc "${safeName}" created, but the brief could not be loaded into tmux. Attach and paste it yourself.` };
   }
-  spawnSync(TMUX, ["paste-buffer", "-b", buf, "-t", target, "-d"], { encoding: "utf8", timeout: 5000 });
+  const paste = spawnSync(TMUX, ["paste-buffer", "-p", "-r", "-b", buf, "-t", target, "-d"], { encoding: "utf8", timeout: 5000 });
+  if (paste.status !== 0) {
+    return { ok: true, id: seed.id, sessionFile: seed.file,
+      message: `Arc "${safeName}" created, but the brief could not be pasted into the pane. Attach and paste it yourself.` };
+  }
   // Enter as a separate send-keys: paste-buffer alone leaves the text in the
   // composer unsubmitted.
   spawnSync("sleep", ["1"]);
-  spawnSync(TMUX, ["send-keys", "-t", target, "Enter"], { encoding: "utf8", timeout: 5000 });
+  const enter = spawnSync(TMUX, ["send-keys", "-t", target, "Enter"], { encoding: "utf8", timeout: 5000 });
+  if (enter.status !== 0) {
+    return { ok: true, id: seed.id, sessionFile: seed.file,
+      message: `Arc "${safeName}" created, the brief is in the composer, but Enter could not be sent to submit it. Attach and press Enter yourself.` };
+  }
 
   return { ok: true, id: seed.id, sessionFile: seed.file,
     message: `Arc "${safeName}" spawned in ${cwd} and the brief was sent. Attach it from the dashboard to steer it.` };
