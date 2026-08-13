@@ -602,7 +602,58 @@ saw it. Any future keystroke-latency test MUST put the pty in raw mode
 tmux+idle, which is impossible) — tmux-side echo timing remains UNSOLVED and
 those numbers must not be trusted.
 
-## OPEN — ghost white-block artifact (2026-08-13, unresolved)
+## SOLVED — ghost white-block artifact (root cause 2026-08-13 evening)
+
+**ROOT CAUSE: `~/.pi/agent/settings.json` had `"showHardwareCursor": true`.**
+pi's own default is FALSE (`pi-tui/dist/tui.js:111`,
+`showHardwareCursor = process.env.PI_HARDWARE_CURSOR === "1"`; the settings key
+overrides it via `settings-manager.js:873`). With it on, every render ends —
+**outside** pi's synchronized-output block — with relative cursor moves plus
+`\x1b[?25h` (`tui-main-screen.js:519-546 positionHardwareCursor`). Under tmux,
+tmux owns the terminal cursor and re-emits its own show/hide: captured client
+stream shows small incremental updates of the form
+`\x1b[?25l …damaged cells… \x1b[?12l \x1b[?25h` with **no reposition before the
+next frame is presented** (and unwrapped by sync — only 5 of 15 updates in a
+14KB capture were inside `?2026h/l`). Ghostty then legitimately paints the
+cursor for one frame at tmux's last write position. Fix applied: setting flipped
+to `false`. Cost is zero — `/settings` → "Show hardware cursor" is literally
+described as "Show the terminal cursor **while still positioning it for IME
+support**", i.e. IME placement survives, and the composer's visible cursor is
+drawn in software regardless (`pi-tui/dist/components/input.js:368`, inverse
+video `\x1b[7m…\x1b[27m`, ungated).
+
+**The earlier KEY INSIGHT below was wrong, and this is why:** it argued "a
+terminal paints exactly ONE hardware cursor, the screenshot shows two blocks,
+therefore it is not a cursor". The premise is right; the missing fact is that pi
+draws its OWN composer cursor in software. Two blocks = one software cursor
+(composer) + one hardware cursor (parked by tmux). Not two cursors.
+
+**Evidence (recording `Screen Recording 2026-08-13 at 15.50.45.mov`, 632 frames,
+19.6s, 3144x2116):** 23 frames carry a second cursor-shaped block
+(`/tmp/pi-audit/ghost3.py`: scipy connected components, 35x17px = exactly one
+cell). Frame-to-frame delta is decisive: 517→518 changes **594 px total, one
+region**, `(1624,2071,35,17)` — the block appears and NOTHING else on screen
+changes; 518→519 it vanishes and reappears at `(1794,2775)`, then `(1930,1576)`.
+Content updates never accompany it, so it is not a stale cell: it is a cursor
+being painted at hopping positions. Ghost positions land anywhere — mid
+transcript, inside pi's own status footer (`HIT 0.0%█ ACTIVE`).
+
+**Native Ghostty is clean for a real reason, not luck:** without tmux, pi's own
+write positions the cursor immediately after each frame, so the stale-position
+window never spans a presented frame.
+
+**Verification path (do this before claiming it fixed):** re-record ~20s of
+typing in a large streaming session and re-run `ghost3.py` — expect 0 frames
+with a second cursor-shaped block, versus 23 in the baseline. A live per-session
+toggle is available without restart: `/settings` → "Show hardware cursor" → off.
+
+**Also disproven along the way:** synchronized output was NOT the missing piece.
+tmux 3.7b already emits `\x1b[?2026h/l` to Ghostty **without** the `sync`
+terminal-feature, because xterm-ghostty terminfo declares `Sync` — measured A/B
+on a private socket (`/tmp/pi-audit/sync-ab.sh`): 39 BSU/39 ESU with no feature
+vs 38/38 with `xterm-ghostty:sync`. Do not re-add that config line for this.
+
+---
 
 **Symptom (Stanley, reproducible in daily use, screenshot captured):** while
 typing in a tmux-hosted session — especially a large/active one (Alexandria)
