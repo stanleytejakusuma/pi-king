@@ -1,7 +1,7 @@
 {
   "name": "pi-king",
   "version": "0.2.0",
-  "description": "tmux-backed session manager and supervisor for the Pi coding agent — background a session and come back to it later",
+  "description": "tmux-backed session manager and supervisor for the Pi coding agent \u2014 background a session and come back to it later",
   "keywords": [
     "pi",
     "pi-coding-agent",
@@ -64,6 +64,7 @@
     "@earendil-works/pi-coding-agent": "^0.83.0",
     "@earendil-works/pi-tui": "^0.83.0",
     "@types/node": "^26.1.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "typebox": "*"
   }
 }

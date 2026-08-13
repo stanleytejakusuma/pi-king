@@ -104,6 +104,8 @@ import {
   type UsageStats,
   type DayTotal,
 } from "./data.ts";
+import { Type } from "typebox";
+import { allArcs, arcsOf, closeArc, extractConversation, findArc, spawnArc } from "./arc.ts";
 import { JobsPanel, notifyMacOS, scanJobs, selectRestoreCards, type SessionManagerLike } from "./jobs.ts";
 import {
   RETIRED_STATES,
@@ -2805,6 +2807,93 @@ function installSessionTracker(pi: ExtensionAPI) {
     );
     setTimeout(() => ctx.shutdown(), 1200);
   }
+
+  // ---- arc: spawn a fresh child session for one unit of work ----------------
+  // Rationale in src/arc.ts. Short version: pi's render cost scales with
+  // retained session size (upstream #6665, core fix only), /fork and /clone
+  // COPY history so they cannot make a small session, and a header-only seed
+  // file with a parentSession pointer produces a child that is both EMPTY and
+  // correctly parented in /resume's tree.
+  pi.registerTool({
+    name: "arc_spawn",
+    label: "Spawn arc",
+    description:
+      "Spawn a NEW, empty, fast child session in its own tmux window to carry out one unit of work (an 'arc'), linked back to this session. " +
+      "Use when work is substantial enough to run many turns — a feature, a spec, a phase, an investigation — rather than something answerable here. " +
+      "The child starts with NO history: the brief is everything it will know, so it must be self-contained (what to build, where, what done looks like, what to read first). " +
+      "The child appears indented under this session in /resume and as its own window in pi-king, and the user steers it directly there. " +
+      "It does NOT report back automatically — the user decides when it is done.",
+    promptSnippet: "arc_spawn: hand a substantial unit of work to a fresh child session instead of growing this one",
+    promptGuidelines: [
+      "Session hygiene: this agent's typing and render latency scale with how much history the session retains, and that cost is permanent — it cannot be compacted away. Before starting substantial multi-turn work (a feature, a spec, a phase, a long investigation), offer to spawn an arc with arc_spawn instead of doing it inline.",
+      "Write the arc brief as if for someone who has never seen this conversation, because that is literally true — the child inherits no history. State the goal, the working directory, what to read first (AGENTS.md, any spec or state file), what 'done' means, and any constraint that would otherwise be discovered the hard way.",
+      "Do not spawn an arc for something you can finish in a turn or two; the overhead is not worth it. Do not spawn one silently either — say what you are spawning and why.",
+    ],
+    parameters: Type.Object({
+      name: Type.String({ description: "Short window name for the arc, e.g. 'search-api'. Becomes the tmux session name." }),
+      brief: Type.String({ description: "The FIRST PROMPT sent to the child. Self-contained: goal, what to read first, definition of done, constraints. The child knows nothing else." }),
+      cwd: Type.Optional(Type.String({ description: "Working directory for the arc. Defaults to this session's cwd." })),
+    }),
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
+      const cwd = params.cwd || ctx.cwd;
+      const r = spawnArc({
+        name: params.name,
+        brief: params.brief,
+        cwd,
+        parentSessionFile: ctx.sessionManager.getSessionFile(),
+        parentId: ctx.sessionManager.getSessionId(),
+      });
+      return { content: [{ type: "text", text: r.message }], details: {} };
+    },
+  });
+
+  pi.registerTool({
+    name: "arc_digest",
+    label: "Digest arc",
+    description:
+      "Prepare a finished arc's transcript for digestion. Strips tool calls/results (measured: 85% of a transcript's bytes) and writes ONLY the conversation to a file, returning its PATH — never its contents. " +
+      "Hand that path to a subagent to distill decisions, rationale, caveats and dead ends; do NOT read the file into this session, which would defeat the point of having split the work out.",
+    promptSnippet: "arc_digest: prepare a finished arc's transcript for a subagent to distill",
+    parameters: Type.Object({
+      arc: Type.String({ description: "Arc name, session id, or id prefix." }),
+    }),
+    execute: async (_id, params, _signal, _onUpdate, _ctx) => {
+      const a = findArc(params.arc);
+      if (!a) return { content: [{ type: "text", text: `No arc matching "${params.arc}".` }], details: {} };
+      if (!existsSync(a.sessionFile)) return { content: [{ type: "text", text: `Arc "${a.name}" has no transcript on disk at ${a.sessionFile}.` }], details: {} };
+      const x = extractConversation(a.sessionFile);
+      const out = join(homedir(), ".pi", "king", `arc-digest-${a.id}.txt`);
+      writeFileSync(out, `# arc: ${a.name}\n# brief given to it:\n${a.brief}\n\n---- transcript (conversation only) ----\n\n${x.text}`);
+      const text =
+          `Wrote ${a.name}'s conversation to ${out} ` +
+          `(${(x.keptChars / 1024).toFixed(0)} KB kept from a ${(x.rawBytes / 1048576).toFixed(1)} MB transcript` +
+          `${x.truncated ? ", TRUNCATED to the most recent portion — the arc was scoped too big" : ""}).\n` +
+          `Now delegate to a subagent: have it read that file and write the distilled decisions, rationale, caveats and dead ends into the project repo. ` +
+          `Do not read the file yourself.`;
+      return { content: [{ type: "text", text }], details: {} };
+    },
+  });
+
+  pi.registerCommand("arc", {
+    description: "List arcs spawned from this session (pi-king)",
+    handler: async (_args, ctx) => {
+      if (!isInteractive(ctx)) return;
+      const mine = arcsOf(ctx.sessionManager.getSessionId());
+      const rows = mine.length > 0 ? mine : allArcs().slice(0, 10);
+      if (rows.length === 0) {
+        ctx.ui.notify("No arcs yet. Ask for one when work gets substantial, or call arc_spawn.", "info");
+        return;
+      }
+      const lines = rows.map((a) => {
+        const age = Math.round((Date.now() - a.createdAt) / 60000);
+        return `${a.closedAt ? "○" : "●"} ${a.name}  ${a.id.slice(0, 8)}  ${age}m  ${a.cwd}`;
+      });
+      ctx.ui.notify(
+        `${mine.length > 0 ? "Arcs from this session" : "Recent arcs (none from this session)"}:\n${lines.join("\n")}`,
+        "info",
+      );
+    },
+  });
 
   pi.registerCommand("bg", {
     description: "Background this session into tmux (queues until the current turn finishes)",
