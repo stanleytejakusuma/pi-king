@@ -2875,7 +2875,7 @@ function installSessionTracker(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("arc", {
-    description: "List arcs spawned from this session (pi-king)",
+    description: "Jump to an arc spawned from this session (pi-king)",
     handler: async (_args, ctx) => {
       if (!isInteractive(ctx)) return;
       const mine = arcsOf(ctx.sessionManager.getSessionId());
@@ -2884,14 +2884,48 @@ function installSessionTracker(pi: ExtensionAPI) {
         ctx.ui.notify("No arcs yet. Ask for one when work gets substantial, or call arc_spawn.", "info");
         return;
       }
-      const lines = rows.map((a) => {
+      // Live state per arc, read from the card rather than from lineage.json:
+      // lineage records the RELATIONSHIP, the card records what the session is
+      // doing right now. "attention" is the one that matters — it means the arc
+      // is blocked waiting on the user, which is invisible from a plain list
+      // and is exactly why this command needed to be more than a printout.
+      const state = (id: string): string => {
+        try {
+          const c = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${id}.json`), "utf8")) as { status?: string; pid?: number };
+          return c.status ?? "?";
+        } catch { return "gone"; }
+      };
+      const pidOf = (id: string): number | undefined => {
+        try {
+          const c = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${id}.json`), "utf8")) as { pid?: number };
+          return typeof c.pid === "number" ? c.pid : undefined;
+        } catch { return undefined; }
+      };
+      const labels = rows.map((a) => {
         const age = Math.round((Date.now() - a.createdAt) / 60000);
-        return `${a.closedAt ? "○" : "●"} ${a.name}  ${a.id.slice(0, 8)}  ${age}m  ${a.cwd}`;
+        const st = a.closedAt ? "closed" : state(a.id);
+        const mark = st === "attention" ? "⚠ waiting on you" : st;
+        return `${a.closedAt ? "○" : "●"} ${a.name} — ${mark} — ${age}m — ${a.cwd}`;
       });
-      ctx.ui.notify(
-        `${mine.length > 0 ? "Arcs from this session" : "Recent arcs (none from this session)"}:\n${lines.join("\n")}`,
-        "info",
+      const picked = await ctx.ui.select(
+        mine.length > 0 ? "Arcs from this session" : "Recent arcs (none from this session)",
+        labels,
       );
+      if (!picked) return;
+      const arc = rows[labels.indexOf(picked)];
+      if (!arc) return;
+      // Reuse the dashboard's own attach path: inside tmux it relocates the
+      // client with switch-client (no tty contention); outside tmux it defers to
+      // the wrapper. It also re-verifies the target's pid against tmux before
+      // moving the user, which a hand-rolled `tmux attach` here would not.
+      const r = dispatchHubAction({ type: "attach", tmuxName: arc.name, expectedPid: pidOf(arc.id) });
+      if (!r.deferred) {
+        ctx.ui.notify(
+          `${r.message ? `${r.message}\n` : ""}Could not switch automatically (this session is not inside tmux). ` +
+          `Attach it from the pi-king dashboard, or run: tmux attach-session -t ${arc.name}`,
+          "info",
+        );
+      }
     },
   });
 
