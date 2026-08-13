@@ -39,12 +39,19 @@ const chk = (name, ok, detail="") => { if(!ok) bad++; console.log(`  ${ok?"PASS"
 // priority made the comparator return NaN.
 {
   const idx = await jiti.import("/Users/stanz/codebase/pi-king/src/index.ts");
+  // isKnownState lives in fleet.ts (see its header comment: stateIcon/iconFor
+  // stayed in index.ts for rendering, isKnownState/KNOWN_STATES moved to
+  // fleet.ts). index.ts only IMPORTS it, so idx.isKnownState was undefined and
+  // every call here threw "is not a function" -- this whole gate had been dead
+  // since the move, silently, because the throw aborts the script before the
+  // summary prints. Found 2026-08-13 by running the verification-loop skill.
+  const flt = await jiti.import("/Users/stanz/codebase/pi-king/src/fleet.ts");
   for (const s of ["working", "idle", "background", "attention", "error", "exited", "trust", "not-a-state", ""]) {
     const icon = idx.iconFor(s);
     chk(`iconFor(${JSON.stringify(s)}) is a real glyph`, typeof icon === "string" && icon.length > 0, icon);
   }
-  chk("known states are recognised", ["working","idle","background","attention","error","exited"].every((s) => idx.isKnownState(s)));
-  chk("retired/unknown states are not", !idx.isKnownState("trust") && !idx.isKnownState("nope"));
+  chk("known states are recognised", ["working","idle","background","attention","error","exited"].every((s) => flt.isKnownState(s)));
+  chk("retired/unknown states are not", !flt.isKnownState("trust") && !flt.isKnownState("nope"));
 }
 
 // 1. cache round-trip must not change any number

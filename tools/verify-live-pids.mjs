@@ -11,7 +11,11 @@ import { spawnSync } from "node:child_process";
 // caught by exactly this kind of check, which is why it is permanent rather
 // than a one-off script.
 const jiti = createJiti(import.meta.url, { interopDefault: true });
-const mod = await jiti.import("/Users/stanz/codebase/pi-king/src/index.ts");
+// livePiPids lives in fleet.ts; index.ts only imports it, so mod.livePiPids
+// was undefined and this entire gate threw on its first call -- dead since the
+// move, silently, because the throw aborts before any summary. Same root cause
+// as verify-metrics.mjs. Found 2026-08-13 via the verification-loop skill.
+const mod = await jiti.import("/Users/stanz/codebase/pi-king/src/fleet.ts");
 
 let bad = 0;
 const chk = (name, ok, detail = "") => { if (!ok) bad++; console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  " + detail : ""}`); };
