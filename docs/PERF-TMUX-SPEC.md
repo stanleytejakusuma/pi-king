@@ -386,6 +386,94 @@ do not touch GitHub.
   Proposal template; PR only if a maintainer grants `lgtm`. Draft at
   `docs/UPSTREAM-ISSUE-DRAFT.md`; Stanley personalizes (own-voice rule) and
   submits manually — never via automation (their blocking policy).
+## OPEN — ghost white-block artifact (2026-08-13, unresolved)
+
+**Symptom (Stanley, reproducible in daily use, screenshot captured):** while
+typing in a tmux-hosted session — especially a large/active one (Alexandria)
+and notably while the agent is STREAMING (`Working...`) — a stray white block
+appears transiently at a wrong position, "mostly bottom side of screen". Also
+reports cursor style flipping between a bar and a normal block. NEVER happens
+in native Ghostty (no tmux), where the same huge session scrolls and types
+perfectly smoothly (confirmed by scrolling a long Alexandria history natively).
+
+**KEY INSIGHT (2026-08-13): it is NOT a second cursor.** A terminal paints
+exactly ONE hardware cursor. The screenshot shows the real cursor after the
+typed text AND a second white block on the composer's top border
+simultaneously. Therefore the ghost must be a CELL rendered with inverse/white
+background — i.e. a STALE, UNCLEARED CELL left behind by a differential
+update (or a tmux damage-tracking miss), not a cursor-positioning error.
+Future investigation should target line-clearing / damage tracking in the
+differential render path, NOT cursor math.
+
+**Hypotheses TESTED AND DISPROVEN (do not re-run these):**
+1. *Raw transport latency through tmux.* Measured keystroke round-trip echo,
+   native pty vs tmux-attached client, n=60 each: statistically identical,
+   both sub-millisecond (native p50=0.019ms, tmux p50=0.020ms).
+2. *tmux status-line redraw perturbing the cursor.* Disabled `status` on a
+   live laggy session (Kairos); Stanley confirmed blipping persisted. Also
+   `monitor-activity` is off, `focus-events` off — neither is a trigger.
+3. *pi-tui `Container.render()` O(document-size) cost.* Benchmarked the REAL
+   installed class (`pi-tui/dist/tui.js:58`) at Alexandria's true scale
+   (20,809 transcript entries) vs a small session (134): p50=0.149ms vs
+   0.010ms. 15.4x ratio but absolute cost is far below perceptible. A
+   workflow agent claimed this was the root cause; direct measurement does
+   NOT support that claim.
+4. *Relative cursor positioning desyncing under tmux when content scrolls.*
+   Built a step-gated harness (`/tmp/pi-audit/cursor-desync-sim.mjs` +
+   `run-desync-test.sh`) mirroring `positionHardwareCursor()`
+   (tui-main-screen.js:504-535) exactly — relative `ESC[{n}A`/`ESC[{n}B`
+   moves computed from self-tracked `hardwareCursorRow` — inside a real
+   tmux pane sized to force scrolling, comparing pi-tui's assumed column
+   against tmux's own `#{cursor_x}`/`#{cursor_y}`. **Result: 0/25 steps
+   diverged.** Rows pinned correctly at 10 once scrolling started. Relative
+   positioning does NOT desync under tmux.
+5. *tmux history-buffer size.* Filled a pane to ~48K lines (near the 50K
+   `history-limit`) then measured keystroke latency: p50=0.146ms. Not a factor.
+6. *tmux server load across the 19-session fleet.* One 139ms spike observed
+   once, but 3 follow-up runs (50 samples each) showed max 34/11/20ms and
+   zero spikes >50ms. Not reliably reproducible; retracted as an explanation.
+
+**Measurement instrument that DOES work (use this next time):** macOS
+`screencapture -v -V <secs> out.mov` records the screen from the CLI (no user
+paste needed, permission already granted) and — critically — records
+VARIABLE frame rate: a frame is emitted only when the screen actually
+changes. Therefore inter-frame gaps ARE screen-repaint events, directly
+measuring perceived smoothness with no threshold guessing. Extract with
+`ffprobe -select_streams v:0 -show_entries frame=pts_time -of csv=p=0`.
+Scene-score thresholding was a dead end — a single character glyph is ~1e-5
+of a 3600x2338 screen, far below any usable scene threshold.
+Measured: laggy tmux typing p50=25ms/p90=108ms/max=392ms repaint gaps vs a
+cleaner recording at p50=16.7ms/p90=66.7ms/max=167ms. Helper scripts:
+`/tmp/pi-audit/analyze-smoothness.sh`, `ghost2.py` (transient-vs-static
+bright-block classifier — correctly traced the real cursor advancing
+left-to-right while typing; found no ghost in that particular recording).
+
+**NEXT STEP when resumed:** capture a screen recording at the exact moment
+the artifact appears (it is transient, so record continuously while typing in
+a large streaming session and search frames afterward with `ghost2.py`), then
+inspect the raw tmux byte stream for that pane at the same timestamp
+(`tmux pipe-pane -o 'cat >> /tmp/x.raw'`) to see whether the stale cell is
+(a) written by pi-tui and never cleared, or (b) an artifact tmux introduces
+when relaying. That distinction determines whether the fix belongs in
+`pi-king patch-tui` or in tmux config.
+
+**Also still open:** dashboard status for "Solagin Live" showed `exited`
+while its tmux pane was actually alive and healthy — pi-king status-tracking
+bug, unrelated to rendering, not yet investigated.
+
+**Architectural option researched (2026-08-12), not started:** `pi --mode rpc`
+EXISTS and works — verified directly: `echo '{"type":"get_state"}' | node
+.../dist/cli.js --mode rpc --no-session` returns clean structured JSON
+(model, sessionId, messageCount, etc). A dashboard could spawn `pi --mode rpc`
+per session and render its own UI from the event stream, removing tmux AND
+pty/terminal emulation entirely. This is the lightest-weight path to "no
+tmux" (Stanley's stated preference: lightweight if possible) because
+fan-out becomes broadcasting small JSON messages rather than relaying raw
+pty bytes with cursor-state tracking. Cost: pi-king would need its own
+renderer. Reports also covered dtach/abduco as a middle path (real
+detach/reattach, but NO server-side scrollback — a regression vs tmux's
+`history-limit 50000`, which would have to be built).
+
 - 2026-08-11: **Fix 3 applied to ~/.tmux.conf** (Stanley approved, agent
   applied): (1) `terminal-overrides` RGB pattern corrected from
   `xterm-256color` (never matched, dead config) to `tmux-256color` (what
