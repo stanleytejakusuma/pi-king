@@ -2875,9 +2875,18 @@ function installSessionTracker(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("arc", {
-    description: "Jump to an arc spawned from this session (pi-king)",
-    handler: async (_args, ctx) => {
+    description: "Jump to an arc spawned from this session (pi-king). `/arc close <name>` marks one done.",
+    handler: async (args, ctx) => {
       if (!isInteractive(ctx)) return;
+      // Bookkeeping only: closing flags the arc in lineage.json so /arc stops
+      // offering it as live work. The window and transcript are left alone.
+      const closeTarget = args.trim().replace(/^close\s*/, "");
+      if (args.trim().startsWith("close")) {
+        if (!closeTarget) { ctx.ui.notify("Usage: /arc close <name>", "info"); return; }
+        const r = closeArc(closeTarget);
+        ctx.ui.notify(r.message, r.ok ? "info" : "error");
+        return;
+      }
       const mine = arcsOf(ctx.sessionManager.getSessionId());
       const rows = mine.length > 0 ? mine : allArcs().slice(0, 10);
       if (rows.length === 0) {
