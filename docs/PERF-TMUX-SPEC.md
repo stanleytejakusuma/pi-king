@@ -386,9 +386,62 @@ do not touch GitHub.
   Proposal template; PR only if a maintainer grants `lgtm`. Draft at
   `docs/UPSTREAM-ISSUE-DRAFT.md`; Stanley personalizes (own-voice rule) and
   submits manually — never via automation (their blocking policy).
-## STRONGEST LEAD (2026-08-13): unthrottled per-keystroke render in big sessions
+## SETTLED (2026-08-13): controlled A/B proves tmux is the amplifier
 
-**This supersedes the tmux-transport framing.** Evidence chain:
+**THE ANSWER. Everything below this section is superseded where it conflicts.**
+
+Controlled experiment, everything held constant except tmux: the SAME 53MB /
+21,371-line Alexandria transcript copied twice with rewritten sessionIds, same
+prompt ("List the numbers 1 through 300, one per line, nothing else. Do not use
+any tools."), same continuous typing during the stream, same
+`PI_TUI_MAX_FULL_RENDER_LINES=3000`, same 196x58 size, back-to-back on an
+otherwise identical machine state. Measured by VFR screen recording
+(inter-frame gap == real repaint event):
+
+| metric | A: tmux | B: native | ratio |
+|---|---|---|---|
+| repaint fps | 17.1 | 28.8 | 1.7x |
+| p50 gap | 25.0 ms | 25.0 ms | IDENTICAL |
+| p90 gap | 116.7 ms | 75.0 ms | 1.6x |
+| p99 gap | 425.0 ms | 100.0 ms | 4.3x |
+| max gap | 550.0 ms | 475.0 ms | |
+| stutters >100ms | 72/511 (14.1%) | 8/863 (0.9%) | **15x** |
+| stalls >250ms | 13 (2.5%) | 2 (0.23%) | 11x |
+| freezes >500ms | 3 | 0 | |
+
+**The median is IDENTICAL; the entire difference is in the TAIL.** This is why
+every earlier measurement came back "clean": they measured medians and
+byte-echo. Humans perceive the tail, not the median — one frame in seven
+hitching >100ms IS the sensation of "choppy", and tmux additionally produced
+three outright >500ms freezes that native never produced.
+
+**Consequence for the "unthrottled render" lead below: pi's render cost is the
+LOAD, but tmux is the AMPLIFIER.** The identical render cost exists in both
+conditions, yet native is 15x cleaner on stutters — so a render-throttle patch
+to pi-tui would NOT have fixed this. The prediction stated below ("typing in a
+large session natively WHILE it streams should also be choppy") was TESTED AND
+FALSIFIED: native under full streaming load is smooth (0.9% stutters).
+
+**Therefore removing tmux IS justified by evidence**, not by preference. See
+the `pi --mode rpc` option recorded further below — verified working — as the
+lightweight path (Stanley's stated constraint).
+
+**Method note for reproducing:** copies MUST have their embedded sessionId
+rewritten (it appears ~57x inside the transcript, including the
+`{"type":"session","id":...}` header). A byte-identical copy makes two
+processes claim one sessionId; when the impostor exits it DELETES the shared
+status card in ~/.pi/king/session-status/, and the real session drops off the
+dashboard into "tmux (no Pi session)" and appears unpinned (pin state in
+~/.pi/king/layout.json is NOT lost — orphans just cannot sort into the pinned
+group). Recovery: rebuild the card with visible:true and the real pid, and OMIT
+startupFingerprint (fleet.ts:395-401 treats undefined as "assume fine").
+This happened live on 2026-08-13 and is the same failure class already
+documented at src/index.ts:2382 from 2026-08-07.
+
+## SUPERSEDED LEAD (2026-08-13): unthrottled per-keystroke render in big sessions
+
+**Kept for the measurements, but see SETTLED above — its central prediction was
+falsified.** Evidence chain:
 
 1. **Live capture while the pane "looked frozen"** (Alexandria, agent running):
    `tmux capture-pane` twice 4s apart showed tmux's screen model WAS updating
