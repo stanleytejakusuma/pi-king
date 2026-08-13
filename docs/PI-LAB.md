@@ -97,6 +97,28 @@ python3 tui-mode-ab.py --mode regular --transport native --load typing \
   --session /tmp/scratch-b.jsonl --out /tmp/patched.json
 ```
 
+### Is the patch actually firing?
+
+CPU numbers alone cannot distinguish "the patch helps a little" from "the patch
+never fires and costs a comparison". `boxmemo-probe.mjs` answers that directly
+by wrapping `Box.prototype.render` from outside the file — ESM modules are
+singletons, so every internal `new Box()` gets the wrapper, and the measured
+`box.js` stays byte-identical to the shipped patch.
+
+```sh
+PK_STAT_OUT=/tmp/stats.json \
+NODE_OPTIONS="--import $PWD/boxmemo-probe.mjs" \
+PI_PERF_CLI=~/.pi-lab/pi-coding-agent/dist/cli.js \
+python3 tui-mode-ab.py --mode regular --transport native --load typing \
+  --session /tmp/scratch.jsonl --out /tmp/probe
+```
+
+A hit is the fast path returning the **same array object** as last time — the
+only thing the patch can do. `hitRate: 0` means it is pure overhead on that
+workload. `widthChanges` matters too: the cache is width-keyed, so a workload
+that changes width every frame (resize) can never hit by construction, and is
+the wrong place to look for a win.
+
 Caveat inherited from the fullscreen measurement: typing is a **proxy** for
 streaming, not streaming itself — no provider will accept a 54MB session. It is
 pi's documented worst path (`requestImmediateRender` deliberately bypasses the
