@@ -43,7 +43,7 @@
  * `#<shortId>` suffix pi-alerts.ts embeds in every title.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -2454,18 +2454,6 @@ function installSessionTracker(pi: ExtensionAPI) {
     // own default `prefix d`. F12 covered that case; this does not.
     if (unsubscribeLeftArrow) { unsubscribeLeftArrow(); unsubscribeLeftArrow = undefined; }
     unsubscribeLeftArrow = ctx.ui.onTerminalInput((data) => {
-      // TEMPORARY DIAGNOSTIC — left-arrow was reported not to work live;
-      // logs the raw bytes and every gate's value for every keystroke so the
-      // failure is a fact instead of a guess. Remove before the next release.
-      if (process.env.PI_KING_DEBUG_KEYS) {
-        try {
-          const release = isKeyRelease(data);
-          const isLeft = matchesKey(data, "left");
-          const editorText = ctx.ui.getEditorText();
-          const line = `${new Date().toISOString()} raw=${JSON.stringify(data)} release=${release} isLeft=${isLeft} editorText=${JSON.stringify(editorText)} TMUX=${Boolean(process.env.TMUX)}\n`;
-          appendFileSync("/tmp/pi-king-left-debug.log", line);
-        } catch { /* diagnostic only, must never disturb the session */ }
-      }
       // The kitty keyboard protocol reports both press and release for the
       // same physical keystroke; matchesKey matches either, so acting on both
       // would detach twice per press. Act on press only.
@@ -2478,10 +2466,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       // process's own $TMUX context, exactly as running `tmux detach-client`
       // by hand inside this same pane would — the identical effect F12 had,
       // just reached through a gated key instead of an unconditional one.
-      const result = spawnSync(TMUX, ["detach-client"], { encoding: "utf8", timeout: 3000 });
-      if (process.env.PI_KING_DEBUG_KEYS) {
-        try { appendFileSync("/tmp/pi-king-left-debug.log", `  -> FIRED: status=${result.status} stderr=${JSON.stringify(result.stderr)}\n`); } catch { /* diagnostic only */ }
-      }
+      spawnSync(TMUX, ["detach-client"], { encoding: "utf8", timeout: 3000 });
       return { consume: true };
     });
 
