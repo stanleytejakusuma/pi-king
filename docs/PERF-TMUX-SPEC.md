@@ -793,6 +793,11 @@ detach/reattach, but NO server-side scrollback — a regression vs tmux's
 
 ## Fix 7 — `[box-child-memo]`: stop rebuilding unchanged messages every frame (2026-08-13)
 
+> **VERDICT 2026-08-13: CORRECT, FIRES 95-99.75% OF THE TIME, AND BUYS NOTHING
+> MEASURABLE. DO NOT SHIP TO THE FLEET.** See "Measured in a real session"
+> below. Kept on `main` as a patch site that is *not* applied, because the
+> measurement is the valuable part: it proves where the cost is not.
+
 **Status: IMPLEMENTED**, branch `perf/box-child-memo`. Fourth patch site in
 `tools/patch-pi-tui.mjs`, target `components/box.js`. Complementary to
 `--tui-mode fullscreen`, not competing with it: fullscreen changes the *write*
@@ -942,6 +947,69 @@ per-line flatten-and-compare, which is why the fix is a reference check in
   deferred so as not to contaminate the `fullscreen-perf` arc). The numbers
   above are operation counts on a simulated transcript, not a live profile.
 ---
+
+### Measured in a real session (2026-08-13) — null result, do not ship
+
+The 97.94% line-op reduction above is real, and was measured in a **synthetic**
+harness where `Box`'s flatten-and-compare was the only work in the loop. In a
+real 21,547-entry session it does not translate.
+
+Method: an isolated clone of the 0.84.1 install at `~/.pi-lab` with the patch
+applied to the clone only (see `docs/PI-LAB.md`), A/B'd against the untouched
+system install with `docs/perf-tools/tui-mode-ab.py`, plus
+`docs/perf-tools/boxmemo-probe.mjs` counting fast-path hits from outside
+`box.js`. Session: a scratch copy of the 53.7 MB / 21,547-entry monolith.
+
+**The patch fires. It just doesn't matter.**
+
+| workload | Box.render calls | fast-path hits | hit rate | lines rebuilt |
+|---|---:|---:|---:|---:|
+| typing, cap=3000 | 809,134 | 807,101 | **99.75%** | 32,836 |
+| typing, cap=none | 809,134 | 807,101 | **99.75%** | 32,836 |
+| resize, cap=none | 42,693 | 40,660 | **95.24%** | 32,836 |
+
+And the CPU it saves is nil:
+
+| workload | stock p50 | patched p50 | stock p99 | patched p99 |
+|---|---:|---:|---:|---:|
+| typing, cap=3000 | 44.8% | 44.8% | 87.0% | 81.9% |
+| resize, cap=none | mean 7.5% | mean 7.8% | 46.0% | 47.9% |
+
+`bytes_to_terminal` was **identical to the byte** in every pair (166,241 typing;
+309,483,737 resize; 10,671,853 per resize). That is the correctness proof — the
+patch may only change CPU, never output — and it is also why the two typing rows
+are identical: rendering is deterministic, the load is scripted, and the cap
+does not engage on this path.
+
+`lines_rebuilt` is the same 32,836 in all three runs because that is the
+**initial** document build; after it, essentially everything is a cache hit.
+
+**Conclusion.** `Box.render`'s per-line rebuild and compare is not a meaningful
+share of a real session's render cost. Eliminating 99.75% of it moves nothing,
+and on the resize path costs ~4% for a comparison that succeeds but saves
+nothing worth having. The cost lives in *how many nodes get visited per frame* —
+`Container.render()` (`tui.js:57`) and `ScrollView.render()` have the same
+pathology with **no cache at all**, and `ScrollView` renders the entire child
+document before layout slices the viewport out of it.
+
+Two further facts from the same runs:
+
+- `render-cap` (`PI_TUI_MAX_FULL_RENDER_LINES=3000`) makes **no difference
+  during typing** — p50 44.8% capped vs 44.7% uncapped. Whatever burns CPU while
+  typing is not a full-document rebuild.
+- The resize load toggles **height**, not width, so `widthChanges` is 0 and the
+  width-keyed cache stays valid across a full 10.6 MB document rewrite. The
+  patch hits 95% even there and still buys nothing.
+
+**Therefore:** per-node memoisation is the wrong lever. The right one is not
+visiting off-screen nodes at all (virtualization), which is the case for the
+rpc-client architecture — now justified by measurement rather than assumption.
+
+**Caveat.** Typing is a proxy for streaming, not streaming itself; no provider
+will accept a 53.7 MB session. Typing is pi's documented worst path
+(`requestImmediateRender` deliberately bypasses the 16 ms throttle), so it
+bounds behaviour, but the streaming case remains unmeasured at this size.
+
 ## MEASURED (2026-08-13): `--tui-mode fullscreen` is a NULL RESULT on CPU
 
 **VERDICT: fullscreen does NOT fix the streaming render cost.** It is a null

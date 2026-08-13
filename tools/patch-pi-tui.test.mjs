@@ -177,11 +177,11 @@ function fixture(dir, body = originalBlock, widthBody = originalWidthCache, kitt
   return path;
 }
 
-function run(args, target) {
+function run(args, target, extraEnv = {}) {
   try {
     const stdout = execFileSync("node", [TOOL, ...args], {
       encoding: "utf8",
-      env: { ...process.env, PI_KING_PI_TUI_TARGET: target, HOME: process.env.HOME },
+      env: { ...process.env, PI_KING_PI_TUI_TARGET: target, HOME: process.env.HOME, ...extraEnv },
     });
     return { code: 0, stdout };
   } catch (err) {
@@ -192,6 +192,36 @@ function run(args, target) {
 let dir;
 const fresh = () => { dir = mkdtempSync(join(tmpdir(), "pi-king-patchtool-")); return dir; };
 const cleanup = () => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } };
+
+test("unknown argument refuses instead of falling through to apply", () => {
+  // Regression, 2026-08-13: `check` (no dashes) hit the default branch and
+  // patched the LIVE fleet install. An unrecognised arg must never mutate a
+  // file. Bare (no arg) still means apply -- that is the documented call.
+  const target = fixture(fresh());
+  const box = join(dir, "components", "box.js");
+  const before = readFileSync(box, "utf8");
+  for (const bad of ["check", "revert", "--dry-run", "-c"]) {
+    const r = run([bad], target);
+    assert.equal(r.code, 2, `"${bad}" should exit 2`);
+    assert.match(r.stderr ?? "", /unknown argument/);
+    assert.equal(readFileSync(box, "utf8"), before, `"${bad}" must leave the file byte-identical`);
+  }
+  cleanup();
+});
+
+test("opt-in patches are excluded from apply unless named in PI_KING_PATCH_OPTIN", () => {
+  const target = fixture(fresh());
+  const box = join(dir, "components", "box.js");
+  run([], target); // bare = apply
+  assert.ok(
+    !readFileSync(box, "utf8").includes("pi-king-tui-patch:boxmemo-v1"),
+    "box-child-memo must NOT be applied by a default apply",
+  );
+  const r = run(["--check"], target);
+  assert.match(r.stdout, /\[box-child-memo\]: opt-in, not applied/);
+  assert.equal(r.code, 0, "an unapplied opt-in patch must not make --check unhealthy");
+  cleanup();
+});
 
 test("--check on a fresh fixture: unpatched, exit 1", () => {
   const target = fixture(fresh());
@@ -464,20 +494,24 @@ test("box-child-memo: registered, reported by --check, and revert is byte-exact"
   const box = join(dir, "components", "box.js");
   const before = readFileSync(box, "utf8");
 
-  const pre = run(["--check"], target);
+  // box-child-memo is opt-in (measured null result, see PERF-TMUX-SPEC.md), so
+  // every arm here must name it explicitly.
+  const OPT = { PI_KING_PATCH_OPTIN: "box-child-memo" };
+
+  const pre = run(["--check"], target, OPT);
   assert.match(pre.stdout, /components\/box\.js \[box-child-memo\]: unpatched/);
   assert.equal(pre.code, 1);
 
-  assert.equal(run([], target).code, 0);
+  assert.equal(run([], target, OPT).code, 0);
   const after = readFileSync(box, "utf8");
   assert.equal((after.match(/pi-king-tui-patch:boxmemo-v1/g) ?? []).length, 1, "marker exactly once");
   assert.equal(readFileSync(`${box}.orig`, "utf8"), before, ".orig must be byte-identical to pre-patch content");
 
-  const post = run(["--check"], target);
+  const post = run(["--check"], target, OPT);
   assert.match(post.stdout, /components\/box\.js \[box-child-memo\]: patched/);
   assert.equal(post.code, 0);
 
-  assert.equal(run(["--revert"], target).code, 0);
+  assert.equal(run(["--revert"], target, OPT).code, 0);
   assert.equal(readFileSync(box, "utf8"), before, "revert must restore byte-exact original");
   cleanup();
 });
@@ -488,8 +522,9 @@ test("box-child-memo: an upstream edit anywhere inside render() refuses rather t
     originalBoxRender.replace("// Top padding", "// Top padding (upstream reworded this)"));
   const box = join(dir, "components", "box.js");
   const before = readFileSync(box, "utf8");
-  assert.equal(run(["--check"], target).code, 2, "must report unknown, not unpatched");
-  assert.equal(run([], target).code, 2, "must refuse to apply");
+  assert.equal(run(["--check"], target, { PI_KING_PATCH_OPTIN: "box-child-memo" }).code, 2,
+    "must report unknown, not unpatched");
+  assert.equal(run([], target, { PI_KING_PATCH_OPTIN: "box-child-memo" }).code, 2, "must refuse to apply");
   assert.equal(readFileSync(box, "utf8"), before, "a refused apply must not touch the file");
   cleanup();
 });

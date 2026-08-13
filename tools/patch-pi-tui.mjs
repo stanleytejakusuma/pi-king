@@ -216,6 +216,12 @@ const PATCHES = [
   },
   {
     name: "box-child-memo",
+    // Measured null result on a real 21,547-entry session: fires 95-99.75% of
+    // the time and moves CPU by nothing (docs/PERF-TMUX-SPEC.md, "Measured in
+    // a real session"). Its failure mode is WRONG TEXT, not slowness, so an
+    // unmeasurable win does not justify the risk. Kept as a verified patch
+    // site, off by default: PI_KING_PATCH_OPTIN=box-child-memo to apply.
+    optIn: true,
     file: "components/box.js",
     marker: "pi-king-tui-patch:boxmemo-v1",
     // Whole render() body is the match target on purpose. Three separate
@@ -429,9 +435,18 @@ function writeRecord(dist, extra) {
   }
 }
 
+// Opt-in patches are excluded from apply/check/revert unless named in
+// PI_KING_PATCH_OPTIN (comma-separated). Anything opt-in must stay invisible
+// to the daemon's health check, or a deliberately-unapplied patch would read
+// as a broken install.
+const OPTED_IN = new Set(
+  (process.env.PI_KING_PATCH_OPTIN || "").split(",").map((s) => s.trim()).filter(Boolean),
+);
+const activePatches = () => PATCHES.filter((p) => !p.optIn || OPTED_IN.has(p.name));
+
 function apply() {
   const dist = findPiTuiDist();
-  const states = PATCHES.map((p) => ({ patch: p, st: statusOf(dist, p) }));
+  const states = activePatches().map((p) => ({ patch: p, st: statusOf(dist, p) }));
   // Refuse the whole run if ANY site is unrecognised, before writing
   // anything: a half-applied pair is worse than an unapplied one, because
   // the daemon's warning would clear while a real regression stayed live.
@@ -465,7 +480,7 @@ function apply() {
     applied.push(patch.name);
     console.log(`Patched: ${target} [${patch.name}]\nBackup:  ${backup}`);
   }
-  writeRecord(dist, { signatures: PATCHES.map((p) => p.marker) });
+  writeRecord(dist, { signatures: activePatches().map((p) => p.marker) });
   if (applied.includes("render-cap")) {
     console.log("Set PI_TUI_MAX_FULL_RENDER_LINES=<n> on a tmux-spawned session to cap full renders (pi-king does this automatically via tmuxLaunchEnv()).");
   }
@@ -481,11 +496,11 @@ function revert() {
   // Restore per FILE, not per patch: several patches can share one file, and
   // restoring the same backup once per patch would be redundant work that
   // also reports one "Reverted" line per patch for a single file.
-  const files = [...new Set(PATCHES.map((p) => p.file))];
+  const files = [...new Set(activePatches().map((p) => p.file))];
   for (const file of files) {
     const target = join(dist, file);
     const backup = `${target}.orig`;
-    const names = PATCHES.filter((p) => p.file === file).map((p) => p.name).join(", ");
+    const names = activePatches().filter((p) => p.file === file).map((p) => p.name).join(", ");
     if (!existsSync(backup)) {
       console.error(`No backup at ${backup} — nothing to revert for [${names}] (or it was never patched by this tool).`);
       continue;
@@ -516,9 +531,12 @@ function warnHardwareCursor() {
 
 function check() {
   const dist = findPiTuiDist();
-  const states = PATCHES.map((p) => ({ patch: p, st: statusOf(dist, p) }));
+  const states = activePatches().map((p) => ({ patch: p, st: statusOf(dist, p) }));
   for (const { patch, st } of states) {
     console.log(`${join(dist, patch.file)} [${patch.name}]: ${st}`);
+  }
+  for (const p of PATCHES.filter((p) => p.optIn && !OPTED_IN.has(p.name))) {
+    console.log(`${join(dist, p.file)} [${p.name}]: opt-in, not applied`);
   }
   warnHardwareCursor();
   // Worst-status-wins: "patched" only when every site is patched, so a
@@ -529,6 +547,14 @@ function check() {
 }
 
 const mode = process.argv[2];
+// Bare `pi-king patch-tui` means apply -- that is the documented call. But an
+// UNRECOGNISED arg must never fall through to apply: typing `check` instead of
+// `--check` silently patched the live fleet install once (2026-08-13), which is
+// the same shape as the 2026-08-10 incident.
+if (mode !== undefined && !["--check", "--revert", "--apply"].includes(mode)) {
+  console.error(`unknown argument: ${mode}\nusage: patch-pi-tui.mjs [--apply|--check|--revert]  (no argument = --apply)`);
+  process.exit(2);
+}
 try {
   const code = mode === "--check" ? check() : mode === "--revert" ? revert() : apply();
   process.exit(code);
