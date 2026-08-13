@@ -1,10 +1,9 @@
 #!/usr/bin/env node
-// pi-king patch-tui — Fixes 2 and 5 of docs/PERF-TMUX-SPEC.md.
+// pi-king patch-tui — Fixes 2, 5, 6 and 7 of docs/PERF-TMUX-SPEC.md.
 //
-// TWO independent vendored patches to pi-tui's installed dist, applied and
-// reverted together. Both target real, measured event-loop stalls on large
-// sessions; they hit DIFFERENT bottlenecks and neither substitutes for the
-// other:
+// FOUR independent vendored patches to pi-tui's installed dist, applied and
+// reverted together. All target real, measured event-loop stalls on large
+// sessions; they hit DIFFERENT bottlenecks and none substitutes for another:
 //
 // [render-cap] (Fix 2, 2026-08-10) — the WRITE cost.
 //   pi-tui's fullRender() (packages/tui/src/tui-main-screen.ts upstream,
@@ -53,6 +52,31 @@
 //   only capacity > working set matters. The real fix is upstream: layout
 //   should not be recomputed for every line of an unchanged document on
 //   every tick. This patch buys headroom, it does not fix the architecture.
+//
+// [box-child-memo] (Fix 7, 2026-08-13) — the per-frame BUILD cost.
+//   components/box.js render() flattens every child's lines into a new array
+//   with a fresh `leftPad + line` string PER LINE PER FRAME, and only then
+//   asks matchCache whether anything changed — a full-document string compare
+//   to discover that nothing did. The transcript is one Box per message
+//   (interactive-mode.js:350-352), thousands of them, and every message but
+//   the last is immutable, so almost all of that work is provably wasted.
+//   Text/Markdown/Image already memoise internally and hand back the SAME
+//   array object while unchanged, so this patch checks reference identity of
+//   the child line-arrays BEFORE any per-line work and returns the cached
+//   frame when every child matches: O(lines) -> O(children) per Box per frame.
+//   Measured by operation count (not wall time — the fullscreen-perf arc was
+//   profiling this machine at the time) on 2,000 messages x 200 streamed
+//   frames: 6,754,828 -> 139,436 line-operations, 97.94% removed (48.4x).
+//
+//   HAZARD, and why `hits < 60` exists: reference identity proves "unchanged"
+//   only while no component mutates its cached array IN PLACE. None shipped in
+//   0.84.1 does (grepped). But this file is re-applied blindly after every pi
+//   upgrade, and unlike the patches above — whose failure mode is slowness —
+//   this one's failure mode is WRONG TEXT ON SCREEN. So the cache force-
+//   revalidates every 61st render, bounding staleness to 60 frames instead of
+//   forever. That safety costs 48.4x instead of 176.9x. The adversarial test
+//   in patch-pi-tui.test.mjs fails with "STALE FOREVER" if the counter is
+//   removed; it was verified failing, not assumed to.
 //
 // These are vendored patches to code pi-king does not own. They WILL be
 // wiped out by any `pi` reinstall/upgrade — see --check and the daemon/
@@ -188,6 +212,134 @@ const PATCHES = [
         this.__pkKittyLines = lines.slice();
         this.__pkKittyIds = __pkNextIds;
         return ids;
+    }`,
+  },
+  {
+    name: "box-child-memo",
+    file: "components/box.js",
+    marker: "pi-king-tui-patch:boxmemo-v1",
+    // Whole render() body is the match target on purpose. Three separate
+    // sub-edits would be needed otherwise (fast path, matchCache branch,
+    // cache write) and each would match independently — so an upstream
+    // change to any ONE of them could leave a half-rewritten method that
+    // still "applied" cleanly. Matching the entire method means any upstream
+    // edit anywhere inside it drops the whole patch to `unknown` and asks a
+    // human, which is the only safe failure for a cache whose bug shape is
+    // "wrong text on screen".
+    original: `    render(width) {
+        if (this.children.length === 0) {
+            return [];
+        }
+        const contentWidth = Math.max(1, width - this.paddingX * 2);
+        const leftPad = " ".repeat(this.paddingX);
+        // Render all children
+        const childLines = [];
+        for (const child of this.children) {
+            const lines = child.render(contentWidth);
+            for (const line of lines) {
+                childLines.push(leftPad + line);
+            }
+        }
+        if (childLines.length === 0) {
+            return [];
+        }
+        // Check if bgFn output changed by sampling
+        const bgSample = this.bgFn ? this.bgFn("test") : undefined;
+        // Check cache validity
+        if (this.matchCache(width, childLines, bgSample)) {
+            return this.cache.lines;
+        }
+        // Apply background and padding
+        const result = [];
+        // Top padding
+        for (let i = 0; i < this.paddingY; i++) {
+            result.push(this.applyBg("", width));
+        }
+        // Content
+        for (const line of childLines) {
+            result.push(this.applyBg(line, width));
+        }
+        // Bottom padding
+        for (let i = 0; i < this.paddingY; i++) {
+            result.push(this.applyBg("", width));
+        }
+        // Update cache
+        this.cache = { childLines, width, bgSample, lines: result };
+        return result;
+    }`,
+    patched: `    render(width) { // pi-king-tui-patch:boxmemo-v1
+        if (this.children.length === 0) {
+            return [];
+        }
+        const contentWidth = Math.max(1, width - this.paddingX * 2);
+        // Collect each child's line ARRAY before doing any per-line work.
+        // Text/Markdown/Image all memoise internally and hand back the very
+        // same array object while their content and width are unchanged, so
+        // reference identity across every child is a sound proof that the
+        // flattened, left-padded document cannot have changed.
+        const __pkRefs = [];
+        for (const child of this.children) {
+            __pkRefs.push(child.render(contentWidth));
+        }
+        const bgSample = this.bgFn ? this.bgFn("test") : undefined;
+        const __pkCache = this.cache;
+        // hits < 60 forces a full content re-verify at least every 61st
+        // render. Reference identity is only a proof of "unchanged" while no
+        // component mutates its cached array IN PLACE; no shipped component
+        // does, but this file is re-applied blindly across pi upgrades, so a
+        // future one that did would otherwise pin stale text on screen
+        // forever instead of for at most 60 frames.
+        if (__pkCache !== undefined && __pkCache.refs !== undefined &&
+            __pkCache.width === width && __pkCache.bgSample === bgSample &&
+            __pkCache.paddingX === this.paddingX && __pkCache.hits < 60 &&
+            __pkCache.refs.length === __pkRefs.length) {
+            let __pkSame = true;
+            for (let i = 0; i < __pkRefs.length; i++) {
+                if (__pkRefs[i] !== __pkCache.refs[i]) {
+                    __pkSame = false;
+                    break;
+                }
+            }
+            if (__pkSame) {
+                __pkCache.hits++;
+                return __pkCache.lines;
+            }
+        }
+        const leftPad = " ".repeat(this.paddingX);
+        // Render all children
+        const childLines = [];
+        for (const lines of __pkRefs) {
+            for (const line of lines) {
+                childLines.push(leftPad + line);
+            }
+        }
+        if (childLines.length === 0) {
+            return [];
+        }
+        // Check cache validity
+        if (this.matchCache(width, childLines, bgSample)) {
+            this.cache.refs = __pkRefs;
+            this.cache.paddingX = this.paddingX;
+            this.cache.hits = 0;
+            return this.cache.lines;
+        }
+        // Apply background and padding
+        const result = [];
+        // Top padding
+        for (let i = 0; i < this.paddingY; i++) {
+            result.push(this.applyBg("", width));
+        }
+        // Content
+        for (const line of childLines) {
+            result.push(this.applyBg(line, width));
+        }
+        // Bottom padding
+        for (let i = 0; i < this.paddingY; i++) {
+            result.push(this.applyBg("", width));
+        }
+        // Update cache
+        this.cache = { childLines, width, bgSample, lines: result, refs: __pkRefs, paddingX: this.paddingX, hits: 0 };
+        return result;
     }`,
   },
 ];
