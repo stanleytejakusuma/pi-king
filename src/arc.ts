@@ -39,7 +39,7 @@
  * /resume. Losing the file never loses the relationship.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createTmuxSession, SESSION_STATUS_DIR, TMUX, type ClientSize } from "./fleet.ts";
@@ -98,7 +98,15 @@ function writeLineage(l: Lineage): void {
  * layout (observed: /Users/stanz/codebase/alexandria ->
  * --Users-stanz-codebase-alexandria--). */
 export function sessionDirFor(cwd: string): string {
-  return join(SESSIONS_ROOT, `--${cwd.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "")}--`);
+  // Resolve symlinks FIRST. pi derives this directory from its own resolved
+  // cwd, so on macOS "/tmp/x" becomes "/private/tmp/x" and seeding under
+  // "--tmp-x--" puts the file somewhere pi will never look: the session comes
+  // up with no seed, exits, and the tmux window vanishes seconds after we
+  // reported success. Falls back to the raw path when the dir doesn't exist
+  // yet, which is the only case realpathSync throws on.
+  let resolved = cwd;
+  try { resolved = realpathSync(cwd); } catch { /* not on disk yet: use as given */ }
+  return join(SESSIONS_ROOT, `--${resolved.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "")}--`);
 }
 
 /** UUIDv7-shaped id, matching the format pi generates (time-ordered prefix so

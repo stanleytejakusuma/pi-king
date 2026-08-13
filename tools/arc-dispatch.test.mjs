@@ -8,7 +8,7 @@
 // files so composer state can be driven call by call.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, existsSync, chmodSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, existsSync, chmodSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -82,7 +82,7 @@ process.env.HOME = HOME;
 process.env.PI_KING_TMUX = FAKE;
 process.env.PI_KING_STATUS_DIR = STATUS;
 process.env.PI_KING_POLL_SEC = "0";
-const { dispatchSession, slugForTask, spawnArc } = await import("../src/arc.ts");
+const { dispatchSession, sessionDirFor, slugForTask, spawnArc } = await import("../src/arc.ts");
 
 const READY = "escape interrupt";
 const TASK = "Fix the flaky retry test in the uploader";
@@ -240,4 +240,23 @@ test("a composer that never becomes ready leaves the session but sends nothing",
   assert.equal(r.ok, true, "the session was created and must not be orphaned silently");
   assert.match(r.message, /NOT sent/);
   assert.ok(!log().some((l) => l.includes("send-keys")), "no keys fired at a composer that is not up");
+});
+
+// --- sessionDirFor: symlink resolution -------------------------------------
+// pi derives its session directory from its OWN resolved cwd. On macOS /tmp is
+// a symlink to /private/tmp, so seeding under "--tmp-x--" writes where pi never
+// looks: the session comes up with no seed, exits, and the tmux window vanishes
+// a few seconds after we already reported success. Found by the native-dispatch
+// arc while testing in a scratch dir under /tmp; production arcs all use
+// ~/codebase paths, which is why it stayed hidden.
+test("sessionDirFor resolves symlinks so the seed lands where pi looks", () => {
+  const real = realpathSync("/tmp");
+  assert.notEqual(real, "/tmp", "precondition: /tmp must be a symlink for this test to mean anything");
+  assert.equal(sessionDirFor("/tmp"), sessionDirFor(real));
+  assert.match(sessionDirFor("/tmp"), /--private-tmp--$/);
+});
+
+test("sessionDirFor falls back to the literal path when the dir does not exist", () => {
+  const ghost = join(tmpdir(), "pi-king-absent-" + Date.now());
+  assert.match(sessionDirFor(ghost), /pi-king-absent-\d+--$/);
 });
