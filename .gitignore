@@ -2,3 +2,6 @@ node_modules/
 *.log
 .DS_Store
 docs/RESUME-PROMPT.md
+
+# arc worktrees live here while an arc is active; never track them
+.worktrees/

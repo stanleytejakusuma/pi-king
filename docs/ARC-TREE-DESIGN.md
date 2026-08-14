@@ -45,15 +45,31 @@ Fix: propagate the parent's flag instead of asserting it. One line.
 Escape hatch, already implemented, no new code: `/bg` inside an arc surfaces
 it — an explicit act of intent, which is exactly the test above.
 
-**This eliminates the orphan case.** Every visible arc now has a visible
-parent by construction, so the tree is always well-formed. An earlier design
-needed a dimmed non-selectable "ghost parent" row for arcs whose parent was
-off-dashboard; that is no longer necessary and should not be reintroduced.
+**This eliminates the orphan case for new spawns.** Every visible arc now
+has a visible parent by construction, so the tree is always well-formed. An
+earlier design needed a dimmed non-selectable "ghost parent" row for arcs
+whose parent was off-dashboard; that is no longer necessary and should not
+be reintroduced.
 
-Edge case: if a parent exits and its card is dismissed while its arcs are
-still live, the arcs keep the visibility they were stamped with and degrade
-to ordinary top-level rows in their cwd group. Nothing vanishes mid-flight,
-and no dynamic ancestor-walking is required.
+**Enforced twice, because the spawn-time gate alone is not enough.** Any
+session that was already running when the inheritance change shipped keeps
+its OLD in-memory extension code, which stamps `PI_DASHBOARD_SPAWNED=1`
+unconditionally — so pre-upgrade sessions keep producing visible arcs with
+invisible parents until they restart. Observed live with the Pi-King dev
+session (2026-08-14). Stanley's ruling: *"fix this so that Pi-King won't
+show an arc that doesn't have an active parent in pi-king."* The
+render-side gate is `pruneOrphanArcs()` (`src/fleet.ts`): a row survives
+only if its ancestry terminates in a session with no parent in the ledger;
+an arc whose parent chain never reaches a dashboard row is hidden entirely.
+Lineage cycles keep today's flat-render behaviour.
+
+Edge case, restated for the render-side gate: the gate looks at the rows
+actually present, not at provenance. An exited parent whose card is still on
+the dashboard keeps its arcs visible, nested under the exited row. Dismissing
+that parent's card (X) removes it from the rows, and its arcs vanish with it
+— the same reading as Stanley's ruling: a parent no longer in pi-king means
+its arcs should not be managed there either. To keep an arc after dismissing
+the parent, `/bg` inside the arc surfaces it as its own root row first.
 
 ### 3. Tree glyphs are drawn inside the name column
 
@@ -147,7 +163,8 @@ touches arc listing and adds window teardown. Merge that first.
 ## Out of scope
 
 - No new jump keybind (decision 1 removed the need).
-- No ghost parent rows (decision 2 removed the need).
+- No ghost parent rows (decision 2 removed the need); invisible parents hide
+  their arcs at render time too (pruneOrphanArcs).
 - No cross-machine or multi-parent lineage. One parent per arc.
 
 ## Visual decisions, made against screenshots

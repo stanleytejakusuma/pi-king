@@ -280,3 +280,36 @@ test("layout.collapsed survives a read/write round-trip and rejects junk", async
   writeFileSync(LAYOUT_FILE, JSON.stringify({ pinned: [], order: [], names: {} }));
   assert.deepEqual(readLayout().collapsed, [], "a layout written before this feature must not crash");
 });
+
+// ---- pruneOrphanArcs (docs/ARC-TREE-DESIGN.md decision 3, render-side gate) -
+const { pruneOrphanArcs } = await import("../src/fleet.ts");
+
+test("an arc whose parent is not on the dashboard is hidden", () => {
+  const rows = [mkRow("kid"), mkRow("other")];
+  const out = pruneOrphanArcs(rows, new Map([["kid", "ghost"]]));
+  assert.deepEqual(ids(out), ["other"]);
+});
+
+test("a grandchild of an absent parent is hidden too", () => {
+  const rows = [mkRow("g"), mkRow("k"), mkRow("other")];
+  const parentOf = new Map([["g", "k"], ["k", "ghost"]]);
+  assert.deepEqual(ids(pruneOrphanArcs(rows, parentOf)), ["other"]);
+});
+
+test("an arc whose parent IS on the dashboard survives", () => {
+  const rows = [mkRow("mum"), mkRow("kid")];
+  const out = pruneOrphanArcs(rows, new Map([["kid", "mum"]]));
+  assert.deepEqual(ids(out), ["mum", "kid"]);
+});
+
+test("a cycle of present rows stays visible, rendered flat", () => {
+  const rows = [mkRow("a"), mkRow("b")];
+  const out = pruneOrphanArcs(rows, new Map([["a", "b"], ["b", "a"]]));
+  assert.deepEqual(ids(out).sort(), ["a", "b"]);
+});
+
+test("sessions with no lineage entry are never pruned", () => {
+  const rows = [mkRow("plain"), mkRow("kid")];
+  const out = pruneOrphanArcs(rows, new Map([["kid", "ghost"]]));
+  assert.deepEqual(ids(out), ["plain"]);
+});

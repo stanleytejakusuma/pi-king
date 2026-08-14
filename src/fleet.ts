@@ -510,6 +510,40 @@ export function readParentMap(): Map<string, string> {
  * WITHIN a sibling group. This is deliberately a post-pass rather than a
  * comparator rewrite: the existing comparator is load-bearing and this only
  * needs to relocate descendants, not re-rank anything. */
+/** A row survives only if its ancestry terminates in a session that has no
+ * parent in the ledger -- a root. An arc whose parent is not on the dashboard
+ * (or whose grandparent is not, and so on) is hidden entirely: a tree branch
+ * floating with no trunk reads as a broken row, and the alternative, a ghost
+ * parent row, was explicitly rejected in the design. Cycles keep today's
+ * behaviour: present-but-cyclic rows render flat rather than vanishing. */
+export function pruneOrphanArcs(rows: SessionRow[], parentOf: Map<string, string>): SessionRow[] {
+  const byId = new Set(rows.map((r) => r.entry.sessionId));
+  const memo = new Map<string, boolean>();
+  const visible = (id: string, chain: Set<string>): boolean => {
+    const hit = memo.get(id);
+    if (hit !== undefined) return hit;
+    const p = parentOf.get(id);
+    if (!p) {
+      memo.set(id, true);
+      return true; // no parent: a root, always shown
+    }
+    if (!byId.has(p)) {
+      memo.set(id, false);
+      return false; // parent absent from the dashboard: hidden
+    }
+    if (chain.has(id)) {
+      memo.set(id, true);
+      return true; // cycle: render flat, as orderByLineage already does
+    }
+    chain.add(id);
+    const ok = visible(p, chain);
+    chain.delete(id);
+    memo.set(id, ok);
+    return ok;
+  };
+  return rows.filter((r) => visible(r.entry.sessionId, new Set()));
+}
+
 export function orderByLineage(
   rows: SessionRow[],
   parentOf: Map<string, string>,
@@ -648,7 +682,15 @@ export function buildRows(): Row[] {
     .map((t) => ({ kind: "orphan", tmux: t }));
   // Lineage is applied last, over the fully sorted list, so an arc keeps its
   // parent's company no matter which section that parent ended up in.
-  return [...orderByLineage(sessionRows, readParentMap(), new Set(readLayout().collapsed)), ...orphanRows];
+  // Pruning comes first: an arc is shown ONLY if its ancestry terminates in a
+  // session that is actually on the dashboard. Spawn-time visibility
+  // inheritance handles new spawns; this render-side gate handles everything
+  // else -- sessions spawned before that change existed (their in-memory
+  // extension code predates it) and any future writer that marks an arc
+  // visible without a visible parent.
+  const parentOf = readParentMap();
+  const shown = pruneOrphanArcs(sessionRows, parentOf);
+  return [...orderByLineage(shown, parentOf, new Set(readLayout().collapsed)), ...orphanRows];
 }
 
 export function tmuxError(result: ReturnType<typeof spawnSync>): string {
