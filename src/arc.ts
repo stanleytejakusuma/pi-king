@@ -42,7 +42,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createTmuxSession, SESSION_STATUS_DIR, TMUX, type ClientSize } from "./fleet.ts";
+import { createTmuxSession, LINEAGE_FILE, SESSION_STATUS_DIR, TMUX, type ClientSize } from "./fleet.ts";
 
 /** Poll interval for the composer-ready and delivery-verification loops.
  * Overridable only so tests need not sleep in real seconds; nothing in normal
@@ -53,7 +53,8 @@ function nap(): void {
 }
 
 const KING_DIR = join(homedir(), ".pi", "king");
-const LINEAGE_FILE = join(KING_DIR, "lineage.json");
+// LINEAGE_FILE now lives in fleet.ts, which needs it to build the tree and
+// must not import this module (arc -> fleet is the only safe direction).
 const SESSIONS_ROOT = join(homedir(), ".pi", "agent", "sessions");
 
 export type ArcRecord = {
@@ -344,7 +345,11 @@ function spawnSessionWithPrompt(opts: {
   // first, writes "--private-tmp-x--" (measured 2026-08-13; a seed in the
   // wrong directory is ignored and the id then exists twice on disk).
   const seed = opts.parent ? writeSeedSession(cwd, opts.parent.sessionFile) : undefined;
-  const created = createTmuxSession(safeName, cwd, seed?.id, opts.liveSize);
+  // An arc is only as managed as its parent. Dispatch (no parent) comes from
+  // the dashboard and is visible by definition; an arc inherits, so a
+  // session the user never backgrounded does not quietly populate the
+  // dashboard with children it never asked to manage.
+  const created = createTmuxSession(safeName, cwd, seed?.id, opts.liveSize, opts.parent ? parentIsVisible(opts.parent.id) : true);
   if (!created.ok) return { ok: false, message: created.message };
 
   // Record lineage BEFORE the prompt is sent: if delivery fails, the arc
@@ -494,6 +499,22 @@ export function spawnArc(opts: {
 }
 
 /** Arcs spawned by a given parent session id (open ones first, newest first). */
+/** Whether the spawning session is itself on the dashboard.
+ *
+ * Fails CLOSED to invisible when the parent has no card, because that is
+ * what an unmanaged parent looks like -- a bare `pi` in a terminal writes no
+ * card at all. Guessing visible instead would put a one-off's children in
+ * front of the user forever, which is the exact behaviour this replaces. */
+function parentIsVisible(parentId: string | undefined): boolean {
+  if (!parentId) return false;
+  try {
+    const raw = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${parentId}.json`), "utf8")) as { visible?: unknown };
+    return raw.visible === true;
+  } catch {
+    return false;
+  }
+}
+
 export function arcsOf(parentId: string): ArcRecord[] {
   return readLineage().arcs
     .filter((a) => a.parentId === parentId)

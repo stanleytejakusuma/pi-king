@@ -65,13 +65,21 @@ import { homedir } from "node:os";
 // \u{...} with braces: a bare \u takes exactly four hex digits, so \u1f514
 // silently parsed as U+1F51 followed by a literal "4" and the attention icon
 // rendered as a Greek vowel with a digit stuck to it. Shipped that way.
+// One geometric family, all U+25xx, all text presentation and single width.
+// The old set mixed \u23f3 and \u{1f514} -- both emoji-presentation, so Ghostty painted
+// them in colour at double width beside crisp single-width marks, and the two
+// loudest glyphs in the column were decided by which codepoints happened to
+// have emoji fonts rather than by which states matter. Hue already encodes
+// urgency and the state word is printed alongside, so shape only has to be
+// distinguishable, not descriptive. Angular = wants a human (attention,
+// error); round = running itself.
 export const stateIcon: Record<TitleState, string> = {
   // background: the main agent has settled but subagents are still running —
   // the session is neither working (nothing to wait on at the prompt) nor idle
   // (work is genuinely still happening on its behalf). pi-alerts has drawn
   // this distinction in its own state model since before this file existed;
   // the dashboard calling the same moment "idle" was simply less true.
-  working: "\u23f3", idle: "\u2713", background: "\u25d0", attention: "\u{1f514}", error: "\u26a0", exited: "\u25cb",
+  working: "\u25d0", idle: "\u25cf", background: "\u25d2", attention: "\u25c6", error: "\u25b2", exited: "\u25cb",
 };
 
 /** FORMAT.md promises readers tolerate unknown status strings, because the
@@ -1362,6 +1370,26 @@ class DashboardView implements Component {
       return;
     }
     const row = this.rows[this.selected];
+    // Collapse the selected row's arcs. Persisted rather than held in memory
+    // because bin/pi-king re-runs this extension after every detach -- an
+    // in-memory toggle would forget itself several times an hour. `right` is
+    // not available for this (already bound to attach), and space is the key
+    // people press to scroll.
+    if (data === "a" || data === "A") {
+      if (!row || row.kind !== "session") return;
+      if (!row.tree?.arcCount) {
+        this.showMessage("That session has no arcs.");
+        this.tui.requestRender();
+        return;
+      }
+      const id = row.entry.sessionId;
+      const l = readLayout();
+      const now = l.collapsed.includes(id) ? l.collapsed.filter((x) => x !== id) : [...l.collapsed, id];
+      writeLayout({ ...l, collapsed: now });
+      this.refresh();
+      this.tui.requestRender();
+      return;
+    }
     if (data === "e" || data === "E") {
       if (!row) return;
       const tmuxName = this.rowTmuxName(row);
@@ -1811,14 +1839,24 @@ class DashboardView implements Component {
     } else {
       // Column geometry: name and status columns are fixed so activity text
       // lines up down the page instead of ragging against variable-width names.
-      const nameW = Math.min(34, Math.max(18, Math.floor(MEASURE * 0.22)));
-      const statusW = 22;
+      // Two cells wider than it was historically: the session glyph that used
+      // to sit outside it is gone, and the lineage rail now lives inside it,
+      // so nested names need the room the glyph used to take.
+      const nameW = Math.min(36, Math.max(20, Math.floor(MEASURE * 0.22) + 2));
+      const statusW = 13;  // "● background" is the longest state at 12 cells; 22 wasted 10 columns on every row
       let lastGroup: string | undefined;
       const pinnedIds = readLayout().pinned;
       this.rows.forEach((r, i) => {
-        const group = r.kind === "orphan" ? "tmux (no Pi session)"
+        // A nested arc never opens a section of its own: it belongs to
+        // whatever section its parent landed in, even when it was spawned in
+        // a different directory. Emitting a header for it would split the
+        // tree in half and claim the child lives somewhere its parent does
+        // not -- the row itself carries the project instead (below).
+        const nested = r.kind === "session" && (r.tree?.depth ?? 0) > 0;
+        const ownGroup = r.kind === "orphan" ? "tmux (no Pi session)"
           : pinnedIds.includes(r.entry.sessionId) ? "pinned"
           : r.entry.cwd.replace(process.env.HOME ?? "~", "~");
+        const group = nested && lastGroup !== undefined ? lastGroup : ownGroup;
         if (group !== lastGroup) {
           if (lastGroup !== undefined) body.push("");
           // A pinned row keeps its own project visible on the row itself,
@@ -1853,10 +1891,57 @@ class DashboardView implements Component {
         // just what the session happened to be created as, and only the
         // dashboard's own rename keeps the two in step. Preferring tmux meant a
         // rename typed inside a session never appeared here at all.
-        const label = (isPinned ? "\u2691 " : "") +
-          (e.name ?? e.tmuxName ?? e.project) +
-          (isPinned ? ` \u00b7 ${e.project}` : "");
-        const nm = pad(truncateToWidth(label, nameW, "\u2026", true), nameW);
+        // The whole left column is assembled here, glyph included, so the
+        // lineage rail is the FIRST thing on the row. It used to sit to the
+        // right of the session glyph, which made the tree look like
+        // decoration floating inside a column instead of the thing giving the
+        // rows their shape. truncateToWidth is ANSI-aware, so the pieces can
+        // carry their own colour and the column still lands on nameW.
+        const tree = r.tree;
+        const rail = tree?.prefix ? th.fg("dim", tree.prefix) : "";
+        // The twisty OCCUPIES the session-glyph slot rather than sitting
+        // beside it. Carrying both produced three glyphs ahead of a parent's
+        // name ("\u25be \u233f \u2691 Alexandria") and the eye had to sort out which one
+        // meant what. A row that owns arcs is by definition a live session,
+        // so the glyph it gives up was the predictable one. Muted, not
+        // accent: the row's one accent already belongs to its state.
+        // SIGNAL BY EXCEPTION, AT ZERO COST. \u26fa has emoji presentation, so
+        // Ghostty drew a full-colour glyph on every row -- and since nearly
+        // every session is tmux-hosted it was identical everywhere, making
+        // the loudest thing on the row the one carrying no information.
+        // Reserving two blank cells for it instead just moved the waste, so
+        // the state it encoded now rides on the name: a session with no tmux
+        // pane -- one `enter` cannot attach to -- is dimmed. Orphan rows keep
+        // the tent, which is how it comes to mean something.
+        // A collapsed parent states what is hidden rather than that something
+        // is: \u25b8 says "there is more", "(2)" says how much more. An expanded
+        // parent needs no marker at all -- its children are directly below it.
+        const badge = tree && tree.collapsed && tree.arcCount > 0
+          ? th.fg("muted", ` (${tree.arcCount})`) : "";
+        // Same reasoning as a pinned row keeping its project: once the section
+        // header no longer describes where this row lives, the row says so
+        // itself. tree.showProject compares against the actual PARENT, so an
+        // arc sitting in its parent's own directory stays unlabelled.
+        const bareName = e.name ?? e.tmuxName ?? e.project;
+        const nameStyled = e.tmuxName ? bareName : th.fg("dim", bareName);
+        // A project suffix that merely restates the name ("Alexandria \u00b7
+        // alexandria") is pure noise AND it steals width from the name, which
+        // then truncates. Only append when it actually carries information.
+        const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+        const wantProject = (isPinned || tree?.showProject) && norm(e.project) !== norm(bareName);
+        // Glyph precedes the rail because it is per-row metadata, not tree
+        // structure; keeping it out of the rail lets the lineage lines form
+        // one unbroken vertical run down the column. The pinned flag is gone:
+        // every row under the "pinned" header is pinned, so it restated its
+        // own section header once per row.
+        const base = rail + (sel ? th.bold(nameStyled) : nameStyled) + badge;
+        const suffix = th.fg("dim", ` \u00b7 ${e.project}`);
+        // All or nothing. A narrow terminal used to truncate the suffix into a
+        // dangling "\u00b7\u2026", which costs two cells of the name to say nothing at
+        // all; dropping it lets the name itself use the space instead.
+        const label = wantProject && visibleWidth(base) + visibleWidth(suffix) <= nameW
+          ? base + suffix : base;
+        const nm = truncateToWidth(label, nameW, "\u2026", true);
         const status = pad(`${iconFor(e.state)} ${th.fg(hue, e.state)}`, statusW);
         const sub = subagentSummary(e.subagents);
         // Context climbs toward compaction, and compaction discards memory the
@@ -1883,8 +1968,7 @@ class DashboardView implements Component {
         const forkBadge = e.isFork ? th.fg("accent", "fork") : "";
         const right = [sub ? th.fg("dim", sub) : "", forkBadge, ctxBadge, restartBadge, th.fg("dim", elapsed(e.updatedAt))]
           .filter(Boolean).join(th.fg("dim", " \u00b7 ")) + "  ";
-        const left = `  ${marker} ${e.tmuxName ? th.fg("accent", "\u26fa") : th.fg("dim", "\u233f")} ` +
-          (sel ? th.bold(nm) : nm) + " " + status +
+        const left = `  ${marker} ` + nm + " " + status +
           th.fg("muted", truncateToWidth(e.lastActivity, Math.max(10, MEASURE - nameW - statusW - visibleWidth(right) - 12), "\u2026", true));
         body.push(split(left, right));
       });
@@ -1955,8 +2039,12 @@ class DashboardView implements Component {
       // directly under the last session. Without this the key map moves up
       // and down the screen as sessions come and go, which is the opposite of
       // pinned: the whole point is that the keys are always in the same place.
-      const pad = Math.max(0, H - head.length - body.length - inv.length - foot.length);
-      return [...head, ...body, ...Array<string>(pad).fill(""), ...inv, ...foot];
+      const room = Math.max(0, H - head.length - body.length - inv.length - foot.length);
+      // Detail sits directly under the list it describes, and only claims
+      // room the pad would have left blank anyway.
+      const detail = this.renderSelectedDetail(MEASURE, Math.min(room, 5));
+      const pad = Math.max(0, room - detail.length);
+      return [...head, ...body, ...detail, ...Array<string>(pad).fill(""), ...inv, ...foot];
     }
 
     // Two rows of the budget go to the more-above/more-below markers, so the
@@ -1978,8 +2066,50 @@ class DashboardView implements Component {
     ];
   }
 
+  /** The one thing the row had to cut: the selected session's activity, in
+   * full. Built ONLY from space the layout was already going to waste as
+   * padding, so it cannot push the footer off and costs nothing whenever the
+   * list is long enough to fill the screen -- the case where render cost
+   * would actually matter. No new I/O: every field is already in memory. */
+  private renderSelectedDetail(width: number, maxLines: number): string[] {
+    const row = this.rows[this.selected];
+    if (!row || row.kind !== "session" || maxLines < 3) return [];
+    const th = this.theme;
+    const e = row.entry;
+    const arcs = row.tree?.arcCount ?? 0;
+    const facts = [
+      e.cwd.replace(process.env.HOME ?? "~", "~"),
+      `#${e.shortId}`,
+      e.pid ? `pid ${e.pid}` : "",
+      arcs > 0 ? `${arcs} arc${arcs > 1 ? "s" : ""}` : "",
+    ].filter(Boolean).join(" \u00b7 ");
+    const out = ["", "  " + th.fg("accent", e.name ?? e.project) + "  " + th.fg("dim", facts)];
+    const text = (e.lastActivity ?? "").trim();
+    if (!text) return out;
+    // Greedy wrap. The row truncates this to a single line, which for a real
+    // activity string is exactly where the useful half begins. Every line is
+    // pushed through truncateToWidth as a guarantee rather than trusting the
+    // arithmetic: guessing two cells too wide does not wrap, it gets
+    // hard-clipped by the renderer, and a clip mid-word looks like corrupt
+    // text rather than like an ellipsis.
+    const w = Math.max(20, width - 10);
+    const put = (s: string, more: boolean) =>
+      out.push("  " + th.fg("muted", truncateToWidth(more ? `${s} \u2026` : s, w, "\u2026", false)));
+    let line = "";
+    let clipped = false;
+    for (const word of text.split(/\s+/)) {
+      if (line && visibleWidth(line) + visibleWidth(word) + 1 > w) {
+        if (out.length >= maxLines - 1) { clipped = true; break; }
+        put(line, false);
+        line = word;
+      } else line = line ? `${line} ${word}` : word;
+    }
+    if (line) put(line, clipped);
+    return out;
+  }
+
   /** Lays inventory categories out as bordered, content-sized cards.
-   * Category title is embedded in the top border (â•­â”€ skills â”€â”€â•®) so it costs
+   * Category title is embedded in the top border (╭─ skills ──╮) so it costs
    * no interior line, and each category keeps its own hue for fast scanning. */
   private renderInventoryCards(innerW: number): string[] {
     const th = this.theme;
