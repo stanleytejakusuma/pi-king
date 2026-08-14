@@ -149,3 +149,46 @@ touches arc listing and adds window teardown. Merge that first.
 - No new jump keybind (decision 1 removed the need).
 - No ghost parent rows (decision 2 removed the need).
 - No cross-machine or multi-parent lineage. One parent per arc.
+
+## Visual decisions, made against screenshots
+
+Reviewed in a sandboxed dashboard (`/tmp/arcui/harness.sh`: private tmux
+socket, throwaway `HOME`, fixture cards) rather than by reading code. Four
+things were only visible once rendered:
+
+1. **The rail leads the row.** It first sat to the right of the session glyph
+   (`⌿ ├─ name`), which made the tree read as decoration floating inside a
+   column instead of the thing giving the rows their shape. The whole left
+   column is now assembled as one string — rail, glyph, flag, name, suffix —
+   and passed to `truncateToWidth`, which is ANSI-aware, so each piece carries
+   its own colour and the column still lands exactly on `nameW`.
+
+2. **The twisty occupies the glyph slot** rather than sitting beside it.
+   Carrying both produced three glyphs ahead of a parent's name
+   (`▾ ⌿ ⚑ Alexandria`) and the eye had to sort out which meant what. A row
+   that owns arcs is by definition a live session, so the glyph it gives up
+   was the predictable one.
+
+3. **`statusW` 22 → 13.** The longest state is `● background` at 12 cells, so
+   every row padded ten dead columns before its activity text. This was not
+   part of the feature; it was just visible once the rows were dense enough to
+   look at.
+
+4. **The project suffix is all-or-nothing.** Truncated, it degrades to a
+   dangling `·…` that spends two cells of the name column saying nothing. It
+   now appears only if it fits whole.
+
+Fixture rows must be backed by real processes whose command is exactly `pi`
+(`process.title` rewriting, as pi itself does) **and** whose start time is
+within 60s of the card's `startedAt` — `src/fleet.ts` treats a mismatch as a
+recycled pid and marks the card exited, so every row renders grey and the
+state colours never appear.
+
+### Found while reviewing, unrelated to arcs
+
+`src/index.ts` had been read as latin-1 and re-encoded, so every literal
+non-ASCII character in it was double-encoded — the restart indicator and the
+separators in each row's right-hand meta are literals, so the dashboard was
+drawing `ctx 35% Â· â» restart` on every row. Escaped characters were fine,
+which is exactly why it went unnoticed: the file's own `\uXXXX` convention hid
+it. Repaired in 9a187cb.
