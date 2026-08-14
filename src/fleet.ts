@@ -233,6 +233,12 @@ export type TreeInfo = {
   hasArcs: boolean;
   /** Children exist but are hidden by the user. */
   collapsed: boolean;
+  /** This arc lives somewhere other than its PARENT, so the row has to name
+   * its own project. Compared against the parent rather than the section
+   * header: a pinned parent's header reads "pinned", which matches no cwd,
+   * so heading-based comparison tagged every nested row and truncated its
+   * name to make room for a suffix that said nothing. */
+  showProject: boolean;
 };
 export type SessionRow = { kind: "session"; entry: DashboardEntry; tree?: TreeInfo };
 export type Row = SessionRow | OrphanRow;
@@ -531,7 +537,7 @@ export function orderByLineage(
   // would then "rescue" them straight back to top level -- a collapse that
   // relocates its own children rather than hiding them. Found by test, not
   // by reading.
-  const emit = (r: SessionRow, depth: number, base: string, isLast: boolean, hidden: boolean): void => {
+  const emit = (r: SessionRow, depth: number, base: string, isLast: boolean, hidden: boolean, parentCwd?: string): void => {
     const id = r.entry.sessionId;
     if (seen.has(id)) return;
     seen.add(id);
@@ -545,6 +551,7 @@ export function orderByLineage(
           prefix: depth === 0 ? "" : base + (isLast ? "\u2514\u2500 " : "\u251c\u2500 "),
           hasArcs: children.length > 0,
           collapsed: isCollapsed,
+          showProject: parentCwd !== undefined && parentCwd !== r.entry.cwd,
         },
       });
     }
@@ -553,7 +560,7 @@ export function orderByLineage(
     // that was never rendered.
     const childBase = depth === 0 ? "" : base + (isLast ? "   " : "\u2502  ");
     const childHidden = hidden || isCollapsed;
-    children.forEach((c, i) => emit(c, depth + 1, childBase, i === children.length - 1, childHidden));
+    children.forEach((c, i) => emit(c, depth + 1, childBase, i === children.length - 1, childHidden, r.entry.cwd));
   };
   roots.forEach((r) => emit(r, 0, "", true, false));
   // A cycle in the ledger (a -> b -> a) leaves both nodes parented and
@@ -561,7 +568,7 @@ export function orderByLineage(
   // from the dashboard. Losing sight of a running session is far worse than
   // rendering it flat, so anything the walk missed is appended.
   for (const r of rows) {
-    if (!seen.has(r.entry.sessionId)) out.push({ ...r, tree: { depth: 0, prefix: "", hasArcs: false, collapsed: false } });
+    if (!seen.has(r.entry.sessionId)) out.push({ ...r, tree: { depth: 0, prefix: "", hasArcs: false, collapsed: false, showProject: false } });
   }
   return out;
 }
