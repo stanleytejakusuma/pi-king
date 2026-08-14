@@ -53,7 +53,7 @@ So: spawn + liveness patches in `src/fleet.ts` (~2 call sites), port pi-alerts, 
 - **`/bg`**: pi-king's extension backgrounds a session into tmux. The daemon IS the backgrounder — residents keep running, clients attach/detach over the socket. `/bg` is redundant under prime-agent; delete or no-op it.
 - **Arcs**: pi-king spawns a fresh empty pi session with `--session <id>` + lineage in `~/.pi/king/lineage.json`. Breaks at spawn (no `--session` flag). And prime-agent has a *native* equivalent — `rlm(...)` subagents and `agent_message` IPC with parent/child topology — so reimplementing pi-king arcs on prime-agent means writing a foreign object model over a capability the fork already has. Skip.
 
-**Verdict: supervise = cheap patch; integrate = wrong move.** The features pi-king integrates *on top of* pi are the features prime-agent's daemon *absorbs into the core*. Integrating them twice is exactly the kind of customization spiral he's been trying to escape.
+**Verdict: supervise = cheap patch; integrate = wrong move — with one new caveat.** The daemon *absorbs* pi-king's job (persistence, detach/reattach) but currently does it **worse than tmux**: see the GitHub scan below (#1148 3-day supervisor death, #1072 stuck sessions, #1291 session-tree loss on update restart). tmux is bulletproof; the daemon is v0.7. pi-king's persistence layer is not yet redundant.
 
 ## 3. What role could prime-agent play here?
 
@@ -65,6 +65,34 @@ Constraints: pi-only fleet, tmux-hosted, local, no remote.
 - **Fork-line risk — now measured.** GitHub check 2026-08-14 (VERIFIED via `gh api`): 15,505 stars, 1,655 forks, 593 open issues; repo pushed hours before this check. Releases: v0.7.0 (2026-08-05), v0.7.1 (08-07), v0.7.2 (08-11); an older beta tag is named `v0.7.2-beta.492...` — a ~492-commit divergence counter (INFERRED from tag name). Sync model is **track-and-cherry-pick, not wholesale merge**: issue #1182 "Prime Agent v0.8: five-stack integration tracker" gates their v0.8 on upstream prerequisites #838/#850/#851/#852 being "merged and verified"; upstream fixes get ported selectively (#678: vendored `packages/ai` predates upstream's xAI OAuth; #1280: "Bring back bare --resume"). Their v0.8 Core/MCP/Release/Prompts/ACP stacks were merging on the day of this check. So: active, viral, but a diverged line that samples upstream rather than tracking it.
 
 **Net: not a landing spot; a supervised experiment at most, and even that is only worth it if the RLM/kernel direction is something he'd actually use.**
+
+---
+
+## Known issues at install time (GitHub scan, 2026-08-14)
+
+Scan by a background agent; ~24 issue bodies read. VERIFIED = issue body read; TITLE-ONLY = title only.
+
+**Stability (most relevant to long-horizon use):**
+- **#1148** (VERIFIED): macOS — after ~3 days uptime, `os.tmpdir()` pruning kills the supervisor registry → every command fails `supervisor_generation_stale`; only fix is daemon restart, **dropping all resident sessions**. Directly contradicts long-horizon expectations on Stanley's platform.
+- **#1072** (VERIFIED, v0.7.1): hourly stuck sessions (idle-eviction sweep failures) + orphaned worker/ipykernel pairs.
+- **#1054** (TITLE-ONLY, v0.7.1): RLM subagents flood the worker with usage-attribution entries → session freeze. Directly relevant to multi-hypothesis fan-out plans.
+- **#900** (VERIFIED): compaction can self-amplify into a permanently unresponsive session (46.7 MB retry-debris journal).
+- **#983** (VERIFIED): `settings.json`/`auth.json` written non-atomically; auth migration deletes old credentials *before* writing new — a crash can silently lose all provider creds. Fix tracked in #1380 (open).
+- #1291 (closed): an update restart once silently discarded the whole session tree.
+
+**Security:**
+- **#915** (open, VERIFIED): third-party audit — `clipboard.ts` used `execSync` (shell-injection surface), weak kernel teardown/cancellation. Fixes unmerged as of the scan.
+- **#1120** (VERIFIED): command execution is **not sandboxed**; execution model undocumented.
+- **#768** (VERIFIED): daemon socket identity ignores `PRIME_AGENT_CODING_AGENT_DIR` — sessions can silently run under a *different* install's daemon.
+- #521 (closed, VERIFIED): telemetry on by default but pseudonymized (UUID, mode 0600, no commands/paths).
+- Supply-chain posture is good: 7-day min-release-age for deps (#126 closed; #918 enforces npm ≥11.10).
+
+**Churn:**
+- **#1182** (VERIFIED): the v0.8 tracker's common Core ref is **blocked on 11 monitor failures**; no human-ready v0.8 PRs. v0.8 not imminent.
+- #741/#1272 (VERIFIED): install + self-update broken on npm 12 (`EALLOWREMOTE`); #738: `/update --extensions` always fails on npm ≥11.
+- **#639** (VERIFIED): RLM sends prime-agent's version as Codex `client_version` → **OpenAI Codex models are excluded from RLM subagents**. Fork divergence already breaks provider integration.
+
+**First-run guidance derived from the scan:** keep sessions short (<days), back up `~/.prime/agent` state, start RLM fan-out small (1–2 subagents, non-Codex models), and treat the daemon's persistence as best-effort — tmux/pi-king remains the reliable layer.
 
 ---
 
