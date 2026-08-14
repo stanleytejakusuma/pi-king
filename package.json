@@ -1,7 +1,7 @@
 {
   "name": "pi-king",
-  "version": "0.2.0",
-  "description": "tmux-backed session manager and supervisor for the Pi coding agent \u2014 background a session and come back to it later",
+  "version": "0.3.0",
+  "description": "tmux-backed session manager and supervisor for the Pi coding agent — background a session and come back to it later",
   "keywords": [
     "pi",
     "pi-coding-agent",
