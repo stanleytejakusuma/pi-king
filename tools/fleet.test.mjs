@@ -179,7 +179,7 @@ test("no lineage: order and rows are untouched, every row depth 0", () => {
   assert.deepEqual(ids(out), ["a", "b", "c"]);
   assert.deepEqual(out.map((r) => r.tree.depth), [0, 0, 0]);
   assert.deepEqual(out.map((r) => r.tree.prefix), ["", "", ""]);
-  assert.deepEqual(out.map((r) => r.tree.hasArcs), [false, false, false]);
+  assert.deepEqual(out.map((r) => r.tree.arcCount), [0, 0, 0]);
 });
 
 test("a child is hoisted to sit directly under its parent", () => {
@@ -187,9 +187,9 @@ test("a child is hoisted to sit directly under its parent", () => {
   const rows = [mkRow("mum"), mkRow("other"), mkRow("kid")];
   const out = orderByLineage(rows, new Map([["kid", "mum"]]), new Set());
   assert.deepEqual(ids(out), ["mum", "kid", "other"]);
-  assert.equal(out[0].tree.hasArcs, true);
+  assert.equal(out[0].tree.arcCount, 1);
   assert.equal(out[1].tree.depth, 1);
-  assert.equal(out[2].tree.hasArcs, false);
+  assert.equal(out[2].tree.arcCount, 0);
 });
 
 test("arcs nest recursively, and glyphs continue the parent's rail", () => {
@@ -207,7 +207,7 @@ test("collapsing a parent hides descendants but keeps the parent", () => {
   const out = orderByLineage(rows, parents, new Set(["root"]));
   assert.deepEqual(ids(out), ["root"]);
   assert.equal(out[0].tree.collapsed, true);
-  assert.equal(out[0].tree.hasArcs, true);
+  assert.equal(out[0].tree.arcCount, 1);
 });
 
 test("collapsing an intermediate arc hides only its own subtree", () => {

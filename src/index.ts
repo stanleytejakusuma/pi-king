@@ -1369,7 +1369,7 @@ class DashboardView implements Component {
     // people press to scroll.
     if (data === "a" || data === "A") {
       if (!row || row.kind !== "session") return;
-      if (!row.tree?.hasArcs) {
+      if (!row.tree?.arcCount) {
         this.showMessage("That session has no arcs.");
         this.tui.requestRender();
         return;
@@ -1831,9 +1831,9 @@ class DashboardView implements Component {
     } else {
       // Column geometry: name and status columns are fixed so activity text
       // lines up down the page instead of ragging against variable-width names.
-      // +2 over the historical width because the session glyph moved INSIDE
-      // this column (see the label build below), so the space available to
-      // the name itself is unchanged.
+      // Two cells wider than it was historically: the session glyph that used
+      // to sit outside it is gone, and the lineage rail now lives inside it,
+      // so nested names need the room the glyph used to take.
       const nameW = Math.min(36, Math.max(20, Math.floor(MEASURE * 0.22) + 2));
       const statusW = 13;  // "● background" is the longest state at 12 cells; 22 wasted 10 columns on every row
       let lastGroup: string | undefined;
@@ -1897,20 +1897,36 @@ class DashboardView implements Component {
         // meant what. A row that owns arcs is by definition a live session,
         // so the glyph it gives up was the predictable one. Muted, not
         // accent: the row's one accent already belongs to its state.
-        const glyph = tree?.hasArcs
-          ? th.fg("muted", tree.collapsed ? "\u25b8" : "\u25be")
-          : e.tmuxName ? th.fg("accent", "\u26fa") : th.fg("dim", "\u233f");
+        // SIGNAL BY EXCEPTION, AT ZERO COST. \u26fa has emoji presentation, so
+        // Ghostty drew a full-colour glyph on every row -- and since nearly
+        // every session is tmux-hosted it was identical everywhere, making
+        // the loudest thing on the row the one carrying no information.
+        // Reserving two blank cells for it instead just moved the waste, so
+        // the state it encoded now rides on the name: a session with no tmux
+        // pane -- one `enter` cannot attach to -- is dimmed. Orphan rows keep
+        // the tent, which is how it comes to mean something.
+        // A collapsed parent states what is hidden rather than that something
+        // is: \u25b8 says "there is more", "(2)" says how much more. An expanded
+        // parent needs no marker at all -- its children are directly below it.
+        const badge = tree && tree.collapsed && tree.arcCount > 0
+          ? th.fg("muted", ` (${tree.arcCount})`) : "";
         // Same reasoning as a pinned row keeping its project: once the section
         // header no longer describes where this row lives, the row says so
         // itself. tree.showProject compares against the actual PARENT, so an
         // arc sitting in its parent's own directory stays unlabelled.
         const bareName = e.name ?? e.tmuxName ?? e.project;
+        const nameStyled = e.tmuxName ? bareName : th.fg("dim", bareName);
         // A project suffix that merely restates the name ("Alexandria \u00b7
         // alexandria") is pure noise AND it steals width from the name, which
         // then truncates. Only append when it actually carries information.
         const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
         const wantProject = (isPinned || tree?.showProject) && norm(e.project) !== norm(bareName);
-        const base = rail + glyph + " " + (isPinned ? "\u2691 " : "") + (sel ? th.bold(bareName) : bareName);
+        // Glyph precedes the rail because it is per-row metadata, not tree
+        // structure; keeping it out of the rail lets the lineage lines form
+        // one unbroken vertical run down the column. The pinned flag is gone:
+        // every row under the "pinned" header is pinned, so it restated its
+        // own section header once per row.
+        const base = rail + (sel ? th.bold(nameStyled) : nameStyled) + badge;
         const suffix = th.fg("dim", ` \u00b7 ${e.project}`);
         // All or nothing. A narrow terminal used to truncate the suffix into a
         // dangling "\u00b7\u2026", which costs two cells of the name to say nothing at

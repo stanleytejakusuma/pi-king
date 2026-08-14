@@ -228,9 +228,11 @@ export type TreeInfo = {
    * name column width precisely so activity text lines up down the page,
    * and indenting the whole row would rag every column to its right. */
   prefix: string;
-  /** Has at least one child ON THE DASHBOARD. Gates the collapse affordance
-   * so ordinary rows are completely unchanged by this feature. */
-  hasArcs: boolean;
+  /** How many children this row has ON THE DASHBOARD. Zero for an ordinary
+   * row, which is what keeps this feature invisible to sessions that never
+   * spawned an arc. A collapsed row renders the count, so the number is the
+   * affordance rather than a separate glyph. */
+  arcCount: number;
   /** Children exist but are hidden by the user. */
   collapsed: boolean;
   /** This arc lives somewhere other than its PARENT, so the row has to name
@@ -549,7 +551,7 @@ export function orderByLineage(
         tree: {
           depth,
           prefix: depth === 0 ? "" : base + (isLast ? "\u2514\u2500 " : "\u251c\u2500 "),
-          hasArcs: children.length > 0,
+          arcCount: children.length,
           collapsed: isCollapsed,
           showProject: parentCwd !== undefined && parentCwd !== r.entry.cwd,
         },
@@ -568,7 +570,7 @@ export function orderByLineage(
   // from the dashboard. Losing sight of a running session is far worse than
   // rendering it flat, so anything the walk missed is appended.
   for (const r of rows) {
-    if (!seen.has(r.entry.sessionId)) out.push({ ...r, tree: { depth: 0, prefix: "", hasArcs: false, collapsed: false, showProject: false } });
+    if (!seen.has(r.entry.sessionId)) out.push({ ...r, tree: { depth: 0, prefix: "", arcCount: 0, collapsed: false, showProject: false } });
   }
   return out;
 }
