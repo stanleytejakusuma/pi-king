@@ -1,5 +1,5 @@
 /**
- * pi-dashboard.ts â cross-project live supervisor for every active Pi session,
+ * pi-dashboard.ts — cross-project live supervisor for every active Pi session,
  * with tmux-backed background/attach/create/rename/delete session management.
  *
  * Two entry points:
@@ -13,7 +13,7 @@
  * error/trust) and persists a small JSON snapshot per session to
  * `~/.pi/agent/session-status/<sessionId>.json` on every state transition; this
  * extension only ever *reads* that directory, and prunes entries whose writer
- * PID is gone (honest degradation â a crashed session simply disappears).
+ * PID is gone (honest degradation — a crashed session simply disappears).
  *
  * Session management layer (new): real background/attach is implemented on top
  * of tmux, not reinvented inside Pi's extension API. Checked before building on
@@ -31,13 +31,13 @@
  * attach-capable. Ad-hoc sessions started by typing `pi` directly into a plain
  * terminal (not created through the dashboard) have no tmux session to
  * correlate with, so they fall back to the original Ghostty-tab-jump mechanism
- * â a known, accepted tradeoff, not a bug.
+ * — a known, accepted tradeoff, not a bug.
  *
  * Navigation fallback (unchanged): Ghostty renders its own tab bar (confirmed
- * empirically â the accessibility tree exposes zero tab UI elements), so
+ * empirically — the accessibility tree exposes zero tab UI elements), so
  * System Events / AXRaise tab-matching is impossible. Ghostty's own AppleScript
  * dictionary (`Ghostty.sdef`) is used instead: `tab.title` is broken in Ghostty
- * 1.3.1 (confirmed empirically â raises `-1700` on every read) but
+ * 1.3.1 (confirmed empirically — raises `-1700` on every read) but
  * `terminal.name` (the same title text) and `terminal.workingDirectory` both
  * work, and `select tab` / `activate window` both work. Matched by the stable
  * `#<shortId>` suffix pi-alerts.ts embeds in every title.
@@ -66,7 +66,7 @@ import { homedir } from "node:os";
 // silently parsed as U+1F51 followed by a literal "4" and the attention icon
 // rendered as a Greek vowel with a digit stuck to it. Shipped that way.
 export const stateIcon: Record<TitleState, string> = {
-  // background: the main agent has settled but subagents are still running â
+  // background: the main agent has settled but subagents are still running —
   // the session is neither working (nothing to wait on at the prompt) nor idle
   // (work is genuinely still happening on its behalf). pi-alerts has drawn
   // this distinction in its own state model since before this file existed;
@@ -81,7 +81,7 @@ export const stateIcon: Record<TitleState, string> = {
  * missing sort priority made the comparator return NaN, quietly scrambling
  * row order. Every lookup keyed by a status now goes through here. */
 /** Icon for any status, known or not. An unknown state keeps its own name on
- * screen â inventing a familiar one would be a worse lie than admitting the
+ * screen — inventing a familiar one would be a worse lie than admitting the
  * dashboard does not recognise it. */
 export function iconFor(s: string): string {
   return isKnownState(s) ? stateIcon[s] : "\u25cc";
@@ -141,15 +141,15 @@ import {
 const REFRESH_MS = 1000;
 /** Ticks of REFRESH_MS between a full data refresh (ps, tmux list-sessions,
  * any git-status cache misses) while nothing on the fleet is actively
- * changing. The render tick itself stays at REFRESH_MS regardless â elapsed-
+ * changing. The render tick itself stays at REFRESH_MS regardless — elapsed-
  * time labels ('3m ago') are computed at render time from stored timestamps,
- * so they keep advancing smoothly even on a tick that skips the data pull â
+ * so they keep advancing smoothly even on a tick that skips the data pull —
  * only the underlying ps/tmux/git work slows down. Worth doing even after
  * targeting ps -p at just the tracked pids (see livePiPids): most of a long
  * session's wall-clock time, with 13+ concurrent sessions, has at most one or
  * two "working" at once, so the fixed per-tick cost was being paid every
  * second for a fleet that was not changing every second. 4 ticks is a
- * deliberately small multiplier â worst case an idle session's death takes 4s
+ * deliberately small multiplier — worst case an idle session's death takes 4s
  * longer to notice than before, which is a fine trade next to a 4x cut in
  * background churn during the (common) stretches when nothing is happening. */
 const IDLE_REFRESH_TICKS = 4;
@@ -166,7 +166,7 @@ type HubAction =
 /**
  * Liveness verified by *identity*, not mere existence.
  *
- * `process.kill(pid, 0)` only proves some process holds that pid â not that it
+ * `process.kill(pid, 0)` only proves some process holds that pid — not that it
  * is ours. Sessions killed with `tmux kill-session` never run their shutdown
  * hook, so their status file survives; the OS later recycles that pid onto an
  * unrelated process and the dead row springs back to life claiming to run.
@@ -176,22 +176,22 @@ type HubAction =
  * Targeted at exactly the pids the caller already knows about (from status
  * files it just read), via `ps -p`, rather than scanning every process on the
  * machine. Measured on this machine: 20ms for `-eo` against 624 processes,
- * 1.5ms for `-p` against a handful of known pids â the scan was paying for
+ * 1.5ms for `-p` against a handful of known pids — the scan was paying for
  * every OTHER process on the system to answer a question about a known,
  * small set. Empty input returns immediately without spawning anything.
  *
- * `ps -p` with NONE of the requested pids alive exits 1 with empty stdout â
+ * `ps -p` with NONE of the requested pids alive exits 1 with empty stdout —
  * verified live, and a completely normal result (every tracked session just
  * crashed), not a sign ps itself is broken. That is why failure is judged by
- * `res.error` (spawn could not even start the process â genuinely unknown,
- * e.g. ps missing or unreadable) rather than by exit code, which for `-p` â 
- * unlike the old `-eo` scan, where any nonzero exit really was suspicious â
+ * `res.error` (spawn could not even start the process — genuinely unknown,
+ * e.g. ps missing or unreadable) rather than by exit code, which for `-p` — 
+ * unlike the old `-eo` scan, where any nonzero exit really was suspicious —
  * conflates "zero matches" with "broken" if trusted the same way.
  *
  * pids are bounds-checked before being handed to ps: nothing validates what a
  * status file contains, and one corrupted pid value in an unfiltered `-p`
  * list makes ps reject the ENTIRE query ("process id too large"), which would
- * fail identity verification for every OTHER session in the same call â
+ * fail identity verification for every OTHER session in the same call —
  * observed directly while building this. A pid that fails the sanity check is
  * simply left out of the query and therefore absent from the result, which is
  * the correct answer anyway: no real process has a pid shaped like that.
@@ -203,7 +203,7 @@ type HubAction =
  * into them would put two processes on one file. This is a dashboard concern,
  * so the dashboard owns the file. */
 /** lastSelected is the session id the cursor sat on when the dashboard was
- * last closed â restored on the next open so leaving a session and coming
+ * last closed — restored on the next open so leaving a session and coming
  * back does not reset you to the top of the list. Not a strong preference
  * like pin/order: a stale id (its card was since dismissed) just fails the
  * lookup and falls back to row 0, same as never having one. */
@@ -211,11 +211,11 @@ type HubAction =
  * set. This is the source of truth for a renamed row's label, not a cache of
  * it. Renaming used to work by sending `/name <newName>` into the pane so Pi
  * would rewrite its OWN status file with the new name for the dashboard to
- * later read back â verified live (sandboxed session, PI_KING_STATUS_DIR)
+ * later read back — verified live (sandboxed session, PI_KING_STATUS_DIR)
  * that this is broken in a specific way: `/name` updates Pi's in-session
  * state immediately (its own title bar and composer footer change right
  * away), but that state is only serialized into the status file on the
- * SESSION'S OWN NEXT UNRELATED ACTIVITY WRITE, not on `/name` itself â a
+ * SESSION'S OWN NEXT UNRELATED ACTIVITY WRITE, not on `/name` itself — a
  * session renamed and then left alone (never given another prompt) shows
  * the stale pre-rename name forever. Same failure class as the pid-token
  * comment two sections up: trusting a second process's own timing for a
@@ -223,7 +223,7 @@ type HubAction =
  * below in renameTmuxSession) so Pi's own UI stays in sync too, but it is
 /** Records which boot generation reboot recovery has already run for, so a
  * second dashboard opened moments after the first does not race it into
- * resuming the same transcript twice â see restoreRebootOrphans. */
+ * resuming the same transcript twice — see restoreRebootOrphans. */
 const REBOOT_RECOVERY_FILE = join(SESSION_STATUS_DIR, "..", "reboot-recovery.json");
 
 function writeLayout(l: Layout): void {
@@ -246,16 +246,16 @@ function writeLayout(l: Layout): void {
  * second. ctimeMs is load-bearing, not belt-and-suspenders: mtime+size alone
  * miss a same-size write that preserves its own mtime (a tool rewriting a
  * file in place with -p), which would leave the cached digest stale and
- * fingerprint a file as unchanged when it changed â a false negative. ctime
+ * fingerprint a file as unchanged when it changed — a false negative. ctime
  * changes on any inode update, including one that preserves mtime and size.
  * A file that disappears (or fails to stat) has no cache entry and
- * contributes nothing to the fingerprint â absent and unreadable are the
+ * contributes nothing to the fingerprint — absent and unreadable are the
  * same "not loaded" fact. */
 
 
 /** Full startup restart of the pi process inside an existing tmux pane, in
  * place: `tmux respawn-pane -k` kills the pane's current process and starts
- * the new one under the same session name, same directory, same env â no
+ * the new one under the same session name, same directory, same env — no
  * new tmux session, no shell, and critically no text injected into the pane
  * (unlike sending /reload, which is what this replaces for startup-only
  * changes: /reload re-imports extensions/skills/prompts but does NOT re-run
@@ -266,24 +266,24 @@ function writeLayout(l: Layout): void {
  * Sandbox-proven: respawning a settled session yields a new pid, the same
  * sessionId and sessionFile on the card, and a subsequent prompt works.
  * Known ceiling, stated rather than hidden: an unsent draft in the editor of
- * an otherwise-settled session is lost â the dashboard cannot inspect a
+ * an otherwise-settled session is lost — the dashboard cannot inspect a
  * remote editor. Accepted trade (Option A) for headless fleet sessions. */
 export function restartTmuxPane(name: string, dir: string, sessionId: string): { ok: boolean; message: string } {
   // pi --session <id> fails with "No session found matching" when the
-  // transcript JSONL does not exist yet â a session that has never received
+  // transcript JSONL does not exist yet — a session that has never received
   // a prompt has no JSONL. respawn-pane -k kills the pane's current process
   // BEFORE the new pi starts, so firing into that state would kill a live
   // session and fail to bring it back, taking the whole tmux session down
   // with it (observed live). Verify resumability from the card before
   // touching the pane: no card, or a card whose sessionFile is missing,
-  // means "nothing to resume" â skip, keep the live process.
+  // means "nothing to resume" — skip, keep the live process.
   try {
     const card = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${sessionId}.json`), "utf8")) as { sessionFile?: string };
     if (typeof card.sessionFile !== "string" || !existsSync(card.sessionFile)) {
-      return { ok: false, message: `"${name}" has no transcript yet â nothing to resume, left running.` };
+      return { ok: false, message: `"${name}" has no transcript yet — nothing to resume, left running.` };
     }
   } catch {
-    return { ok: false, message: `"${name}" has no status card â cannot restart.` };
+    return { ok: false, message: `"${name}" has no status card — cannot restart.` };
   }
   const result = spawnSync(TMUX, [
     "respawn-pane", "-k", "-t", `=${name}:0.0`,
@@ -297,7 +297,7 @@ export function restartTmuxPane(name: string, dir: string, sessionId: string): {
 }
 
 /** Seconds since the epoch this machine last booted, or undefined when it
- * cannot be determined â macOS only; anything else degrades to "reboot
+ * cannot be determined — macOS only; anything else degrades to "reboot
  * recovery does not engage" rather than guessing. `sysctl -n kern.boottime`
  * prints `{ sec = 1785800818, usec = 776947 } Tue Aug  4 06:46:58 2026`. */
 function bootTimeSec(): number | undefined {
@@ -321,7 +321,7 @@ const REBOOT_WINDOW_SEC = 600;
  * The signal is proximity to boot, not the on-disk status field. A plain
  * Restart from the Apple menu gives running processes a SIGTERM before the new
  * boot completes, and this project's own shutdown hook catches that and
- * writes status:"exited" cleanly â verified live: every card here was
+ * writes status:"exited" cleanly — verified live: every card here was
  * exited exactly 33s before this machine's own boot time. A hard power-cut
  * or `kill -9` skips that hook entirely, leaving whatever status was current
  * (idle, working) on disk. Both are "the machine ended this", and both look
@@ -329,13 +329,13 @@ const REBOOT_WINDOW_SEC = 600;
  * write falls in a short window immediately before boot. A card that has
  * simply been sitting exited for hours or days, unrelated to today's reboot,
  * fails that proximity test regardless of what its status field says, and is
- * left exactly as the user left it â this function only ever restores what
+ * left exactly as the user left it — this function only ever restores what
  * the reboot itself took.
  *
  * Guarded by a marker file, not just an in-memory flag: two dashboards opened
  * within the same boot (this hub, plus any tracked session with the overlay
  * bound to a key) would otherwise both see the same pre-restore state and
- * could both resume the same session id onto two live processes â the one
+ * could both resume the same session id onto two live processes — the one
  * outcome this project must never cause. The marker is written before the
  * restore work runs, not after, to keep that window as small as possible.
  * ponytail: not a true lock (two processes could still both pass the read in
@@ -421,7 +421,7 @@ function flushPendingRenames(rows: Row[]): void {
   if (pendingRenames.size === 0) return;
   for (const [tmuxName, desired] of [...pendingRenames]) {
     const row = rows.find((r) => r.kind === "session" && r.entry.tmuxName === tmuxName);
-    // Gone, not just unsettled â the session exited (or its tmux pane did)
+    // Gone, not just unsettled — the session exited (or its tmux pane did)
     // before ever going idle. Nothing will ever match this tmuxName again, so
     // leaving it queued was a permanent leak: found live, still growing
     // slowly for the life of this dashboard process, one entry per rename
@@ -439,12 +439,12 @@ function flushPendingRenames(rows: Row[]): void {
  * that might happen to the same session while a restart is still queued
  * behind it. A respawn does not type into the pane (unlike the /reload this
  * replaces), but killing a mid-turn process still loses whatever it was
- * doing, so it must never fire mid-turn â same invariant as pendingRenames. */
+ * doing, so it must never fire mid-turn — same invariant as pendingRenames. */
 const pendingRestarts = new Set<string>();
 
 /** sessionId -> pid observed when the restart was fired. Cleared once the
  * card shows a different pid (the successor process has claimed the file) or
- * the row disappears entirely â this is what stops a second `r` from
+ * the row disappears entirely — this is what stops a second `r` from
  * respawning a session that is already mid-restart: between firing
  * respawn-pane and the new process's first status write the card still shows
  * the OLD pid and the OLD fingerprint, so without this guard a refresh would
@@ -456,12 +456,12 @@ const restartingSessions = new Map<string, number>();
  * by construction rather than by parallel maintenance:
  *   - gone: pruned, not left to leak.
  *   - already fresh: re-checks entry.restartNeeded at FIRE time, not queue
- *     time â rows is rebuilt fresh every refresh(), so a session restarted
+ *     time — rows is rebuilt fresh every refresh(), so a session restarted
  *     some other way already shows restartNeeded:false here, and the queued
  *     fire is skipped as a no-op rather than sent redundantly.
  *   - still busy: left queued, tried again next cycle.
  * A restart failure (tmux refused, directory gone) also prunes: a broken
- * config must not loop-respawn forever â the card keeps its restartNeeded
+ * config must not loop-respawn forever — the card keeps its restartNeeded
  * badge, so the user still sees it needs a restart and can retry with r. */
 function flushPendingRestarts(rows: Row[]): void {
   if (pendingRestarts.size === 0) return;
@@ -483,7 +483,7 @@ function flushPendingRestarts(rows: Row[]): void {
  * longer in-flight when the queued sweep runs. "Acknowledged" is stricter
  * than "pid changed": the new process publishes its pid and its fingerprint
  * in one session_start persist, so a card whose pid changed but whose
- * fingerprint still disagrees (or is absent) has not finished initializing â
+ * fingerprint still disagrees (or is absent) has not finished initializing —
  * clearing on pid alone would let a second `r` kill the half-started
  * successor (Red review, risk #2). Row gone entirely = the restart failed and
  * took the tmux session with it; clear so the card renders exited instead of
@@ -505,7 +505,7 @@ function renameTmuxSession(oldName: string, newName: string, settled: boolean, s
   // Layout.names comment: /name's effect on Pi's own status file is delayed
   // until that session's next unrelated activity, sometimes indefinitely, so
   // it cannot be what a rename's success depends on. Written immediately,
-  // synchronously, before this function returns â the row is correct on the
+  // synchronously, before this function returns — the row is correct on the
   // very next render, not eventually. sessionId is undefined for an orphan
   // (a tmux pane with no Pi session behind it, so no status-file name to
   // override in the first place, and rowLabel() reads row.tmux.name for
@@ -539,7 +539,7 @@ function detachTmuxSession(name: string): { ok: boolean; message: string } {
   const attached = spawnSync(TMUX, ["display-message", "-p", "-t", name, "#{session_attached}"], { encoding: "utf8", timeout: 3000 });
   const count = Number(String(attached.stdout || "").trim()) || 0;
   if (count === 0) {
-    return { ok: true, message: `"${name}" has no attached client â it is already running unattended.` };
+    return { ok: true, message: `"${name}" has no attached client — it is already running unattended.` };
   }
   const result = spawnSync(TMUX, ["detach-client", "-s", name], { encoding: "utf8", timeout: 3000 });
   if (result.status !== 0) return { ok: false, message: `Failed to detach: ${tmuxError(result)}` };
@@ -558,12 +558,12 @@ function killTmuxSession(name: string): { ok: boolean; message: string } {
  *
  * This indirection is load-bearing, not ceremony. The original implementation
  * spawned `tmux attach-session` as a child with `stdio: "inherit"` while Pi's
- * own TUI was still live â which left two processes (Pi's TUI event loop and
+ * own TUI was still live — which left two processes (Pi's TUI event loop and
  * the tmux client) concurrently reading the same terminal stdin and writing
  * the same stdout. Keystrokes were split nondeterministically between them and
  * terminal-mode state was fought over, which is what actually produced the
  * "server exited unexpectedly" client death on a keypress. Pi exposes no API
- * to suspend/release its TUI mid-session (verified â no suspend/releaseTerminal
+ * to suspend/release its TUI mid-session (verified — no suspend/releaseTerminal
  * in the extension or interactive-mode surface), so the only correct fix is to
  * ensure exactly one process owns the terminal at a time: Pi writes the action
  * and exits; the wrapper then execs tmux with the terminal entirely to itself;
@@ -574,7 +574,7 @@ function requestWrapperAction(action: HubAction): boolean {
   if (!target) return false;
   try {
     // First line: the RAW tmux session name, never JSON-escaped. The wrapper
-    // reads exactly this line; a JSON-escaped name breaks sed extraction â a
+    // reads exactly this line; a JSON-escaped name breaks sed extraction — a
     // quote inside the name arrives as \" and the old sed stopped at that
     // first quote, leaving a stray backslash as the attach target (observed
     // live as `can't find session: \`). tmux rejects control characters in
@@ -656,9 +656,9 @@ function subagentSummary(subagents: SubagentStatus[]): string {
   const done = subagents.filter((s) => s.status === "completed").length;
   const failed = subagents.filter((s) => s.status === "failed").length;
   const parts: string[] = [];
-  if (running > 0) parts.push(`ð¤${running} running`);
-  if (failed > 0) parts.push(`â${failed}`);
-  if (done > 0) parts.push(`â${done}`);
+  if (running > 0) parts.push(`🤖${running} running`);
+  if (failed > 0) parts.push(`✗${failed}`);
+  if (done > 0) parts.push(`✓${done}`);
   return parts.join(" ");
 }
 
@@ -683,14 +683,14 @@ function clockLine(): string {
   const d = new Date();
   const day = d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
   const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
-  return `${day} Â· ${time}`;
+  return `${day} · ${time}`;
 }
 
 /** One-line usage ticker, colour-coded by meaning rather than decoration:
  * error rate takes its colour from a threshold (so a bad number is visible
  * without reading it), and the top three models get descending emphasis so
  * rank is legible at a glance. An empty today says so in words and still
- * shows the history â a fresh morning used to blank the whole band, hiding a
+ * shows the history — a fresh morning used to blank the whole band, hiding a
  * week of figures that exist regardless of whether today has started. "0
  * calls" is still never printed: absence of logs is not a measurement. */
 function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[], loaded: boolean, budget = Infinity): string | undefined {
@@ -710,14 +710,14 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
     );
     // The rest of the band is day-cumulative, which reads the same at a busy
     // noon and a dead midnight. The trailing hour is the "now" signal. A zero
-    // here is a measurement â the whole day's logs were scanned and none fell
-    // in the window â so quiet is stated, not hidden.
+    // here is a measurement — the whole day's logs were scanned and none fell
+    // in the window — so quiet is stated, not hidden.
     segs.push(stats.lastHour.calls > 0
       ? th.fg("dim", "1h ") + th.fg("accent", String(stats.lastHour.calls)) +
         th.fg("dim", " calls \u00b7 ") + th.fg("accent", compactNum(stats.lastHour.tokensIn)) + th.fg("dim", " in")
       : th.fg("dim", "1h quiet"));
     // Which part of the day carried the traffic, in four coarse buckets
-    // (morning/afternoon/evening/night) rather than a raw hour count â "peak
+    // (morning/afternoon/evening/night) rather than a raw hour count — "peak
     // 585/h" answers a question nobody asked; "busiest afternoon" answers the
     // one people actually have (when am I busiest). Replaces the old per-hour
     // sparkline, which packed the same shape into less legible ground.
@@ -726,11 +726,11 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
         th.fg("dim", ` ${stats.peakPeriod.pct}%`));
     }
   }
-  // Daily NET-token history â cache re-reads excluded, so a chatty week of
+  // Daily NET-token history — cache re-reads excluded, so a chatty week of
   // re-sent history doesn't flatten the shape of how much new ground was
   // actually covered each day. Lives outside the `if (stats)` block on
   // purpose: history renders even on a fresh morning with zero calls yet.
-  // When today has data it is the last bar and is dimmed â a partial day
+  // When today has data it is the last bar and is dimmed — a partial day
   // ranked against completed ones is a false signal. When today is empty it
   // is absent from the series, so every bar is a completed day.
   if (daily.length >= 3) {
@@ -756,7 +756,7 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
     const net = netTokens(stats.tokensIn, stats.tokensCacheRead);
     // Every neighbouring segment names its own window ("calls today", "7d"):
     // this was the one silent one, sitting between them, and read as
-    // ambiguous â all-time or today? It is today only, same as the rest of
+    // ambiguous — all-time or today? It is today only, same as the rest of
     // the band; readUsageStats() scans exactly one day's directory and never
     // touches the others. Made explicit rather than inferred from position.
     segs.push(
@@ -768,7 +768,7 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
   }
   // Today's most-used model, no share number: the ticker already spent its
   // percentages on error rate and busiest period, and "which model" is
-  // answered completely by the name alone â the runner-up's share never
+  // answered completely by the name alone — the runner-up's share never
   // changed what anyone did next either, which is why only the leader ever
   // showed up here at all.
   const lead = stats?.topModels[0];
@@ -785,8 +785,8 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
   if (stats?.partial) segs.push(th.fg("warning", "(partial)"));
   // p95 goes dead last, on purpose: it is the first segment dropped when the
   // row does not fit. Tail latency is real but the least actionable figure
-  // next to what's ahead of it in the band â volume, errors, when you're
-  // busiest, cache economics â worth showing, not worth the room to protect.
+  // next to what's ahead of it in the band — volume, errors, when you're
+  // busiest, cache economics — worth showing, not worth the room to protect.
   const p95 = stats && stats.durations.length > 0
     ? stats.durations[Math.min(stats.durations.length - 1, Math.floor(stats.durations.length * 0.95))]
     : 0;
@@ -797,7 +797,7 @@ function tickerParts(th: Theme, stats: UsageStats | undefined, daily: DayTotal[]
   // the space left for it, the clock is pushed past the terminal edge and
   // silently truncated, so shed the least important segments (p95 first, see
   // above) until what remains fits.
-  const joiner = th.fg("dim", "  â  ");
+  const joiner = th.fg("dim", "  │  ");
   while (segs.length > 1 && visibleWidth(segs.join(joiner)) > budget) segs.pop();
   return segs.join(joiner);
 }
@@ -845,7 +845,7 @@ class DashboardView implements Component {
   /** Usage stats: 60s TTL, refreshed off the render path so first paint and
    * navigation are never blocked by the ~0.5s aggregation. */
   private statsCache = new StatsCache(() => this.tui.requestRender());
-  /** Snapshot taken once at open â static between config edits, so no TTL. */
+  /** Snapshot taken once at open — static between config edits, so no TTL. */
   private inventory: Inventory | undefined;
   /** Landing-page fallback when nothing is backgrounded. */
   private recent: RecentProject[] = [];
@@ -855,7 +855,7 @@ class DashboardView implements Component {
    * cadence, no second timer), the panel replaces the session body while
    * open, and /jobs parity in the hub routes through the same instance. */
   private jobs: JobsPanel;
-  /** Checked once at open, not per-render â a pi upgrade silently wiping the
+  /** Checked once at open, not per-render — a pi upgrade silently wiping the
    * Fix 2 patch (docs/PERF-TMUX-SPEC.md) is a rare, deliberate event; the
    * user just needs to notice on the next dashboard open, not mid-session. */
   private piTuiUnpatched = false;
@@ -874,7 +874,7 @@ class DashboardView implements Component {
     this.jobs = new JobsPanel(sessionManager, invocationCwd, notifyFallback);
     this.refresh();
     // Restores the cursor to wherever it was left last time, rather than
-    // always opening on row 0 â leaving "Homelab Setup" and coming straight
+    // always opening on row 0 — leaving "Homelab Setup" and coming straight
     // back should put the cursor back on Homelab Setup, not reset to the top
     // of the pinned section. A dismissed or since-vanished card's id simply
     // fails this lookup and falls back to row 0, which is exactly the old
@@ -896,11 +896,11 @@ class DashboardView implements Component {
       // Jobs poll on the SAME tick, unconditionally: completion detection is
       // bounded by REFRESH_MS even on an idle fleet where the heavier data
       // refresh below is throttled to every IDLE_REFRESH_TICKS. The scan is
-      // a stat-cached readdir â cheap enough for 1s â and the panel's seen
+      // a stat-cached readdir — cheap enough for 1s — and the panel's seen
       // set guarantees exactly one injection per marker per hub run.
       this.jobs.poll(Date.now(), () => this.rows);
       // Fast cadence (every tick) while a turn is actively streaming or a
-      // subagent is running â the only states where a fresher read shows
+      // subagent is running — the only states where a fresher read shows
       // something genuinely new. Everything else (idle, background,
       // attention, error, exited) is static until something external changes
       // it, so a slower cadence loses nothing but promptness in noticing that
@@ -916,13 +916,13 @@ class DashboardView implements Component {
   }
 
   /** Terminal size, fed in by the overlay each render cycle from the layout
-   * engine's own visible(w,h) hook â the one place both dimensions are
+   * engine's own visible(w,h) hook — the one place both dimensions are
    * known reliably, tmux or not (reading process.stdout.columns/rows
    * directly misses resizes on a multiplexed or piped stdout). Zero height
-   * means "not known yet", which renders everything unwindowed â the
+   * means "not known yet", which renders everything unwindowed — the
    * previous behaviour. Persisted (deduped, best-effort) so the headless
    * daemon and the next dashboard boot can spawn sessions close to this
-   * size instead of tmux's 80x24 default â see fleet.ts's
+   * size instead of tmux's 80x24 default — see fleet.ts's
    * resolveSpawnSize/CLIENT_SIZE_FILE. */
   private termWidth = 0;
   private termHeight = 0;
@@ -932,7 +932,7 @@ class DashboardView implements Component {
     if (this.termWidth > 0 && this.termHeight > 0) writeClientSize({ w: this.termWidth, h: this.termHeight });
   }
   /** The live client size this DashboardView is currently rendering at, for
-   * any createTmuxSession call made from here â more current than the
+   * any createTmuxSession call made from here — more current than the
    * persisted file within this same process. undefined before the first
    * render (falls through to fleet.ts's persisted-or-default tiers). */
   clientSize(): ClientSize | undefined {
@@ -953,7 +953,7 @@ class DashboardView implements Component {
    * without ever killing a pane mid-turn. Settled sessions (idle/background)
    * are respawned immediately; busy ones are queued and picked up
    * automatically by flushPendingRestarts on a later refresh, the moment they
-   * settle â one press converges the whole fleet instead of firing once and
+   * settle — one press converges the whole fleet instead of firing once and
    * leaving whatever was busy to be caught manually later. A full restart
    * (not /reload) is required for startup-only changes: /reload re-imports
    * extensions/skills/prompts but does NOT re-run pi.registerProvider(),
@@ -989,7 +989,7 @@ class DashboardView implements Component {
     if (firedNow === 0 && queued === 0) this.showMessage("No sessions need restarting.");
     else this.showMessage(
       `Restarting ${firedNow} session${firedNow === 1 ? "" : "s"}` +
-      (queued > 0 ? `, ${queued} queued â will restart once settled.` : "."),
+      (queued > 0 ? `, ${queued} queued — will restart once settled.` : "."),
     );
     this.tui.requestRender();
   }
@@ -1052,7 +1052,7 @@ class DashboardView implements Component {
     }
   }
 
-  /** The only exit from this view, on every path â attach, resume, cancel.
+  /** The only exit from this view, on every path — attach, resume, cancel.
    * Persists which row the cursor was on before handing control back, so the
    * next open can restore it. A no-op write when the row hasn't changed since
    * the last save, and silently skipped for an orphan row (no session id to
@@ -1099,7 +1099,7 @@ class DashboardView implements Component {
     const pinned = layout.pinned.includes(row.entry.sessionId);
     // A row may only move among its peers: within the pinned section, or
     // within its own directory group. Moving across a boundary would silently
-    // change what the row means â its directory, or its pinned-ness â and
+    // change what the row means — its directory, or its pinned-ness — and
     // those are what the other two keys are for.
     const peers = this.rows.filter((r): r is SessionRow =>
       r.kind === "session" &&
@@ -1181,7 +1181,7 @@ class DashboardView implements Component {
     this.composerStep = undefined;
     if (!step) return;
     if (!value) {
-      this.showMessage("Cancelled â empty input.");
+      this.showMessage("Cancelled — empty input.");
       return;
     }
     if (step.kind === "new-name") {
@@ -1240,7 +1240,7 @@ class DashboardView implements Component {
     }
     // Jobs mode owns the keyboard: every key below is a JOB action, never a
     // session action, while the panel is open. Unhandled keys clear the
-    // delete arm and stop â session keys must not leak through.
+    // delete arm and stop — session keys must not leak through.
     if (this.jobs.open) {
       if (matchesKey(data, "escape") || data === "j" || data === "J") {
         this.jobs.open = false;
@@ -1311,7 +1311,7 @@ class DashboardView implements Component {
       this.jobs.deleteArmedFor = null;
       return;
     }
-    // Esc (and the terminal's own Ctrl+C/Ctrl+D) are the only ways to quit â
+    // Esc (and the terminal's own Ctrl+C/Ctrl+D) are the only ways to quit —
     // "q" is deliberately not a quit key here: it's too easy to hit by
     // accident while navigating (e.g. inside a session name), and this is a
     // dashboard people rely on staying open, not a pager.
@@ -1419,7 +1419,7 @@ class DashboardView implements Component {
     if (data === "X") {
       if (!row) return;
       // An exited card holds no process; X here removes the card itself.
-      // Armed like kill â not because it is dangerous, but because one
+      // Armed like kill — not because it is dangerous, but because one
       // consistent rhythm for X is worth more than saving a keypress.
       if (row.kind === "session" && row.entry.state === "exited") {
         const id = row.entry.sessionId;
@@ -1467,7 +1467,7 @@ class DashboardView implements Component {
         this.tui.requestRender();
       } else {
         this.deleteArmedFor = tmuxName;
-        this.showMessage(`Press X again to KILL "${tmuxName}" â ends the running process. x detaches instead.`);
+        this.showMessage(`Press X again to KILL "${tmuxName}" — ends the running process. x detaches instead.`);
       }
       return;
     }
@@ -1475,7 +1475,7 @@ class DashboardView implements Component {
     // right is an alternative to enter, not a distinct gesture: it goes
     // through the exact same branch below (resurrect-if-exited, then
     // attach), so a row behaves identically no matter which key opens it.
-    // Not bound on orphan-tmux rows specially â it falls through to the same
+    // Not bound on orphan-tmux rows specially — it falls through to the same
     // rowTmuxName/attach path enter already uses for those.
     if (matchesKey(data, "enter") || matchesKey(data, "right")) {
       if (!row) return;
@@ -1485,14 +1485,14 @@ class DashboardView implements Component {
         const e = row.entry;
         // Re-check liveness AT PRESS TIME, not at render time. "Exited" here
         // is a verdict computed up to a refresh-cycle ago from a card that any
-        // bug upstream can mis-stamp â and one did: /reload used to reset the
+        // bug upstream can mis-stamp — and one did: /reload used to reset the
         // card's startedAt, failing the identity check, so a session could sit
         // here marked exited while its process ran fine. Resuming that spawns
         // a second process on the same transcript, which is the one disaster
         // this tool must never cause. A resurrect is not latency-sensitive;
         // one ps call is cheap insurance against it.
         if (e.pid && spawnSync("/bin/ps", ["-p", String(e.pid)], { encoding: "utf8", timeout: 2000 }).status === 0) {
-          this.showMessage(`Card says exited, but pid ${e.pid} is alive right now â not resuming onto a live transcript. Refresh (r) and re-check.`);
+          this.showMessage(`Card says exited, but pid ${e.pid} is alive right now — not resuming onto a live transcript. Refresh (r) and re-check.`);
           this.refresh();
           this.tui.requestRender();
           return;
@@ -1578,7 +1578,7 @@ class DashboardView implements Component {
     // MEASURE - 2 (left margin) - 2 (right margin) - 1 (minimum pad) = -5. A
     // previous -8 reserved 3 unnecessary characters, coarse-shedding a whole
     // extra segment (e.g. "avg 356.9M/day") on renders that missed the tighter
-    // budget by only 1-2 characters â verified against a real 224-col render
+    // budget by only 1-2 characters — verified against a real 224-col render
     // where correcting this alone was the difference between 7 and 8 segments
     // surviving.
     const clockText = clockLine();
@@ -1591,12 +1591,12 @@ class DashboardView implements Component {
       lines.push("  " + th.fg("warning", "pi-tui unpatched \u2014 monolith sessions replay full renders under tmux; run: pi-king patch-tui"));
     }
     // A human-scale comparison for today's distinct tokens, on its own row
-    // instead of competing with the ticker's other segments for width â it
+    // instead of competing with the ticker's other segments for width — it
     // used to live there and lost the room to things people check more often
     // (volume, errors, when they're busiest). Full phrasing here, unlike the
     // trimmed ticker version this replaced: nothing else is on this line to
     // compete with. Small/early days show nothing, same as everywhere else
-    // that reads tokenComparison â absence of logs is not a measurement.
+    // that reads tokenComparison — absence of logs is not a measurement.
     if (stats) {
       const distinctToday = netTokens(stats.tokensIn, stats.tokensCacheRead) + stats.tokensOut;
       const cmp = tokenComparison(distinctToday);
@@ -1630,11 +1630,11 @@ class DashboardView implements Component {
           ["cache reads", `${compactNum(life.tokensCacheRead)} (${life.tokensIn > 0 ? Math.round((life.tokensCacheRead / life.tokensIn) * 100) : 0}%)`],
         ];
         // API-equivalent cost, from the pipeline's cost-prices.json. Only shown
-        // when a price is actually known â absence of prices is not a $0 bill.
+        // when a price is actually known — absence of prices is not a $0 bill.
         if (life.cost > 0) pairs.push(["API-equiv", fmtMoney(life.cost)]);
         // Cache leverage: how many times each token written into the cache was
         // served back out. This is the number that justifies (or indicts) the
-        // whole caching story â read share alone cannot say whether writes paid.
+        // whole caching story — read share alone cannot say whether writes paid.
         if (life.tokensCacheWrite > 0) {
           pairs.push(["cache leverage", `${(life.tokensCacheRead / life.tokensCacheWrite).toFixed(1)}x re-read`]);
         }
@@ -1683,12 +1683,12 @@ class DashboardView implements Component {
       }
       // ---- today, in detail ----------------------------------------------
       // The band answers "how much"; this answers "which model, what kind of
-      // errors, and what made you wait". Only rendered when today has calls â
+      // errors, and what made you wait". Only rendered when today has calls —
       // an empty section would just be furniture.
       const { stats: todayStats } = this.statsCache.get();
       if (todayStats) {
         lines.push("");
-        lines.push("  " + th.fg("dim", "ââ today ââ"));
+        lines.push("  " + th.fg("dim", "── today ──"));
         for (const m of todayStats.perModel.slice(0, 4)) {
           const bits = [
             `${m.calls} call${m.calls === 1 ? "" : "s"}`,
@@ -1696,7 +1696,7 @@ class DashboardView implements Component {
             m.cost > 0 ? fmtMoney(m.cost) : "",
             m.p95 > 0 ? `p95 ${(m.p95 / 1000).toFixed(1)}s` : "",
             m.errors > 0 ? `${m.errors} err` : "",
-          ].filter(Boolean).join(" Â· ");
+          ].filter(Boolean).join(" · ");
           lines.push("  " + th.fg("accent", m.model.padEnd(22)) + th.fg("muted", bits));
         }
         if (todayStats.errorsByStatus.length > 0) {
@@ -1736,16 +1736,16 @@ class DashboardView implements Component {
     // From here to the inventory, lines go into `body`: this is the only zone
     // allowed to scroll. Everything above is pinned context and everything
     // below is the key map, which is useless if a long list pushes it off the
-    // screen â which it did, at 21 sessions.
+    // screen — which it did, at 21 sessions.
     const body: string[] = [];
     /** Index in `body` of the currently selected row, so the window can be
      * centred on it rather than on the top of the list. */
     let selectedLine = 0;
     if (this.jobs.open) {
       // Jobs panel: the session body is replaced by the marker list. Marker
-      // content is UNTRUSTED data â every field passes through clean() +
+      // content is UNTRUSTED data — every field passes through clean() +
       // truncateToWidth before it is rendered.
-      body.push("  " + th.fg("accent", "Jobs") + th.fg("dim", " â j/esc back Â· enter show Â· r resume Â· c clear Â· X delete"));
+      body.push("  " + th.fg("accent", "Jobs") + th.fg("dim", " — j/esc back · enter show · r resume · c clear · X delete"));
       const jobs = this.jobs.list;
       if (jobs.length === 0) {
         body.push("  " + th.fg("dim", "No job markers in ~/.pi/jobs."));
@@ -1754,7 +1754,7 @@ class DashboardView implements Component {
         const statusW = 10;
         const timeW = 9;
         const spawnerW = 16;
-        // sessionId â display name, from the live rows (the dashboard's own
+        // sessionId → display name, from the live rows (the dashboard's own
         // read of the fleet, same source the injector targets against).
         const spawnerName = new Map<string, string>();
         for (const r of this.rows) {
@@ -1774,14 +1774,14 @@ class DashboardView implements Component {
           const hue = j.orphaned ? "error" : j.stale ? "dim" : j.marker.status === "done" ? "success"
             : j.marker.status === "failed" ? "error" : "accent";
           const id = pad(truncateToWidth(clean(j.id), idW, "\u2026", true), idW);
-          // "pending (stale)" is 15 chars â must truncate or it overflows
+          // "pending (stale)" is 15 chars — must truncate or it overflows
           // the status column and shoves the summary right. "died" replaces
           // the status outright: "pending" would be a lie about a job whose
           // worker no longer exists.
           const statusText = j.orphaned ? "died" : j.marker.status + (j.stale ? " (stale)" : "");
           const status = pad(truncateToWidth(statusText, statusW, "\u2026", true), statusW);
           // Time elapsed: live count-up since createdAt while pending;
-          // total runtime (completedAt â createdAt) once terminal. Ticks
+          // total runtime (completedAt − createdAt) once terminal. Ticks
           // with the panel's 1s refresh.
           let timeText = "\u2014";
           if (j.marker.createdAt) {
@@ -1794,7 +1794,7 @@ class DashboardView implements Component {
           const time = th.fg("muted", pad(truncateToWidth(timeText, timeW, "\u2026", true), timeW));
           // Spawner provenance: which session this job came from (job_spawn
           // stamps spawnerSessionId since 0.2.5). Lets a misroute be spotted
-          // in the panel itself â a job delivered elsewhere while its
+          // in the panel itself — a job delivered elsewhere while its
           // "spawned by" column names a different session is a red flag.
           const spawner = j.marker.spawnerSessionId
             ? th.fg("dim", pad(
@@ -1927,9 +1927,9 @@ class DashboardView implements Component {
         // `r` visibly does something even for the sessions it could not fire
         // into immediately, instead of looking like nothing happened.
         const restartBadge = e.restartNeeded
-          ? (restartingSessions.has(e.sessionId) ? th.fg("warning", "â» restarting")
-            : pendingRestarts.has(e.sessionId) ? th.fg("warning", "â» queued")
-            : th.fg("warning", "â» restart"))
+          ? (restartingSessions.has(e.sessionId) ? th.fg("warning", "↻ restarting")
+            : pendingRestarts.has(e.sessionId) ? th.fg("warning", "↻ queued")
+            : th.fg("warning", "↻ restart"))
           : "";
         // Plain text, no glyph -- unlike stale/queued this is not an action
         // item, and a fork-shaped Unicode symbol is not confidently
@@ -1996,7 +1996,7 @@ class DashboardView implements Component {
     // The two marker rows live INSIDE the body zone, so the zone needs room for
     // them as well. Budgeting only for the rows themselves overshot the
     // terminal by exactly two lines, and since the footer is last, the two
-    // lines pushed off the bottom were the key map â the one thing that must
+    // lines pushed off the bottom were the key map — the one thing that must
     // never be shed. Observed at 20 rows.
     const MIN_ZONE = MIN_BODY + 2;
     let head = lines;
@@ -2035,7 +2035,7 @@ class DashboardView implements Component {
   }
 
   /** Lays inventory categories out as bordered, content-sized cards.
-   * Category title is embedded in the top border (Ã¢â¢Â­Ã¢ââ¬ skills Ã¢ââ¬Ã¢ââ¬Ã¢â¢Â®) so it costs
+   * Category title is embedded in the top border (╭─ skills ──╮) so it costs
    * no interior line, and each category keeps its own hue for fast scanning. */
   private renderInventoryCards(innerW: number): string[] {
     const th = this.theme;
@@ -2113,7 +2113,7 @@ class DashboardView implements Component {
   }
 }
 
-/** The hub never accepts chat input â the dashboard overlay owns all keyboard
+/** The hub never accepts chat input — the dashboard overlay owns all keyboard
  * focus while open. A visible empty prompt row underneath it doesn't make
  * sense for a dedicated tool, so it's blanked out rather than left showing. */
 class BlankEditor extends CustomEditor {
@@ -2137,7 +2137,7 @@ async function showDashboardOnce(ctx: ExtensionContext): Promise<HubAction | und
 
 /** True while this process's own dashboard overlay is open. Raw input
  * listeners run BEFORE overlay/focus routing in pi-tui, and the editor under
- * an overlay is empty by construction â so without this gate, pressing
+ * an overlay is empty by construction — so without this gate, pressing
  * left-arrow while browsing dashboard rows sailed through the empty-prompt
  * check and silently detached the client out from under the dashboard the
  * user was looking at. */
@@ -2154,7 +2154,7 @@ async function showDashboardInner(ctx: ExtensionContext): Promise<HubAction | un
   // multiplexed or piped stdout, and this number is the one the layout engine
   // is itself using.
   // Runs once per boot generation (guarded on disk, see REBOOT_RECOVERY_FILE),
-  // synchronously, before the first frame paints â so a restart-orphaned
+  // synchronously, before the first frame paints — so a restart-orphaned
   // fleet is already back by the time the dashboard is visible, not restored
   // out from under a rendered "exited" row a moment later.
   const recovery = restoreRebootOrphans();
@@ -2247,7 +2247,7 @@ function dispatchHubAction(action: HubAction): { deferred: boolean; message?: st
  * no notification extension, no subagent package, no terminal-specific tools.
  * Optional integrations are feature-detected and degrade to absent.
  */
-/** True only when this session lives in tmux AND no client is attached â
+/** True only when this session lives in tmux AND no client is attached —
  * the one situation where the user cannot be watching this terminal.
  * undefined = not in tmux, or tmux did not answer; treated as attended,
  * because notifying someone who is already looking is noise. Hoisted to
@@ -2266,12 +2266,12 @@ let osascriptOk: boolean | undefined;
  * this fires precisely in the gap that tool cannot see a need for.
  * stdlib-only: osascript on macOS, feature-detected once; elsewhere this is
  * a no-op rather than a dependency. Text goes through argv, never spliced
- * into the AppleScript source â prompts are attacker-adjacent input. */
+ * into the AppleScript source — prompts are attacker-adjacent input. */
 function notifyDetached(ctx: ExtensionContext, body: string): void {
   if (process.platform !== "darwin" || !detachedInTmux()) return;
   if (osascriptOk === undefined) osascriptOk = existsSync("/usr/bin/osascript");
   if (!osascriptOk) return;
-  const title = `Pi â ${ctx.sessionManager.getSessionName() ?? basename(ctx.cwd)}`;
+  const title = `Pi — ${ctx.sessionManager.getSessionName() ?? basename(ctx.cwd)}`;
   try {
     const child = spawn("/usr/bin/osascript", [
       "-e", "on run argv\n  display notification (item 1 of argv) with title (item 2 of argv)\nend run",
@@ -2291,7 +2291,7 @@ function installSessionTracker(pi: ExtensionAPI) {
   // never "when this extension instance initialised": /reload rebuilds the
   // ExtensionRunner and re-fires session_start hours into a process's life,
   // and stamping Date.now() there made every reloaded session fail its own
-  // identity check â alive, working, and rendered as exited beside its own
+  // identity check — alive, working, and rendered as exited beside its own
   // tmux session as an orphan (observed live: a reloaded session 12.5h old
   // carried a card 44,888s newer than its ps lstart). Derived from uptime,
   // the value is identical no matter how many times this module re-evaluates.
@@ -2321,7 +2321,7 @@ function installSessionTracker(pi: ExtensionAPI) {
    * Handoff resumes the SAME id, so the replacement writes the SAME status
    * file. Without this flag our shutdown hook then deletes the file the new
    * process just wrote, and the session vanishes from the dashboard despite
-   * running perfectly â observed exactly that. */
+   * running perfectly — observed exactly that. */
   let handedOff = false;
   /** Timers we own. Pi replaces the whole ExtensionRunner on /reload and does
    * not unwind side effects made outside its registries, so anything started
@@ -2329,7 +2329,7 @@ function installSessionTracker(pi: ExtensionAPI) {
    * alongside the freshly loaded instance. */
   const timers = new Set<ReturnType<typeof setInterval>>();
   const subagents = new Map<string, SubagentStatus>();
-  /** Unsubscribes the left-arrow â detach listener registered in session_start.
+  /** Unsubscribes the left-arrow → detach listener registered in session_start.
    * Cleared in session_shutdown alongside timers, for the same reason: /reload
    * rebuilds the ExtensionRunner but does not unwind hooks registered outside
    * its own registries, so a stale listener would survive as a zombie
@@ -2350,7 +2350,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     // Once handed off, the card belongs to the successor. This process lives
     // on for a moment while the TUI winds down, and any settle or message
     // event in that window would otherwise stamp this dead-to-be pid over the
-    // new process's card â the dashboard then shows an exited session beside
+    // new process's card — the dashboard then shows an exited session beside
     // a live orphan tmux, which is what it did.
     if (handedOff) return;
     try {
@@ -2417,17 +2417,17 @@ function installSessionTracker(pi: ExtensionAPI) {
     isFork = e.reason === "fork";
     visible = process.env.PI_DASHBOARD_SPAWNED === "1";
     // One read of our own card serves two purposes, and it MUST happen before
-    // the first persist() â persist() stamps our own pid into that card, so
+    // the first persist() — persist() stamps our own pid into that card, so
     // reading afterwards can only ever see ourselves. (The collision guard
     // shipped with the order reversed and was dead on arrival: the one
     // incident it existed for sailed straight past it.)
     //
     // Purpose one, collision: if another LIVE process claims this session id,
-    // a resume is about to put two processes on one transcript â say so.
+    // a resume is about to put two processes on one transcript — say so.
     //
-    // Purpose two, continuity: if the card is OURS â same pid, meaning this
+    // Purpose two, continuity: if the card is OURS — same pid, meaning this
     // start is a /reload or a same-process session switch, not a fresh launch
-    // â the card is the durable state and this handler's defaults above are
+    // — the card is the durable state and this handler's defaults above are
     // amnesia. Restoring visible closes a real hole: /bg sets visible=true at
     // runtime, but the env var this handler consults reflects only how the
     // process was LAUNCHED, so a reload used to silently drop a /bg'd session
@@ -2456,13 +2456,13 @@ function installSessionTracker(pi: ExtensionAPI) {
         // reload and must come from the card, not from this firing's reason.
         isFork = Boolean(card.isFork);
         // Skip death-flavoured activity text: a reload out of an OLD build
-        // arrives here with the card already stamped "Ended. Last: â¦" by that
+        // arrives here with the card already stamped "Ended. Last: …" by that
         // build's shutdown handler, and restoring it verbatim would caption a
         // live session with its own obituary.
         if (typeof card.activity === "string" && card.activity && !card.activity.startsWith("Ended.")) activity = card.activity;
         // exited maps back to idle: we are demonstrably alive. Retired states
         // go through the same translation table the dashboard applies to every
-        // other card â restoring is just another read.
+        // other card — restoring is just another read.
         const restored = RETIRED_STATES[card.status] ?? card.status;
         if (isKnownState(restored) && restored !== "exited") state = restored;
         // The subagent roster survives the reload too: the in-memory map is
@@ -2476,22 +2476,22 @@ function installSessionTracker(pi: ExtensionAPI) {
         if ((state === "idle") && hasLiveSubagents() > 0) state = "background";
         // Same class as isFork above: the startup fingerprint records what
         // THIS sessionId ran with at process launch, and a reload does not
-        // re-run startup registration â preserve the card's stamp rather than
+        // re-run startup registration — preserve the card's stamp rather than
         // recomputing a fresh one that would claim a reload made the process
         // startup-fresh when it did not.
         startupFingerprint = card.startupFingerprint;
       } else if (owner && !livePiPids([owner])?.has(owner)) {
         // Dead predecessor: this is a restart (respawn-pane replacing a dead
         // process) or a plain resume of a transcript whose previous process
-        // is gone. Immutable identity facts â dashboard visibility (a /bg'd
-        // session must not drop off the dashboard) and fork origin â belong
+        // is gone. Immutable identity facts — dashboard visibility (a /bg'd
+        // session must not drop off the dashboard) and fork origin — belong
         // to the sessionId, not the pid, so they survive the process swap.
         // The env var WINS over the old card: a /bg handoff launches the
         // copy with PI_DASHBOARD_SPAWNED=1, but the predecessor card was
         // written by the plain-terminal original (visible=false), and a
         // copy that boots slower than the original's shutdown lands in this
         // branch and previously had its env-driven true clobbered back to
-        // false â the session then vanished off the dashboard into "tmux
+        // false — the session then vanished off the dashboard into "tmux
         // (no Pi session)" (observed live 2026-08-07: codebase and
         // hustle-ops both). The card remains the fallback for plain resumes
         // where the env var is absent.
@@ -2499,17 +2499,17 @@ function installSessionTracker(pi: ExtensionAPI) {
         isFork = Boolean(card.isFork);
         // NOT restored here: state/activity/subagents (they describe a
         // process that is gone) and startupFingerprint (this process DID run
-        // startup registration â it gets a fresh stamp below).
+        // startup registration — it gets a fresh stamp below).
       }
     } catch { /* no file, unreadable, or first run: nothing to warn about */ }
     // Stamped here, at the end of session_start rather than the top: this is
     // as close as this handler gets to "extension setup for this run is
     // done", the same reasoning /reload's own comments elsewhere in this
     // handler already apply to state/activity/subagents restoration above.
-    // A reload preserves the card's stamp (restored above â the process did
+    // A reload preserves the card's stamp (restored above — the process did
     // not re-run startup registration). A fork inherits its parent's stamp:
     // it shares this process, so it shares the parent's launch-time startup
-    // inputs â claiming a fresh compute would silently hide a stale parent's
+    // inputs — claiming a fresh compute would silently hide a stale parent's
     // missing providers behind a badge-free fork card. Only a genuinely
     // fresh process start (startup/new/resume, including a restart via
     // respawn-pane) computes a new one.
@@ -2517,20 +2517,20 @@ function installSessionTracker(pi: ExtensionAPI) {
       // First choice: this process's own stamp. The fork is the SAME process
       // (same pid, same tmux pane), so if the module was not re-evaluated for
       // the fork, the closure variable still holds the exact stamp this
-      // process stamped at launch â the true source of truth, no filesystem
+      // process stamped at launch — the true source of truth, no filesystem
       // involved (Red review: "the process already knows its own startup
       // fingerprint"). If the module WAS re-evaluated (the closure is fresh
       // undefined), fall back to the parent's card: the parent session id is
       // embedded in the previous session file name <timestamp>_<id>.jsonl,
       // and its card (still live, or already exited by the fork's own
-      // shutdown â exited cards keep their fields) carries the stamp.
+      // shutdown — exited cards keep their fields) carries the stamp.
       if (startupFingerprint === undefined && typeof e.previousSessionFile === "string") {
         const m = /_([0-9a-f-]+)\.jsonl$/.exec(e.previousSessionFile);
         if (m) {
           try {
             const parent = JSON.parse(readFileSync(join(SESSION_STATUS_DIR, `${m[1]}.json`), "utf8")) as SessionStatusFile;
             startupFingerprint = parent.startupFingerprint;
-          } catch { /* parent card gone: leave unstamped â the dashboard reads
+          } catch { /* parent card gone: leave unstamped — the dashboard reads
                      that as restart-needed, the safe direction */ }
         }
       }
@@ -2539,7 +2539,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     }
     persist(ctx);
 
-    // Left-arrow at an empty prompt detaches this pane's tmux client â a
+    // Left-arrow at an empty prompt detaches this pane's tmux client — a
     // second, gated route back to the dashboard alongside Cmd+Esc, replacing
     // the tmux-level F12 binding this project used to ship (~/.tmux.conf).
     //
@@ -2549,12 +2549,12 @@ function installSessionTracker(pi: ExtensionAPI) {
     // the terminal. A bare arrow key has no such guarantee: it is the single
     // most commonly used key in any text-editing context, including this very
     // composer. Binding it at the tmux level, unconditionally, would swallow
-    // every left-arrow keystroke in the pane forever â cursor movement inside
+    // every left-arrow keystroke in the pane forever — cursor movement inside
     // Pi's own prompt, inside vim, inside shell line-editing, everywhere.
     //
     // So this is NOT a tmux binding. It is registered here, inside the running
     // Pi session, gated on `getEditorText() === ""` exactly like pi-subagents'
-    // own fleet-list activator (verified by reading its source) â the same
+    // own fleet-list activator (verified by reading its source) — the same
     // pattern that already proves this is safe: outside an empty prompt the
     // handler declines and the key reaches the editor untouched.
     //
@@ -2575,7 +2575,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       if (!process.env.TMUX) return undefined;
       // No explicit target: tmux resolves "the current client" from this
       // process's own $TMUX context, exactly as running `tmux detach-client`
-      // by hand inside this same pane would â the identical effect F12 had,
+      // by hand inside this same pane would — the identical effect F12 had,
       // just reached through a gated key instead of an unconditional one.
       spawnSync(TMUX, ["detach-client"], { encoding: "utf8", timeout: 3000 });
       return { consume: true };
@@ -2595,7 +2595,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     timers.add(settle);
 
     // Heartbeat. A supervisor prunes status files whose owner looks dead, and
-    // that judgement can be wrong â a session mid-handoff briefly advertises
+    // that judgement can be wrong — a session mid-handoff briefly advertises
     // the pid of the process that just exited. Without this one bad prune
     // makes a live session invisible permanently, since an idle session emits
     // no further events to trigger another write. Re-assert only when the file
@@ -2609,13 +2609,13 @@ function installSessionTracker(pi: ExtensionAPI) {
         // Cards are never deleted now, so a stale card from this session's
         // PREVIOUS process (a /bg handoff resumes the same id, so the same
         // path) would otherwise sit there reading "exited" with a dead pid
-        // while this very process runs â which is precisely what the
+        // while this very process runs — which is precisely what the
         // dashboard then shows: an exited card beside an orphan tmux session.
         // Same path means same session id, so a foreign pid here is always a
         // predecessor of ours, never a rival.
         if (!ownsStatusFile(ctx)) persist(ctx);
         // Attention means "finished while nobody was attached". The moment a
-        // client attaches, the user has seen it â typing is not required to
+        // client attaches, the user has seen it — typing is not required to
         // acknowledge a result you read with your eyes.
         if (state === "attention" && process.env.TMUX && !detachedInTmux()) {
           set("idle", ctx);
@@ -2651,7 +2651,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       pi.events?.on?.("subagents:completed", track("completed"));
       pi.events?.on?.("subagents:failed", track("failed"));
     } catch {
-      // No subagent extension installed â rollup simply stays empty.
+      // No subagent extension installed — rollup simply stays empty.
     }
   });
 
@@ -2696,7 +2696,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     if (!isInteractive(ctx)) return;
     const m = e.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
     if (!m || m.role !== "assistant") return;
-    // The assistant produced output, so no tool call is sitting at a dialog â
+    // The assistant produced output, so no tool call is sitting at a dialog —
     // including a call the user just denied, which never executes and would
     // otherwise leave the trust state stuck.
     const failure = m.stopReason === "error"
@@ -2723,7 +2723,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       if (hasLiveSubagents() > 0) {
         // Settled at the prompt, but subagents are still running on this
         // session's behalf: neither working nor idle. No notification either
-        // way â nothing needs the user yet, and the subagent-completion
+        // way — nothing needs the user yet, and the subagent-completion
         // handler below raises attention (and notifies, if detached) the
         // moment one actually finishes.
         set("background", ctx);
@@ -2744,7 +2744,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     if (bgQueued) { bgQueued = false; void runBackgroundHandoff(ctx); }
   });
   pi.on("session_shutdown", (e, ctx) => {
-    // Fires for reason "reload" as well as a real exit â which is precisely
+    // Fires for reason "reload" as well as a real exit — which is precisely
     // when orphaned timers would otherwise accumulate, since Pi builds a new
     // ExtensionRunner and never unwinds side effects made outside its own
     // registries. Clear unconditionally, before any early return.
@@ -2753,7 +2753,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     if (unsubscribeLeftArrow) { unsubscribeLeftArrow(); unsubscribeLeftArrow = undefined; }
     // A reload is not a death. The process survives, the session id stays
     // served, and the new runner's session_start re-persists within the same
-    // second â but between the old runner's "exited" stamp and that rewrite
+    // second — but between the old runner's "exited" stamp and that rewrite
     // there was a window in which the dashboard read a live session as a
     // corpse. Tonight's duplicate-process incident walked in through exactly
     // that window. On reload, leave the card precisely as it is: cleanup
@@ -2768,12 +2768,12 @@ function installSessionTracker(pi: ExtensionAPI) {
     // Never clobber a card another process already owns. A handoff resumes
     // the same session id, so the successor writes the SAME path: if it has
     // already claimed the card, this exiting process writing "exited" over it
-    // would kill a session that is running fine â the mirror image of the
+    // would kill a session that is running fine — the mirror image of the
     // stale-card bug, and the reason the ordering of these two exits cannot be
     // relied on.
     if (!ownsStatusFile(ctx)) return;
     // A session that never appeared on the dashboard leaves nothing behind:
-    // its card was invisible, so an exited card would be unreachable â a file
+    // its card was invisible, so an exited card would be unreachable — a file
     // that accumulates forever with no way to see or dismiss it. The
     // transcript itself is Pi's and survives regardless.
     if (!visible) {
@@ -2813,7 +2813,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       // tmux's -t argument is a TARGET, not a name: '.' and ':' are its
       // window and pane separators. A session legitimately created as
       // "foo.bar" cannot then be found by `has-session -t foo.bar`, which
-      // reads as a handoff that failed while the copy is in fact alive â two
+      // reads as a handoff that failed while the copy is in fact alive — two
       // processes on one transcript, the exact damage the collision guard
       // exists to warn about. Replace them at the source.
       .replace(/[.:]/g, "-").trim() || `session-${sessionId.slice(0, 8)}`;
@@ -2823,7 +2823,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     }
     // A session that has never received a prompt has no transcript JSONL yet.
     // The copy runs `pi --session <id>`, which fails with "No session found
-    // matching" when the JSONL does not exist, and dies immediately â /bg then
+    // matching" when the JSONL does not exist, and dies immediately — /bg then
     // misreports it as a handoff failure and kills the tmux session it just
     // created. Same hazard restartTmuxPane guards against; same fix: verify
     // resumability from the card before spawning anything.
@@ -2877,7 +2877,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     // Verify the replacement actually survived before destroying this copy.
     await new Promise((r) => setTimeout(r, 2500));
     if (!tmuxSessionExists(tmux, name)) {
-      // Nothing to clean up in this branch â the session is gone, which is how
+      // Nothing to clean up in this branch — the session is gone, which is how
       // we got here. But if it half-exists (created, then died leaving a shell)
       // it would block every later attempt with a false "already exists", so
       // clear the name unconditionally rather than reasoning about which.
@@ -2915,15 +2915,15 @@ function installSessionTracker(pi: ExtensionAPI) {
     label: "Spawn arc",
     description:
       "Spawn a NEW, empty, fast child session in its own tmux window to carry out one unit of work (an 'arc'), linked back to this session. " +
-      "Use when work is substantial enough to run many turns â a feature, a spec, a phase, an investigation â rather than something answerable here. " +
+      "Use when work is substantial enough to run many turns — a feature, a spec, a phase, an investigation — rather than something answerable here. " +
       "The child starts with NO history: the brief is everything it will know, so it must be self-contained (what to build, where, what done looks like, what to read first). " +
       "The child appears indented under this session in /resume and as its own window in pi-king, and the user steers it directly there. " +
-      "It does NOT report back automatically â the user decides when it is done.",
+      "It does NOT report back automatically — the user decides when it is done.",
     promptSnippet: "arc_spawn: hand a substantial unit of work to a fresh child session instead of growing this one",
     promptGuidelines: [
-      "Session hygiene: this agent's typing and render latency scale with how much history the session retains, and that cost is permanent â it cannot be compacted away. Before starting substantial multi-turn work (a feature, a spec, a phase, a long investigation), offer to spawn an arc with arc_spawn instead of doing it inline.",
-      "Write the arc brief as if for someone who has never seen this conversation, because that is literally true â the child inherits no history. State the goal, the working directory, what to read first (AGENTS.md, any spec or state file), what 'done' means, and any constraint that would otherwise be discovered the hard way.",
-      "Do not spawn an arc for something you can finish in a turn or two; the overhead is not worth it. Do not spawn one silently either â say what you are spawning and why.",
+      "Session hygiene: this agent's typing and render latency scale with how much history the session retains, and that cost is permanent — it cannot be compacted away. Before starting substantial multi-turn work (a feature, a spec, a phase, a long investigation), offer to spawn an arc with arc_spawn instead of doing it inline.",
+      "Write the arc brief as if for someone who has never seen this conversation, because that is literally true — the child inherits no history. State the goal, the working directory, what to read first (AGENTS.md, any spec or state file), what 'done' means, and any constraint that would otherwise be discovered the hard way.",
+      "Do not spawn an arc for something you can finish in a turn or two; the overhead is not worth it. Do not spawn one silently either — say what you are spawning and why.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "Short window name for the arc, e.g. 'search-api'. Becomes the tmux session name." }),
@@ -2947,7 +2947,7 @@ function installSessionTracker(pi: ExtensionAPI) {
     name: "arc_digest",
     label: "Digest arc",
     description:
-      "Prepare a finished arc's transcript for digestion. Strips tool calls/results (measured: 85% of a transcript's bytes) and writes ONLY the conversation to a file, returning its PATH â never its contents. " +
+      "Prepare a finished arc's transcript for digestion. Strips tool calls/results (measured: 85% of a transcript's bytes) and writes ONLY the conversation to a file, returning its PATH — never its contents. " +
       "Hand that path to a subagent to distill decisions, rationale, caveats and dead ends; do NOT read the file into this session, which would defeat the point of having split the work out.",
     promptSnippet: "arc_digest: prepare a finished arc's transcript for a subagent to distill",
     parameters: Type.Object({
@@ -2963,7 +2963,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       const text =
           `Wrote ${a.name}'s conversation to ${out} ` +
           `(${(x.keptChars / 1024).toFixed(0)} KB kept from a ${(x.rawBytes / 1048576).toFixed(1)} MB transcript` +
-          `${x.truncated ? ", TRUNCATED to the most recent portion â the arc was scoped too big" : ""}).\n` +
+          `${x.truncated ? ", TRUNCATED to the most recent portion — the arc was scoped too big" : ""}).\n` +
           `Now delegate to a subagent: have it read that file and write the distilled decisions, rationale, caveats and dead ends into the project repo. ` +
           `Do not read the file yourself.`;
       return { content: [{ type: "text", text }], details: {} };
@@ -2991,7 +2991,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       }
       // Live state per arc, read from the card rather than from lineage.json:
       // lineage records the RELATIONSHIP, the card records what the session is
-      // doing right now. "attention" is the one that matters â it means the arc
+      // doing right now. "attention" is the one that matters — it means the arc
       // is blocked waiting on the user, which is invisible from a plain list
       // and is exactly why this command needed to be more than a printout.
       const state = (id: string): string => {
@@ -3009,8 +3009,8 @@ function installSessionTracker(pi: ExtensionAPI) {
       const labels = rows.map((a) => {
         const age = Math.round((Date.now() - a.createdAt) / 60000);
         const st = a.closedAt ? "closed" : state(a.id);
-        const mark = st === "attention" ? "â  waiting on you" : st;
-        return `${a.closedAt ? "â" : "â"} ${a.name} â ${mark} â ${age}m â ${a.cwd}`;
+        const mark = st === "attention" ? "⚠ waiting on you" : st;
+        return `${a.closedAt ? "○" : "●"} ${a.name} — ${mark} — ${age}m — ${a.cwd}`;
       });
       const picked = await ctx.ui.select(
         mine.length > 0 ? "Arcs from this session" : "Recent arcs (none from this session)",
@@ -3027,7 +3027,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       if (!r.deferred) {
         // Outside tmux, try opening a new tab in the current Ghostty window via
         // AppleScript + System Events. This is the only way to get a tab in the
-        // same window on macOS â Ghostty's +new-window action is unsupported on
+        // same window on macOS — Ghostty's +new-window action is unsupported on
         // macOS and `open -na` opens a new application instance, not a window.
         // The Cmd+T keystroke is fragile (focus-dependent) but works in practice.
         const asA = spawnSync("osascript", ["-e", `
@@ -3058,7 +3058,7 @@ function installSessionTracker(pi: ExtensionAPI) {
       if (busy || running > 0) {
         // Queue rather than refuse. A handoff mid-turn would discard the
         // in-flight response and kill running subagents, so it waits for the
-        // session to settle and fires itself â no second command to remember.
+        // session to settle and fires itself — no second command to remember.
         bgQueued = true;
         visible = true; persist(ctx);
         const why = busy && running > 0 ? `the current turn and ${running} subagent(s)`
@@ -3082,7 +3082,7 @@ export default function piDashboard(pi: ExtensionAPI) {
   // branch below), never from the factory: the hub runs --no-tools
   // --no-extensions so pi-jobs' own /jobs never loads there, but in normal
   // sessions both extensions load, and pi suffixes duplicate command names
-  // to jobs:1/jobs:2 â neither reachable as /jobs. Hub-only registration
+  // to jobs:1/jobs:2 — neither reachable as /jobs. Hub-only registration
   // leaves /jobs to pi-jobs in normal sessions.
   pi.registerCommand("pi-dashboard", {
     description: "Live cross-project dashboard: attach/create/rename/delete tmux-backed Pi sessions",
@@ -3095,7 +3095,7 @@ export default function piDashboard(pi: ExtensionAPI) {
         const action = await showDashboardOnce(ctx);
         if (action) {
           // Invoked as a slash command from inside somebody's real working
-          // session â there is no wrapper to hand the terminal to, and we must
+          // session — there is no wrapper to hand the terminal to, and we must
           // not fight that session's TUI for stdin. Tell the user how to attach
           // instead of hijacking their terminal.
           const tmuxName = action.type === "attach" ? action.tmuxName : action.name;
@@ -3118,11 +3118,11 @@ export default function piDashboard(pi: ExtensionAPI) {
     // /jobs lives HERE, not in the factory: the hub runs --no-tools
     // --no-extensions so pi-jobs' own /jobs never loads in this process,
     // but normal sessions load both extensions, and pi suffixes duplicate
-    // command names to jobs:1/jobs:2 â neither reachable as /jobs. Hub-only
+    // command names to jobs:1/jobs:2 — neither reachable as /jobs. Hub-only
     // registration leaves /jobs to pi-jobs in normal sessions.
     pi.registerCommand("jobs", {
       description:
-        "Offload-job markers: open the jobs panel (enter show Â· r resume Â· c clear Â· X delete), or list markers when no dashboard is open",
+        "Offload-job markers: open the jobs panel (enter show · r resume · c clear · X delete), or list markers when no dashboard is open",
       handler: async (_args, ctx) => {
         if (dashboardView) {
           dashboardView.toggleJobsPanel();
@@ -3140,14 +3140,14 @@ export default function piDashboard(pi: ExtensionAPI) {
       },
     });
     // Daemon mode moved to scripts/hub-daemon.ts (plain node, not a pi
-    // process) â see bin/pi-king --daemon. This session_start no longer has
+    // process) — see bin/pi-king --daemon. This session_start no longer has
     // a headless branch to dispatch to.
     if (ctx.mode !== "tui") {
       ctx.ui.notify("pi-king requires an interactive terminal.", "error");
       ctx.shutdown();
       return;
     }
-    // This is a dedicated dashboard app, not a chat session â replace Pi's
+    // This is a dedicated dashboard app, not a chat session — replace Pi's
     // default chat header/footer chrome (irrelevant here: cwd, model, token
     // stats) with a one-line identity banner and a blank footer, rather than
     // leaving Pi's own chat UI visibly underneath the overlay.
@@ -3160,7 +3160,7 @@ export default function piDashboard(pi: ExtensionAPI) {
     ctx.ui.setEditorComponent((tui, theme, keybindings) => new BlankEditor(tui, theme, keybindings));
     // The hub loops on the dashboard: attach/create hand the terminal to tmux,
     // and once the user detaches, control returns here and the dashboard
-    // re-opens â a persistent home base, not a one-shot view.
+    // re-opens — a persistent home base, not a one-shot view.
     for (;;) {
       let action: HubAction | undefined;
       try {
