@@ -50,6 +50,11 @@ case "${1:-}" in
     PATCH_TOOL="$(cd "$(dirname "$SELF")/.." && pwd)/tools/patch-pi-tui.mjs"
     exec node "$PATCH_TOOL" "$@"
     ;;
+  --patch-acp|patch-acp)
+    shift
+    PATCH_TOOL="$(cd "$(dirname "$SELF")/.." && pwd)/tools/patch-acp.mjs"
+    exec node "$PATCH_TOOL" "$@"
+    ;;
   --daemon-install)
     PLIST="$HOME/Library/LaunchAgents/com.stanz.pi-king-hub.plist"
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.pi/king"

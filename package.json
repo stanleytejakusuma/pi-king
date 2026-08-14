@@ -53,7 +53,7 @@
   },
   "scripts": {
     "prepublishOnly": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs",
-    "check": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs && node --test tools/jobs.test.mjs tools/fleet.test.mjs tools/patch-pi-tui.test.mjs tools/arc-dispatch.test.mjs",
+    "check": "tsc --noEmit -p tsconfig.json && node tools/check-exports.mjs && node --test tools/jobs.test.mjs tools/fleet.test.mjs tools/patch-pi-tui.test.mjs tools/patch-acp.test.mjs tools/arc-dispatch.test.mjs",
     "verify": "node tools/verify-metrics.mjs && node tools/verify-reboot-recovery.mjs && node tools/verify-live-pids.mjs",
     "verify:reboot": "node tools/verify-reboot-recovery.mjs",
     "verify:pids": "node tools/verify-live-pids.mjs",
