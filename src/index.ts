@@ -65,13 +65,21 @@ import { homedir } from "node:os";
 // \u{...} with braces: a bare \u takes exactly four hex digits, so \u1f514
 // silently parsed as U+1F51 followed by a literal "4" and the attention icon
 // rendered as a Greek vowel with a digit stuck to it. Shipped that way.
+// One geometric family, all U+25xx, all text presentation and single width.
+// The old set mixed \u23f3 and \u{1f514} -- both emoji-presentation, so Ghostty painted
+// them in colour at double width beside crisp single-width marks, and the two
+// loudest glyphs in the column were decided by which codepoints happened to
+// have emoji fonts rather than by which states matter. Hue already encodes
+// urgency and the state word is printed alongside, so shape only has to be
+// distinguishable, not descriptive. Angular = wants a human (attention,
+// error); round = running itself.
 export const stateIcon: Record<TitleState, string> = {
   // background: the main agent has settled but subagents are still running —
   // the session is neither working (nothing to wait on at the prompt) nor idle
   // (work is genuinely still happening on its behalf). pi-alerts has drawn
   // this distinction in its own state model since before this file existed;
   // the dashboard calling the same moment "idle" was simply less true.
-  working: "\u23f3", idle: "\u2713", background: "\u25d0", attention: "\u{1f514}", error: "\u26a0", exited: "\u25cb",
+  working: "\u25d0", idle: "\u25cf", background: "\u25d2", attention: "\u25c6", error: "\u25b2", exited: "\u25cb",
 };
 
 /** FORMAT.md promises readers tolerate unknown status strings, because the
@@ -2031,8 +2039,12 @@ class DashboardView implements Component {
       // directly under the last session. Without this the key map moves up
       // and down the screen as sessions come and go, which is the opposite of
       // pinned: the whole point is that the keys are always in the same place.
-      const pad = Math.max(0, H - head.length - body.length - inv.length - foot.length);
-      return [...head, ...body, ...Array<string>(pad).fill(""), ...inv, ...foot];
+      const room = Math.max(0, H - head.length - body.length - inv.length - foot.length);
+      // Detail sits directly under the list it describes, and only claims
+      // room the pad would have left blank anyway.
+      const detail = this.renderSelectedDetail(MEASURE, Math.min(room, 5));
+      const pad = Math.max(0, room - detail.length);
+      return [...head, ...body, ...detail, ...Array<string>(pad).fill(""), ...inv, ...foot];
     }
 
     // Two rows of the budget go to the more-above/more-below markers, so the
@@ -2052,6 +2064,48 @@ class DashboardView implements Component {
       ...inv,
       ...foot,
     ];
+  }
+
+  /** The one thing the row had to cut: the selected session's activity, in
+   * full. Built ONLY from space the layout was already going to waste as
+   * padding, so it cannot push the footer off and costs nothing whenever the
+   * list is long enough to fill the screen -- the case where render cost
+   * would actually matter. No new I/O: every field is already in memory. */
+  private renderSelectedDetail(width: number, maxLines: number): string[] {
+    const row = this.rows[this.selected];
+    if (!row || row.kind !== "session" || maxLines < 3) return [];
+    const th = this.theme;
+    const e = row.entry;
+    const arcs = row.tree?.arcCount ?? 0;
+    const facts = [
+      e.cwd.replace(process.env.HOME ?? "~", "~"),
+      `#${e.shortId}`,
+      e.pid ? `pid ${e.pid}` : "",
+      arcs > 0 ? `${arcs} arc${arcs > 1 ? "s" : ""}` : "",
+    ].filter(Boolean).join(" \u00b7 ");
+    const out = ["", "  " + th.fg("accent", e.name ?? e.project) + "  " + th.fg("dim", facts)];
+    const text = (e.lastActivity ?? "").trim();
+    if (!text) return out;
+    // Greedy wrap. The row truncates this to a single line, which for a real
+    // activity string is exactly where the useful half begins. Every line is
+    // pushed through truncateToWidth as a guarantee rather than trusting the
+    // arithmetic: guessing two cells too wide does not wrap, it gets
+    // hard-clipped by the renderer, and a clip mid-word looks like corrupt
+    // text rather than like an ellipsis.
+    const w = Math.max(20, width - 10);
+    const put = (s: string, more: boolean) =>
+      out.push("  " + th.fg("muted", truncateToWidth(more ? `${s} \u2026` : s, w, "\u2026", false)));
+    let line = "";
+    let clipped = false;
+    for (const word of text.split(/\s+/)) {
+      if (line && visibleWidth(line) + visibleWidth(word) + 1 > w) {
+        if (out.length >= maxLines - 1) { clipped = true; break; }
+        put(line, false);
+        line = word;
+      } else line = line ? `${line} ${word}` : word;
+    }
+    if (line) put(line, clipped);
+    return out;
   }
 
   /** Lays inventory categories out as bordered, content-sized cards.
