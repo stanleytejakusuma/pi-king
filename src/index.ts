@@ -1910,9 +1910,13 @@ class DashboardView implements Component {
         // then truncates. Only append when it actually carries information.
         const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
         const wantProject = (isPinned || tree?.showProject) && norm(e.project) !== norm(bareName);
-        const label = rail + glyph + " " + (isPinned ? "\u2691 " : "") +
-          (sel ? th.bold(bareName) : bareName) +
-          (wantProject ? th.fg("dim", ` \u00b7 ${e.project}`) : "");
+        const base = rail + glyph + " " + (isPinned ? "\u2691 " : "") + (sel ? th.bold(bareName) : bareName);
+        const suffix = th.fg("dim", ` \u00b7 ${e.project}`);
+        // All or nothing. A narrow terminal used to truncate the suffix into a
+        // dangling "\u00b7\u2026", which costs two cells of the name to say nothing at
+        // all; dropping it lets the name itself use the space instead.
+        const label = wantProject && visibleWidth(base) + visibleWidth(suffix) <= nameW
+          ? base + suffix : base;
         const nm = truncateToWidth(label, nameW, "\u2026", true);
         const status = pad(`${iconFor(e.state)} ${th.fg(hue, e.state)}`, statusW);
         const sub = subagentSummary(e.subagents);
